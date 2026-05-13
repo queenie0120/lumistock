@@ -1,5 +1,5 @@
-line-bot-sdk
+line-bot-sdk>=3.0.0
 flask
-yfinance
+yfinance==0.2.40
 requests
 gunicorn
