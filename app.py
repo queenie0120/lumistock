@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v4.0
+LINE Bot 模組 v5.0（含K線分析＋即時新聞）
 """
 
 from flask import Flask, request, abort
@@ -14,6 +14,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import requests
 import json, os
 from datetime import datetime
+import xml.etree.ElementTree as ET
 
 app = Flask(__name__)
 
@@ -37,7 +38,7 @@ def save_portfolio(portfolio):
 
 
 # ══════════════════════════════════════════
-#  台股資料（證交所＋櫃買中心）
+#  台股資料
 # ══════════════════════════════════════════
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -63,15 +64,16 @@ def get_tw_stock(stock_id: str) -> dict:
         except:
             pass
 
-    # 盤後用收盤價
+    # 盤後備援
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
         data = r.json()
         if data.get("stat") == "OK" and data.get("data"):
-            last = data["data"][-1]
+            rows = data["data"]
+            last = rows[-1]
             price = float(last[6].replace(",", ""))
-            prev  = float(data["data"][-2][6].replace(",", "")) if len(data["data"]) > 1 else price
+            prev  = float(rows[-2][6].replace(",", "")) if len(rows) > 1 else price
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
             name  = data.get("title", "").split(" ")[-1] if data.get("title") else stock_id
@@ -95,7 +97,10 @@ def get_us_stock(symbol: str) -> dict:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         r = requests.get(url, headers=headers, timeout=10)
         data = r.json()
-        meta = data["chart"]["result"][0]["meta"]
+        result = data["chart"]["result"][0]
+        meta = result["meta"]
+        closes = result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        closes = [c for c in closes if c is not None]
         price = meta.get("regularMarketPrice", 0)
         prev  = meta.get("chartPreviousClose", price)
         chg   = price - prev
@@ -103,11 +108,95 @@ def get_us_stock(symbol: str) -> dict:
         name  = meta.get("longName") or meta.get("shortName") or symbol
         return {
             "name": name[:20], "price": price,
-            "chg": chg, "pct": pct
+            "chg": chg, "pct": pct,
+            "closes": closes
         }
     except:
         pass
     return None
+
+
+# ══════════════════════════════════════════
+#  K線文字分析
+# ══════════════════════════════════════════
+def get_kline_text(closes: list) -> str:
+    if not closes or len(closes) < 2:
+        return "📈 K線資料不足"
+
+    # sparkline
+    mn, mx = min(closes), max(closes)
+    bars = "▁▂▃▄▅▆▇█"
+    if mx == mn:
+        spark = "─" * len(closes)
+    else:
+        spark = "".join(bars[int((c - mn) / (mx - mn) * 7)] for c in closes)
+
+    # 趨勢
+    trend = "📈 上升" if closes[-1] > closes[0] else ("📉 下降" if closes[-1] < closes[0] else "➡️ 持平")
+
+    # 均線
+    ma5  = sum(closes[-5:])  / min(5,  len(closes))
+    ma20 = sum(closes[-20:]) / min(20, len(closes))
+    price = closes[-1]
+    ma_signal = "強勢（站上均線）" if price > ma5 > ma20 else (
+                "弱勢（跌破均線）" if price < ma5 < ma20 else "整理中")
+
+    # RSI
+    gains = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
+    avg_gain = sum(gains[-14:]) / min(14, len(gains)) if gains else 0
+    avg_loss = sum(losses[-14:]) / min(14, len(losses)) if losses else 0.001
+    rsi = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss else 50
+    rsi_signal = "超買⚠️" if rsi > 70 else ("超賣💡" if rsi < 30 else "中性")
+
+    return (f"📈 K線走勢（{len(closes)}日）\n"
+            f"{spark}  {trend}\n"
+            f"MA5：{ma5:.2f}　MA20：{ma20:.2f}\n"
+            f"RSI：{rsi:.1f}　{rsi_signal}\n"
+            f"均線訊號：{ma_signal}")
+
+
+# ══════════════════════════════════════════
+#  台股K線（從證交所抓歷史）
+# ══════════════════════════════════════════
+def get_tw_kline(stock_id: str) -> str:
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
+        r = requests.get(url, headers=headers, timeout=8)
+        data = r.json()
+        if data.get("stat") == "OK" and data.get("data"):
+            closes = []
+            for row in data["data"]:
+                try:
+                    closes.append(float(row[6].replace(",", "")))
+                except:
+                    pass
+            return get_kline_text(closes)
+    except:
+        pass
+    return "📈 K線資料暫無法取得"
+
+
+# ══════════════════════════════════════════
+#  Google News 新聞（中文）
+# ══════════════════════════════════════════
+def get_news(query: str) -> str:
+    try:
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        root = ET.fromstring(r.content)
+        items = root.findall(".//item")[:3]
+        if not items:
+            return "📰 暫無相關新聞"
+        news = "📰 相關新聞\n"
+        for i, item in enumerate(items, 1):
+            title = item.findtext("title", "").split(" - ")[0].strip()
+            title = title[:30] + "…" if len(title) > 30 else title
+            news += f"{i}. {title}\n"
+        return news.strip()
+    except:
+        return "📰 新聞暫時無法取得"
 
 
 # ══════════════════════════════════════════
@@ -120,28 +209,36 @@ def get_stock_summary(symbol: str) -> str:
     if is_tw:
         tw = get_tw_stock(symbol)
         if not tw:
-            return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確\n（台股盤中 9:00-13:30 資料較完整）"
+            return (f"❌ 查無此股票：{symbol}\n"
+                    f"請確認代碼是否正確\n"
+                    f"（台股盤中 9:00-13:30 資料較完整）")
         arrow = "▲" if tw["chg"] >= 0 else "▼"
-        return f"""✨ 慧股拾光 Lumistock
-━━━━━━━━━━━━━━
-📊 {symbol}｜{tw['name']}（{tw['market']}）
-現價：{tw['price']:.2f}　{arrow}{abs(tw['chg']):.2f}（{tw['pct']:+.2f}%）
-最高：{tw['high']}　最低：{tw['low']}
-成交量：{tw['vol']} 張
-
-🕐 {datetime.now().strftime("%m/%d %H:%M")}"""
+        kline = get_tw_kline(symbol)
+        news  = get_news(f"{symbol} {tw['name']} 股票")
+        return (f"✨ 慧股拾光 Lumistock\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📊 {symbol}｜{tw['name']}（{tw['market']}）\n"
+                f"現價：{tw['price']:.2f}　{arrow}{abs(tw['chg']):.2f}（{tw['pct']:+.2f}%）\n"
+                f"最高：{tw['high']}　最低：{tw['low']}\n"
+                f"成交量：{tw['vol']} 張\n\n"
+                f"{kline}\n\n"
+                f"{news}\n\n"
+                f"🕐 {datetime.now().strftime('%m/%d %H:%M')}")
 
     else:
         us = get_us_stock(symbol)
         if not us:
             return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確"
         arrow = "▲" if us["chg"] >= 0 else "▼"
-        return f"""✨ 慧股拾光 Lumistock
-━━━━━━━━━━━━━━
-📊 {symbol}｜{us['name']}（美股）
-現價：{us['price']:.2f}　{arrow}{abs(us['chg']):.2f}（{us['pct']:+.2f}%）
-
-🕐 {datetime.now().strftime("%m/%d %H:%M")}"""
+        kline = get_kline_text(us.get("closes", []))
+        news  = get_news(f"{symbol} {us['name']} 股票")
+        return (f"✨ 慧股拾光 Lumistock\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📊 {symbol}｜{us['name']}（美股）\n"
+                f"現價：{us['price']:.2f}　{arrow}{abs(us['chg']):.2f}（{us['pct']:+.2f}%）\n\n"
+                f"{kline}\n\n"
+                f"{news}\n\n"
+                f"🕐 {datetime.now().strftime('%m/%d %H:%M')}")
 
 
 # ══════════════════════════════════════════
@@ -209,6 +306,7 @@ HELP_MSG = """✨ 慧股拾光 Lumistock
 
 🔍 查股票（直接輸入代號）
 2330　AAPL　6127
+→ 自動顯示價格＋K線＋新聞
 
 📋 持股管理
 新增 2330 100 200
@@ -292,6 +390,6 @@ def handle_message(event):
             reply(event.reply_token, HELP_MSG)
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v4.0 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v5.0 啟動中...")
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)
