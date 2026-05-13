@@ -18,13 +18,13 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-CHANNEL_SECRET       = "bf2705977fbf63744d3618febb57d9c3"
-CHANNEL_ACCESS_TOKEN = "H+8d6OLcVkxCE20TuYI68ewZ+q7P3WDSoO6fcEqGiqMcgUj6TeU+zuwgsAwgfYNEmRJdipaZVxvpqZp3CvBC0wVheivgvknbZnaXeaxTdzwuIJ2EdjQSlJHDTnIOqzfwQZZkPVprYKct8csQA5UwVQdB04t89/1O/w1cDnyilFU="
+CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(CHANNEL_SECRET)
 
-PORTFOLIO_FILE = os.path.expanduser("~/lumistock_portfolio.json")
+PORTFOLIO_FILE = "/tmp/lumistock_portfolio.json"
 
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
@@ -37,14 +37,8 @@ def save_portfolio(portfolio):
         json.dump(portfolio, f, ensure_ascii=False, indent=2)
 
 
-# ══════════════════════════════════════════
-#  台股資料（證交所＋櫃買中心）
-# ══════════════════════════════════════════
 def get_tw_stock(stock_id: str) -> dict:
-    """先查證交所（上市），找不到再查櫃買（上櫃）"""
     headers = {"User-Agent": "Mozilla/5.0"}
-
-    # 證交所（上市）
     try:
         url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw&json=1&delay=0"
         r = requests.get(url, headers=headers, timeout=8)
@@ -56,20 +50,14 @@ def get_tw_stock(stock_id: str) -> dict:
             prev  = float(d.get("y", price))
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
-            high  = d.get("h", "N/A")
-            low   = d.get("l", "N/A")
-            vol   = d.get("v", "N/A")
-            name  = d.get("n", stock_id)
             return {
-                "name": name, "price": price, "prev": prev,
+                "name": d.get("n", stock_id), "price": price, "prev": prev,
                 "chg": chg, "pct": pct,
-                "high": high, "low": low, "vol": vol,
-                "market": "上市", "source": "twse"
+                "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
+                "vol": d.get("v", "N/A"), "market": "上市", "source": "twse"
             }
     except:
         pass
-
-    # 櫃買中心（上櫃）
     try:
         url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=otc_{stock_id}.tw&json=1&delay=0"
         r = requests.get(url, headers=headers, timeout=8)
@@ -81,61 +69,44 @@ def get_tw_stock(stock_id: str) -> dict:
             prev  = float(d.get("y", price))
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
-            high  = d.get("h", "N/A")
-            low   = d.get("l", "N/A")
-            vol   = d.get("v", "N/A")
-            name  = d.get("n", stock_id)
             return {
-                "name": name, "price": price, "prev": prev,
+                "name": d.get("n", stock_id), "price": price, "prev": prev,
                 "chg": chg, "pct": pct,
-                "high": high, "low": low, "vol": vol,
-                "market": "上櫃", "source": "otc"
+                "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
+                "vol": d.get("v", "N/A"), "market": "上櫃", "source": "otc"
             }
     except:
         pass
-
     return None
 
 
 def get_tw_fundamental(stock_id: str) -> dict:
-    """從 yfinance 抓台股基本面（補充用）"""
     try:
         info = yf.Ticker(f"{stock_id}.TW").info
         return {
-            "eps":  info.get("trailingEps"),
-            "pe":   info.get("trailingPE"),
-            "roe":  info.get("returnOnEquity"),
-            "div":  info.get("dividendYield"),
-            "pb":   info.get("priceToBook"),
+            "eps": info.get("trailingEps"), "pe": info.get("trailingPE"),
+            "roe": info.get("returnOnEquity"), "div": info.get("dividendYield"),
+            "pb":  info.get("priceToBook"),
         }
     except:
         return {}
 
 
-# ══════════════════════════════════════════
-#  股票分析主函數
-# ══════════════════════════════════════════
 def get_stock_summary(symbol: str) -> str:
     symbol = symbol.strip().upper()
-
-    # 判斷台股（純數字）或美股（英文）
     is_tw = symbol.isdigit()
 
     if is_tw:
-        # 台股：爬證交所
         tw = get_tw_stock(symbol)
         if not tw:
             return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確"
-
         arrow = "▲" if tw["chg"] >= 0 else "▼"
         fund  = get_tw_fundamental(symbol)
-
         eps = f"{fund['eps']:.2f}" if fund.get("eps") else "N/A"
         pe  = f"{fund['pe']:.1f}"  if fund.get("pe")  else "N/A"
         roe = f"{fund['roe']:.1%}" if fund.get("roe") else "N/A"
         div = f"{fund['div']:.1%}" if fund.get("div") else "N/A"
         pb  = f"{fund['pb']:.2f}"  if fund.get("pb")  else "N/A"
-
         return f"""✨ 慧股拾光 Lumistock
 ━━━━━━━━━━━━━━
 📊 {symbol}｜{tw['name']}（{tw['market']}）
@@ -149,9 +120,7 @@ ROE：{roe}　PB：{pb}
 殖利率：{div}
 
 🕐 {datetime.now().strftime("%m/%d %H:%M")}"""
-
     else:
-        # 美股：yfinance
         try:
             info  = yf.Ticker(symbol).info
             price = info.get("regularMarketPrice") or info.get("previousClose", 0)
@@ -160,12 +129,11 @@ ROE：{roe}　PB：{pb}
             pct   = chg / prev * 100 if prev else 0
             arrow = "▲" if chg >= 0 else "▼"
             name  = info.get("longName", symbol)[:20]
-            eps   = info.get("trailingEps")
-            pe    = info.get("trailingPE")
-            roe   = info.get("returnOnEquity")
-            div   = info.get("dividendYield")
-            pb    = info.get("priceToBook")
-
+            eps = info.get("trailingEps")
+            pe  = info.get("trailingPE")
+            roe = info.get("returnOnEquity")
+            div = info.get("dividendYield")
+            pb  = info.get("priceToBook")
             return f"""✨ 慧股拾光 Lumistock
 ━━━━━━━━━━━━━━
 📊 {symbol}｜{name}（美股）
@@ -183,9 +151,6 @@ PB：{f"{pb:.2f}" if pb else "N/A"}
             return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確"
 
 
-# ══════════════════════════════════════════
-#  大盤摘要
-# ══════════════════════════════════════════
 def get_market_summary() -> str:
     indices = [("^TWII","台灣加權"),("^GSPC","S&P 500"),("^IXIC","那斯達克"),("^DJI","道瓊")]
     msg = f"🌍 全球大盤　{datetime.now().strftime('%m/%d %H:%M')}\n━━━━━━━━━━━━━━\n"
@@ -202,9 +167,6 @@ def get_market_summary() -> str:
     return msg.strip()
 
 
-# ══════════════════════════════════════════
-#  持股查詢
-# ══════════════════════════════════════════
 def get_portfolio_summary() -> str:
     portfolio = load_portfolio()
     if not portfolio:
@@ -279,7 +241,6 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     text = event.message.text.strip()
-
     if text in ["大盤", "指數", "市場"]:
         reply(event.reply_token, get_market_summary())
     elif text in ["持股", "查持股", "我的持股"]:
@@ -315,7 +276,6 @@ def handle_message(event):
         else:
             reply(event.reply_token, "格式：刪除 代碼\n範例：刪除 2330")
     else:
-        # 直接輸入代號查詢
         t = text.upper().replace("查","").strip()
         if t and (t.isdigit() or t.isalpha() or t.replace("-","").isalnum()):
             reply(event.reply_token, get_stock_summary(t))
@@ -324,4 +284,6 @@ def handle_message(event):
 
 if __name__ == "__main__":
     print("慧股拾光 Lumistock LINE Bot v3.0 啟動中...")
-    app.run(port=5001, debug=False)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port, debug=False)
+    
