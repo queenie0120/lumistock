@@ -1,5 +1,6 @@
 line-bot-sdk>=3.0.0
 flask
-yfinance==0.2.40
 requests
 gunicorn
+twstock
+finance-datareader
