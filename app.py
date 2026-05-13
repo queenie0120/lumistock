@@ -1,6 +1,6 @@
 """
-慧拾股光 Lumistock – by Hui
-LINE Bot 模組 v3.0（證交所＋櫃買中心＋美股）
+慧股拾光 Lumistock – by Hui
+LINE Bot 模組 v4.0
 """
 
 from flask import Flask, request, abort
@@ -11,7 +11,6 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
-import yfinance as yf
 import requests
 import json, os
 from datetime import datetime
@@ -37,61 +36,83 @@ def save_portfolio(portfolio):
         json.dump(portfolio, f, ensure_ascii=False, indent=2)
 
 
+# ══════════════════════════════════════════
+#  台股資料（證交所＋櫃買中心）
+# ══════════════════════════════════════════
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
+    for market in ["tse", "otc"]:
+        try:
+            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{stock_id}.tw&json=1&delay=0"
+            r = requests.get(url, headers=headers, timeout=8)
+            data = r.json()
+            items = data.get("msgArray", [])
+            if items and items[0].get("z", "-") != "-":
+                d = items[0]
+                price = float(d.get("z", 0) or d.get("y", 0))
+                prev  = float(d.get("y", price))
+                chg   = price - prev
+                pct   = chg / prev * 100 if prev else 0
+                return {
+                    "name": d.get("n", stock_id), "price": price,
+                    "chg": chg, "pct": pct,
+                    "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
+                    "vol": d.get("v", "N/A"),
+                    "market": "上市" if market == "tse" else "上櫃"
+                }
+        except:
+            pass
+
+    # 盤後用收盤價
     try:
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw&json=1&delay=0"
+        url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
         data = r.json()
-        items = data.get("msgArray", [])
-        if items and items[0].get("z", "-") != "-":
-            d = items[0]
-            price = float(d.get("z", 0) or d.get("y", 0))
-            prev  = float(d.get("y", price))
+        if data.get("stat") == "OK" and data.get("data"):
+            last = data["data"][-1]
+            price = float(last[6].replace(",", ""))
+            prev  = float(data["data"][-2][6].replace(",", "")) if len(data["data"]) > 1 else price
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
+            name  = data.get("title", "").split(" ")[-1] if data.get("title") else stock_id
             return {
-                "name": d.get("n", stock_id), "price": price, "prev": prev,
+                "name": name, "price": price,
                 "chg": chg, "pct": pct,
-                "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
-                "vol": d.get("v", "N/A"), "market": "上市", "source": "twse"
-            }
-    except:
-        pass
-    try:
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=otc_{stock_id}.tw&json=1&delay=0"
-        r = requests.get(url, headers=headers, timeout=8)
-        data = r.json()
-        items = data.get("msgArray", [])
-        if items and items[0].get("z", "-") != "-":
-            d = items[0]
-            price = float(d.get("z", 0) or d.get("y", 0))
-            prev  = float(d.get("y", price))
-            chg   = price - prev
-            pct   = chg / prev * 100 if prev else 0
-            return {
-                "name": d.get("n", stock_id), "price": price, "prev": prev,
-                "chg": chg, "pct": pct,
-                "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
-                "vol": d.get("v", "N/A"), "market": "上櫃", "source": "otc"
+                "high": last[4].replace(",",""), "low": last[5].replace(",",""),
+                "vol": last[1].replace(",",""), "market": "上市（收盤）"
             }
     except:
         pass
     return None
 
 
-def get_tw_fundamental(stock_id: str) -> dict:
+# ══════════════════════════════════════════
+#  美股資料
+# ══════════════════════════════════════════
+def get_us_stock(symbol: str) -> dict:
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        info = yf.Ticker(f"{stock_id}.TW").info
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice", 0)
+        prev  = meta.get("chartPreviousClose", price)
+        chg   = price - prev
+        pct   = chg / prev * 100 if prev else 0
+        name  = meta.get("longName") or meta.get("shortName") or symbol
         return {
-            "eps": info.get("trailingEps"), "pe": info.get("trailingPE"),
-            "roe": info.get("returnOnEquity"), "div": info.get("dividendYield"),
-            "pb":  info.get("priceToBook"),
+            "name": name[:20], "price": price,
+            "chg": chg, "pct": pct
         }
     except:
-        return {}
+        pass
+    return None
 
 
+# ══════════════════════════════════════════
+#  股票分析主函數
+# ══════════════════════════════════════════
 def get_stock_summary(symbol: str) -> str:
     symbol = symbol.strip().upper()
     is_tw = symbol.isdigit()
@@ -99,14 +120,8 @@ def get_stock_summary(symbol: str) -> str:
     if is_tw:
         tw = get_tw_stock(symbol)
         if not tw:
-            return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確"
+            return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確\n（台股盤中 9:00-13:30 資料較完整）"
         arrow = "▲" if tw["chg"] >= 0 else "▼"
-        fund  = get_tw_fundamental(symbol)
-        eps = f"{fund['eps']:.2f}" if fund.get("eps") else "N/A"
-        pe  = f"{fund['pe']:.1f}"  if fund.get("pe")  else "N/A"
-        roe = f"{fund['roe']:.1%}" if fund.get("roe") else "N/A"
-        div = f"{fund['div']:.1%}" if fund.get("div") else "N/A"
-        pb  = f"{fund['pb']:.2f}"  if fund.get("pb")  else "N/A"
         return f"""✨ 慧股拾光 Lumistock
 ━━━━━━━━━━━━━━
 📊 {symbol}｜{tw['name']}（{tw['market']}）
@@ -114,51 +129,41 @@ def get_stock_summary(symbol: str) -> str:
 最高：{tw['high']}　最低：{tw['low']}
 成交量：{tw['vol']} 張
 
-💰 基本面
-EPS：{eps}　PE：{pe}
-ROE：{roe}　PB：{pb}
-殖利率：{div}
-
 🕐 {datetime.now().strftime("%m/%d %H:%M")}"""
+
     else:
-        try:
-            info  = yf.Ticker(symbol).info
-            price = info.get("regularMarketPrice") or info.get("previousClose", 0)
-            prev  = info.get("regularMarketPreviousClose") or info.get("previousClose", 1)
-            chg   = price - prev
-            pct   = chg / prev * 100 if prev else 0
-            arrow = "▲" if chg >= 0 else "▼"
-            name  = info.get("longName", symbol)[:20]
-            eps = info.get("trailingEps")
-            pe  = info.get("trailingPE")
-            roe = info.get("returnOnEquity")
-            div = info.get("dividendYield")
-            pb  = info.get("priceToBook")
-            return f"""✨ 慧股拾光 Lumistock
+        us = get_us_stock(symbol)
+        if not us:
+            return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確"
+        arrow = "▲" if us["chg"] >= 0 else "▼"
+        return f"""✨ 慧股拾光 Lumistock
 ━━━━━━━━━━━━━━
-📊 {symbol}｜{name}（美股）
-現價：{price:.2f}　{arrow}{abs(chg):.2f}（{pct:+.2f}%）
-
-💰 基本面
-EPS：{f"{eps:.2f}" if eps else "N/A"}
-PE：{f"{pe:.1f}" if pe else "N/A"}
-ROE：{f"{roe:.1%}" if roe else "N/A"}
-PB：{f"{pb:.2f}" if pb else "N/A"}
-殖利率：{f"{div:.1%}" if div else "N/A"}
+📊 {symbol}｜{us['name']}（美股）
+現價：{us['price']:.2f}　{arrow}{abs(us['chg']):.2f}（{us['pct']:+.2f}%）
 
 🕐 {datetime.now().strftime("%m/%d %H:%M")}"""
-        except:
-            return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確"
 
 
+# ══════════════════════════════════════════
+#  大盤摘要
+# ══════════════════════════════════════════
 def get_market_summary() -> str:
-    indices = [("^TWII","台灣加權"),("^GSPC","S&P 500"),("^IXIC","那斯達克"),("^DJI","道瓊")]
+    indices = [
+        ("^TWII", "台灣加權"),
+        ("^GSPC", "S&P 500"),
+        ("^IXIC", "那斯達克"),
+        ("^DJI",  "道瓊")
+    ]
+    headers = {"User-Agent": "Mozilla/5.0"}
     msg = f"🌍 全球大盤　{datetime.now().strftime('%m/%d %H:%M')}\n━━━━━━━━━━━━━━\n"
     for sym, name in indices:
         try:
-            info  = yf.Ticker(sym).info
-            price = info.get("regularMarketPrice") or info.get("previousClose", 0)
-            prev  = info.get("regularMarketPreviousClose") or info.get("previousClose", 1)
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
+            r = requests.get(url, headers=headers, timeout=10)
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice", 0)
+            prev  = meta.get("chartPreviousClose", price)
             pct   = (price - prev) / prev * 100 if prev else 0
             icon  = "🟢" if pct >= 0 else "🔴"
             msg  += f"{icon} {name}　{price:,.2f}　{pct:+.2f}%\n"
@@ -167,6 +172,9 @@ def get_market_summary() -> str:
     return msg.strip()
 
 
+# ══════════════════════════════════════════
+#  持股查詢
+# ══════════════════════════════════════════
 def get_portfolio_summary() -> str:
     portfolio = load_portfolio()
     if not portfolio:
@@ -175,12 +183,13 @@ def get_portfolio_summary() -> str:
     total = 0
     for symbol, data in portfolio.items():
         try:
-            if symbol.replace(".TW","").isdigit():
-                sid = symbol.replace(".TW","")
+            sid = symbol.replace(".TW", "")
+            if sid.isdigit():
                 tw = get_tw_stock(sid)
                 price = tw["price"] if tw else 0
             else:
-                price = yf.Ticker(symbol).info.get("regularMarketPrice", 0)
+                us = get_us_stock(symbol)
+                price = us["price"] if us else 0
             shares    = data["shares"]
             buy_price = data["buy_price"]
             profit    = (price - buy_price) * shares
@@ -276,14 +285,13 @@ def handle_message(event):
         else:
             reply(event.reply_token, "格式：刪除 代碼\n範例：刪除 2330")
     else:
-        t = text.upper().replace("查","").strip()
-        if t and (t.isdigit() or t.isalpha() or t.replace("-","").isalnum()):
+        t = text.upper().replace("查", "").strip()
+        if t and (t.isdigit() or t.isalpha() or t.replace("-", "").isalnum()):
             reply(event.reply_token, get_stock_summary(t))
         else:
             reply(event.reply_token, HELP_MSG)
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v3.0 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v4.0 啟動中...")
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)
-    
