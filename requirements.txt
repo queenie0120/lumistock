@@ -2,5 +2,5 @@ line-bot-sdk>=3.0.0
 flask
 requests
 gunicorn
-twstock
-finance-datareader
+gspread
+google-auth
