@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v6.0（Rich Menu + 建議功能 + 推薦股）
+LINE Bot 模組 v6.2（上市＋上櫃盤後備援）
 """
 
 from flask import Flask, request, abort
@@ -25,8 +25,8 @@ OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(CHANNEL_SECRET)
 
-PORTFOLIO_FILE   = "/tmp/lumistock_portfolio.json"
-SUGGESTION_FILE  = "/tmp/lumistock_suggestions.json"
+PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
+SUGGESTION_FILE    = "/tmp/lumistock_suggestions.json"
 WAITING_SUGGESTION = set()
 
 def load_json(path):
@@ -53,10 +53,6 @@ def save_suggestions(s):
     with open(SUGGESTION_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
 
-
-# ══════════════════════════════════════════
-#  推播給管理者
-# ══════════════════════════════════════════
 def push_to_owner(text):
     try:
         with ApiClient(configuration) as api_client:
@@ -71,10 +67,12 @@ def push_to_owner(text):
 
 
 # ══════════════════════════════════════════
-#  台股資料
+#  台股資料（盤中＋盤後上市＋盤後上櫃）
 # ══════════════════════════════════════════
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 盤中即時（上市＋上櫃）
     for market in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{stock_id}.tw&json=1&delay=0"
@@ -96,6 +94,8 @@ def get_tw_stock(stock_id: str) -> dict:
                 }
         except:
             pass
+
+    # 盤後備援：上市（TWSE）
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
@@ -116,6 +116,50 @@ def get_tw_stock(stock_id: str) -> dict:
             }
     except:
         pass
+
+    # 盤後備援：上櫃（OTC）
+    try:
+        url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&o=json&d=114/05/14&s=0,asc&q={stock_id}"
+        r = requests.get(url, headers=headers, timeout=8)
+        data = r.json()
+        rows = data.get("aaData", [])
+        if rows:
+            last = rows[-1]
+            price = float(last[2].replace(",", ""))
+            prev  = float(rows[-2][2].replace(",", "")) if len(rows) > 1 else price
+            chg   = price - prev
+            pct   = chg / prev * 100 if prev else 0
+            return {
+                "name": last[1] if len(last) > 1 else stock_id,
+                "price": price, "chg": chg, "pct": pct,
+                "high": last[4].replace(",","") if len(last) > 4 else "N/A",
+                "low": last[5].replace(",","") if len(last) > 5 else "N/A",
+                "vol": last[0].replace(",","") if len(last) > 0 else "N/A",
+                "market": "上櫃（收盤）"
+            }
+    except:
+        pass
+
+    # 最後備援：用 Yahoo Finance
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}.TW?interval=1d&range=5d"
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        meta = data["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice") or meta.get("previousClose", 0)
+        prev  = meta.get("chartPreviousClose", price)
+        chg   = price - prev
+        pct   = chg / prev * 100 if prev else 0
+        name  = meta.get("longName") or meta.get("shortName") or stock_id
+        return {
+            "name": name[:10], "price": price,
+            "chg": chg, "pct": pct,
+            "high": "N/A", "low": "N/A", "vol": "N/A",
+            "market": "收盤"
+        }
+    except:
+        pass
+
     return None
 
 
@@ -148,14 +192,14 @@ def get_us_stock(symbol: str) -> dict:
 
 
 # ══════════════════════════════════════════
-#  K線文字分析
+#  K線分析
 # ══════════════════════════════════════════
 def get_kline_text(closes: list) -> str:
     if not closes or len(closes) < 2:
         return "📈 K線資料不足"
     mn, mx = min(closes), max(closes)
     bars = "▁▂▃▄▅▆▇█"
-    spark = "─" * len(closes) if mx == mn else "".join(bars[int((c-mn)/(mx-mn)*7)] for c in closes[-10:])
+    spark = "─" * 10 if mx == mn else "".join(bars[int((c-mn)/(mx-mn)*7)] for c in closes[-10:])
     trend = "📈 上升" if closes[-1] > closes[0] else ("📉 下降" if closes[-1] < closes[0] else "➡️ 持平")
     ma5  = sum(closes[-5:])  / min(5,  len(closes))
     ma20 = sum(closes[-20:]) / min(20, len(closes))
@@ -194,7 +238,7 @@ def get_tw_kline(stock_id: str) -> str:
 
 
 # ══════════════════════════════════════════
-#  Google News 新聞
+#  新聞
 # ══════════════════════════════════════════
 def get_news(query: str) -> str:
     try:
@@ -223,9 +267,7 @@ def get_stock_summary(symbol: str) -> str:
     if is_tw:
         tw = get_tw_stock(symbol)
         if not tw:
-            return (f"❌ 查無此股票：{symbol}\n"
-                    f"請確認代碼是否正確\n"
-                    f"（台股盤中 9:00-13:30 資料較完整）")
+            return f"❌ 查無此股票：{symbol}\n請確認代碼是否正確"
         arrow = "▲" if tw["chg"] >= 0 else "▼"
         kline = get_tw_kline(symbol)
         news  = get_news(f"{symbol} {tw['name']} 股票")
@@ -300,8 +342,7 @@ def get_recommendation() -> str:
                 except:
                     pass
             candidates.sort(key=lambda x: x[2], reverse=True)
-            top3 = candidates[:3]
-            for i, (sid, name, total) in enumerate(top3, 1):
+            for i, (sid, name, total) in enumerate(candidates[:3], 1):
                 tw = get_tw_stock(sid)
                 price_str = f"{tw['price']:.2f}" if tw else "N/A"
                 msg += (f"{i}. {sid} {name}\n"
@@ -397,6 +438,10 @@ def reply(reply_token, text):
         )
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return "Lumistock is running! 🌸", 200
+
 @app.after_request
 def add_header(response):
     response.headers["ngrok-skip-browser-warning"] = "true"
@@ -417,7 +462,6 @@ def handle_message(event):
     text = event.message.text.strip()
     user_id = event.source.user_id
 
-    # 建議模式
     if user_id in WAITING_SUGGESTION:
         WAITING_SUGGESTION.discard(user_id)
         suggestions = load_suggestions()
@@ -443,7 +487,7 @@ def handle_message(event):
     elif text in ["建議"]:
         WAITING_SUGGESTION.add(user_id)
         reply(event.reply_token, "💬 請輸入您的建議，我們會持續改善！\n\n（直接輸入文字送出即可）")
-    elif text in ["查看建議"] and user_id == OWNER_USER_ID:
+    elif text == "查看建議" and user_id == OWNER_USER_ID:
         suggestions = load_suggestions()
         if not suggestions:
             reply(event.reply_token, "目前還沒有建議")
@@ -490,6 +534,6 @@ def handle_message(event):
             reply(event.reply_token, HELP_MSG)
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v6.0 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v6.2 啟動中...")
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)
