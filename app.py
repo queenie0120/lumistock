@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v9.0（全面重構版面）
+LINE Bot 模組 v10.0（Flex Message 卡片版）
 """
 
 from flask import Flask, request, abort
@@ -8,12 +8,13 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage, PushMessageRequest
+    ReplyMessageRequest, TextMessage, PushMessageRequest,
+    FlexMessage, FlexContainer
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import requests
 import json, os, re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import xml.etree.ElementTree as ET
 import gspread
 from google.oauth2.service_account import Credentials
@@ -33,6 +34,11 @@ handler       = WebhookHandler(CHANNEL_SECRET)
 WAITING_SUGGESTION = set()
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 NAME_CACHE         = {}
+
+TZ_TAIPEI = timezone(timedelta(hours=8))
+
+def now_taipei():
+    return datetime.now(TZ_TAIPEI)
 
 
 # ══════════════════════════════════════════
@@ -130,7 +136,7 @@ def log_to_sheets(user_id, action, content, result):
     try:
         sheet = get_sheet("系統記錄")
         if sheet:
-            sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M"), user_id, action, content, result, "", ""])
+            sheet.append_row([now_taipei().strftime("%Y-%m-%d %H:%M"), user_id, action, content, result, "", ""])
     except:
         pass
 
@@ -138,7 +144,7 @@ def save_suggestion_to_sheets(user_id, text):
     try:
         sheet = get_sheet("系統記錄")
         if sheet:
-            sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M"), user_id, "建議", "", "", text, ""])
+            sheet.append_row([now_taipei().strftime("%Y-%m-%d %H:%M"), user_id, "建議", "", "", text, ""])
     except:
         pass
 
@@ -146,7 +152,7 @@ def save_portfolio_to_sheets(user_id, symbol, name, market, shares, buy_price):
     try:
         sheet = get_sheet("自選股")
         if sheet:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            now = now_taipei().strftime("%Y-%m-%d %H:%M")
             sheet.append_row([user_id, symbol, name, market, shares, buy_price, "", "", "", now, now])
     except:
         pass
@@ -168,7 +174,7 @@ def update_tw_data_to_sheets(stock_id, data):
         sheet = get_sheet("台股資料")
         if sheet and data:
             sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d"), stock_id, data.get("name",""),
+                now_taipei().strftime("%Y-%m-%d"), stock_id, data.get("name",""),
                 "", data.get("high",""), data.get("low",""),
                 data.get("price",""), data.get("vol",""),
                 f"{data.get('pct',0):+.2f}%", "", "", "", "", ""
@@ -181,7 +187,7 @@ def update_us_data_to_sheets(symbol, data):
         sheet = get_sheet("美股資料")
         if sheet and data:
             sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d"), symbol, data.get("name",""),
+                now_taipei().strftime("%Y-%m-%d"), symbol, data.get("name",""),
                 data.get("price",""), f"{data.get('pct',0):+.2f}%",
                 "", "", "", "", "", "", "", ""
             ])
@@ -257,7 +263,7 @@ def get_tw_stock(stock_id: str) -> dict:
                 prev  = float(d.get("y", price))
                 chg   = price - prev
                 pct   = chg / prev * 100 if prev else 0
-                name  = d.get("n", get_tw_stock_name(stock_id))
+                name  = d.get("n", "") or get_tw_stock_name(stock_id)
                 NAME_CACHE[stock_id] = name
                 return {
                     "name": name, "price": price, "chg": chg, "pct": pct,
@@ -291,7 +297,7 @@ def get_tw_stock(stock_id: str) -> dict:
         pass
 
     try:
-        today = datetime.now()
+        today = now_taipei()
         civil_year = today.year - 1911
         date_str = f"{civil_year}/{today.month:02d}/{today.day:02d}"
         url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&o=json&d={date_str}&s=0,asc&q={stock_id}"
@@ -361,42 +367,47 @@ def get_us_stock(symbol: str) -> dict:
 
 
 # ══════════════════════════════════════════
-#  K線分析
+#  K線 Sparkline
 # ══════════════════════════════════════════
-def get_kline_text(closes: list) -> str:
+def get_sparkline(closes: list) -> str:
     if not closes or len(closes) < 2:
-        return "　K線資料不足"
-    mn, mx = min(closes), max(closes)
+        return "▁▁▁▁▁▁▁▁▁▁"
+    data = closes[-10:]
+    mn, mx = min(data), max(data)
+    if mx == mn:
+        return "▄▄▄▄▄▄▄▄▄▄"
     bars = "▁▂▃▄▅▆▇█"
-    spark = "▄" * 10 if mx == mn else "".join(bars[int((c-mn)/(mx-mn)*7)] for c in closes[-10:])
-    trend = "上升 📈" if closes[-1] > closes[0] else ("下降 📉" if closes[-1] < closes[0] else "持平 ➡️")
+    return "".join(bars[int((c - mn) / (mx - mn) * 7)] for c in data)
+
+def get_kline_analysis(closes: list) -> dict:
+    if not closes or len(closes) < 2:
+        return {}
     ma5  = sum(closes[-5:])  / min(5,  len(closes))
     ma20 = sum(closes[-20:]) / min(20, len(closes))
     price = closes[-1]
-    ma_signal = "強勢" if price > ma5 > ma20 else ("弱勢" if price < ma5 < ma20 else "整理")
+    trend = "多頭" if closes[-1] > closes[-5] else ("空頭" if closes[-1] < closes[-5] else "盤整")
+    ma_sig = "站穩MA20" if price > ma20 else "跌破MA20"
+
     gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
     losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
     avg_gain = sum(gains[-14:]) / min(14, len(gains)) if gains else 0
     avg_loss = sum(losses[-14:]) / min(14, len(losses)) if losses else 0.001
     rsi = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss else 50
 
-    if rsi > 80:
-        rsi_label = "短線過熱，留意高檔"
-    elif rsi > 70:
-        rsi_label = "短線偏熱，注意壓力"
-    elif rsi < 20:
-        rsi_label = "短線極弱，留意反彈"
-    elif rsi < 30:
-        rsi_label = "短線偏冷，接近超賣"
-    else:
-        rsi_label = "中性區間"
+    if rsi > 80:   rsi_label = "短線過熱"
+    elif rsi > 70: rsi_label = "短線偏熱"
+    elif rsi < 20: rsi_label = "極度超賣"
+    elif rsi < 30: rsi_label = "短線偏冷"
+    else:          rsi_label = "中性"
 
-    return (f"　{spark}\n"
-            f"　趨勢　{trend}　｜　均線　{ma_signal}\n"
-            f"　MA5　{ma5:.0f}　MA20　{ma20:.0f}\n"
-            f"　RSI　{rsi:.0f}　{rsi_label}")
+    return {
+        "ma5": ma5, "ma20": ma20,
+        "trend": trend, "ma_sig": ma_sig,
+        "rsi": rsi, "rsi_label": rsi_label,
+        "spark": get_sparkline(closes)
+    }
 
-def get_tw_kline(stock_id: str) -> str:
+def get_tw_closes(stock_id: str) -> list:
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
@@ -410,7 +421,7 @@ def get_tw_kline(stock_id: str) -> str:
                 except:
                     pass
             if closes:
-                return get_kline_text(closes)
+                return closes
     except:
         pass
     try:
@@ -418,30 +429,27 @@ def get_tw_kline(stock_id: str) -> str:
         r = requests.get(url, headers=headers, timeout=10)
         data = r.json()
         closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-        closes = [c for c in closes if c is not None]
-        if closes:
-            return get_kline_text(closes)
+        return [c for c in closes if c is not None]
     except:
         pass
-    return "　K線資料暫無法取得"
+    return []
 
 
 # ══════════════════════════════════════════
-#  新聞（不顯示長網址）
+#  新聞
 # ══════════════════════════════════════════
 def get_news(query: str) -> list:
-    """回傳 [(title, url), ...] 最多3則"""
     headers = {"User-Agent": "Mozilla/5.0"}
     results = []
     try:
         url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         r = requests.get(url, timeout=8, headers=headers)
         root = ET.fromstring(r.content)
-        for item in root.findall(".//item")[:3]:
+        for item in root.findall(".//item")[:2]:
             title = item.findtext("title", "").split(" - ")[0].strip()
             link  = item.findtext("link", "").strip()
             if title:
-                results.append((title[:30], link))
+                results.append((title[:22] + "…" if len(title) > 22 else title, link))
         if results:
             return results
     except:
@@ -450,99 +458,234 @@ def get_news(query: str) -> list:
         url = "https://news.cnyes.com/rss/news/tw_stock"
         r = requests.get(url, timeout=8, headers=headers)
         root = ET.fromstring(r.content)
-        for item in root.findall(".//item")[:3]:
+        for item in root.findall(".//item")[:2]:
             title = item.findtext("title", "").strip()
             link  = item.findtext("link", "").strip()
             if title:
-                results.append((title[:30], link))
+                results.append((title[:22] + "…" if len(title) > 22 else title, link))
         if results:
             return results
     except:
         pass
     return []
 
-def format_news(news_list: list) -> str:
-    if not news_list:
-        return "　暫無相關新聞"
-    lines = []
-    for i, (title, url) in enumerate(news_list, 1):
-        title = title + "…" if len(title) >= 30 else title
+
+# ══════════════════════════════════════════
+#  Flex Message 股票卡片
+# ══════════════════════════════════════════
+def make_stock_flex(symbol, name, market, price, chg, pct, high, low, vol, kline, news_list, query_time):
+    color = "#C47055" if chg >= 0 else "#5B8DB8"
+    arrow = "▲" if chg >= 0 else "▼"
+    sign  = "+" if chg >= 0 else ""
+    spark = kline.get("spark", "▄▄▄▄▄▄▄▄▄▄")
+    trend = kline.get("trend", "--")
+    ma_sig = kline.get("ma_sig", "--")
+    ma5   = kline.get("ma5", 0)
+    ma20  = kline.get("ma20", 0)
+    rsi   = kline.get("rsi", 0)
+    rsi_label = kline.get("rsi_label", "--")
+
+    # 新聞按鈕
+    news_buttons = []
+    for title, url in news_list[:2]:
         if url:
-            lines.append(f"　{i}. {title}\n　   🔗 查看新聞 → {url[:50]}…" if len(url) > 50 else f"　{i}. {title}\n　   🔗 {url}")
-        else:
-            lines.append(f"　{i}. {title}")
-    return "\n".join(lines)
+            news_buttons.append({
+                "type": "button",
+                "style": "link",
+                "height": "sm",
+                "action": {
+                    "type": "uri",
+                    "label": f"📰 {title}",
+                    "uri": url
+                }
+            })
+
+    flex = {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "✨ 慧股拾光 Lumistock",
+                            "size": "xs",
+                            "color": "#FDF6F0",
+                            "flex": 1
+                        },
+                        {
+                            "type": "text",
+                            "text": market,
+                            "size": "xs",
+                            "color": "#F0C4B0",
+                            "align": "end"
+                        }
+                    ]
+                },
+                {
+                    "type": "text",
+                    "text": f"{symbol}　{name}",
+                    "size": "xl",
+                    "weight": "bold",
+                    "color": "#FFFFFF"
+                }
+            ],
+            "backgroundColor": "#C47055",
+            "paddingAll": "16px"
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#FDF6F0",
+            "paddingAll": "16px",
+            "spacing": "md",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": f"{price:.2f}",
+                            "size": "3xl",
+                            "weight": "bold",
+                            "color": color
+                        },
+                        {
+                            "type": "text",
+                            "text": f"{arrow} {abs(chg):.2f}　（{sign}{pct:.2f}%）",
+                            "size": "sm",
+                            "color": color
+                        }
+                    ]
+                },
+                {
+                    "type": "separator",
+                    "color": "#E8C4B4"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": f"最高　{high}", "size": "sm", "color": "#8B4A3A", "flex": 1},
+                        {"type": "text", "text": f"最低　{low}", "size": "sm", "color": "#8B4A3A", "flex": 1},
+                    ]
+                },
+                {
+                    "type": "text",
+                    "text": f"成交量　{vol} 張",
+                    "size": "sm",
+                    "color": "#B06050"
+                },
+                {
+                    "type": "separator",
+                    "color": "#E8C4B4"
+                },
+                {
+                    "type": "text",
+                    "text": "📊 技術分析",
+                    "size": "sm",
+                    "weight": "bold",
+                    "color": "#7A3828"
+                },
+                {
+                    "type": "text",
+                    "text": spark,
+                    "size": "lg",
+                    "color": color,
+                    "tracking": "normal"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": f"趨勢　{trend}", "size": "sm", "color": "#8B4A3A", "flex": 1},
+                        {"type": "text", "text": f"均線　{ma_sig}", "size": "sm", "color": "#8B4A3A", "flex": 1},
+                    ]
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": f"MA5　{ma5:.0f}", "size": "sm", "color": "#B06050", "flex": 1},
+                        {"type": "text", "text": f"MA20　{ma20:.0f}", "size": "sm", "color": "#B06050", "flex": 1},
+                        {"type": "text", "text": f"RSI　{rsi:.0f}　{rsi_label}", "size": "sm", "color": "#B06050", "flex": 2},
+                    ]
+                },
+                {
+                    "type": "separator",
+                    "color": "#E8C4B4"
+                },
+                {
+                    "type": "text",
+                    "text": "📰 相關新聞",
+                    "size": "sm",
+                    "weight": "bold",
+                    "color": "#7A3828"
+                },
+            ] + (news_buttons if news_buttons else [
+                {"type": "text", "text": "暫無相關新聞", "size": "sm", "color": "#B06050"}
+            ]) + [
+                {
+                    "type": "separator",
+                    "color": "#E8C4B4"
+                },
+                {
+                    "type": "text",
+                    "text": f"🕐 查詢時間　{query_time}",
+                    "size": "xs",
+                    "color": "#C4907A"
+                }
+            ]
+        }
+    }
+    return flex
 
 
 # ══════════════════════════════════════════
-#  股票查詢（重構版面）
+#  股票查詢
 # ══════════════════════════════════════════
-def get_stock_summary(symbol: str, user_id: str = "") -> str:
+def get_stock_flex(symbol: str, user_id: str = ""):
     symbol = symbol.strip().upper()
     is_tw = symbol.isdigit()
+    query_time = now_taipei().strftime("%m/%d %H:%M")
 
     if is_tw:
         tw = get_tw_stock(symbol)
         if not tw:
-            return f"查無此股票：{symbol}\n請確認代碼是否正確"
-        arrow = "▲" if tw["chg"] >= 0 else "▼"
-        sign  = "+" if tw["chg"] >= 0 else ""
-        kline = get_tw_kline(symbol)
-        news  = get_news(f"{symbol} {tw['name']} 股票")
-        news_str = format_news(news)
+            return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
+        closes = get_tw_closes(symbol)
+        kline  = get_kline_analysis(closes)
+        news   = get_news(f"{symbol} {tw['name']} 股票")
         update_tw_data_to_sheets(symbol, tw)
         log_to_sheets(user_id, "查詢台股", symbol, "成功")
-        time_label = tw.get("time", "") or datetime.now().strftime("%m/%d %H:%M")
-
-        return (
-            f"✨ 慧股拾光 Lumistock\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"　{symbol}｜{tw['name']}\n"
-            f"　{tw['market']}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"💰 現價　{tw['price']:.2f}\n"
-            f"　　{arrow} {abs(tw['chg']):.2f}（{sign}{tw['pct']:.2f}%）\n"
-            f"　最高 {tw['high']}　最低 {tw['low']}\n"
-            f"　成交量 {tw['vol']} 張\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📊 技術分析\n"
-            f"{kline}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📰 相關新聞\n"
-            f"{news_str}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🕐 {time_label}"
+        flex = make_stock_flex(
+            symbol, tw["name"], tw["market"],
+            tw["price"], tw["chg"], tw["pct"],
+            tw["high"], tw["low"], tw["vol"],
+            kline, news, query_time
         )
-
+        return flex, None
     else:
         us = get_us_stock(symbol)
         if not us:
-            return f"查無此股票：{symbol}\n請確認代碼是否正確"
-        arrow = "▲" if us["chg"] >= 0 else "▼"
-        sign  = "+" if us["chg"] >= 0 else ""
-        kline = get_kline_text(us.get("closes", []))
-        news  = get_news(f"{symbol} {us['name']} 股票")
-        news_str = format_news(news)
+            return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
+        kline  = get_kline_analysis(us.get("closes", []))
+        news   = get_news(f"{symbol} {us['name']} 股票")
         update_us_data_to_sheets(symbol, us)
         log_to_sheets(user_id, "查詢美股", symbol, "成功")
-
-        return (
-            f"✨ 慧股拾光 Lumistock\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"　{symbol}｜{us['name']}\n"
-            f"　美股\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"💰 現價　{us['price']:.2f}\n"
-            f"　　{arrow} {abs(us['chg']):.2f}（{sign}{us['pct']:.2f}%）\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📊 技術分析\n"
-            f"{kline}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📰 相關新聞\n"
-            f"{news_str}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now().strftime('%m/%d %H:%M')}"
+        flex = make_stock_flex(
+            symbol, us["name"], "美股",
+            us["price"], us["chg"], us["pct"],
+            "N/A", "N/A", "N/A",
+            kline, news, query_time
         )
+        return flex, None
 
 
 # ══════════════════════════════════════════
@@ -552,7 +695,7 @@ def get_market_summary() -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
     msg = (f"🌐 全球大盤\n"
            f"━━━━━━━━━━━━━━\n"
-           f"　{datetime.now().strftime('%m/%d %H:%M')} 更新\n"
+           f"　{now_taipei().strftime('%m/%d %H:%M')} 更新\n"
            f"━━━━━━━━━━━━━━\n")
     try:
         url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0"
@@ -596,7 +739,7 @@ def get_recommendation() -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
     msg = (f"⭐ 今日法人買超\n"
            f"━━━━━━━━━━━━━━\n"
-           f"　{datetime.now().strftime('%m/%d')} 資料\n"
+           f"　{now_taipei().strftime('%m/%d')} 資料\n"
            f"━━━━━━━━━━━━━━\n")
     try:
         url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
@@ -676,16 +819,25 @@ def get_portfolio_summary(user_id: str) -> str:
 def get_market_news() -> str:
     news1 = get_news("台股 股市 今日")
     news2 = get_news("美股 華爾街 今日")
-    msg = (f"📰 市場新聞\n"
-           f"━━━━━━━━━━━━━━\n"
-           f"　{datetime.now().strftime('%m/%d %H:%M')} 更新\n"
-           f"━━━━━━━━━━━━━━\n"
-           f"🇹🇼 台股\n"
-           f"{format_news(news1)}\n"
-           f"━━━━━━━━━━━━━━\n"
-           f"🇺🇸 美股\n"
-           f"{format_news(news2)}")
-    return msg
+
+    def fmt(news_list):
+        if not news_list:
+            return "　暫無新聞"
+        lines = []
+        for title, url in news_list:
+            if url:
+                lines.append(f"　• {title}\n　  {url}")
+            else:
+                lines.append(f"　• {title}")
+        return "\n".join(lines)
+
+    return (f"📰 市場新聞\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"　{now_taipei().strftime('%m/%d %H:%M')} 更新\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🇹🇼 台股\n{fmt(news1)}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🇺🇸 美股\n{fmt(news2)}")
 
 
 HELP_MSG = """✨ 慧股拾光 Lumistock
@@ -717,10 +869,22 @@ HELP_MSG = """✨ 慧股拾光 Lumistock
 台股／美股／ETF 皆支援"""
 
 
-def reply(reply_token, text):
+def reply_text(reply_token, text):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
+        )
+
+def reply_flex(reply_token, flex_content, alt_text="股票資訊"):
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[FlexMessage(
+                    alt_text=alt_text,
+                    contents=FlexContainer.from_dict(flex_content)
+                )]
+            )
         )
 
 
@@ -749,7 +913,7 @@ def handle_message(event):
     user_id = event.source.user_id
 
     if text == "查股票":
-        reply(event.reply_token,
+        reply_text(event.reply_token,
               "🔍 請直接輸入股票代號\n"
               "━━━━━━━━━━━━━━\n"
               "　台股：2330\n"
@@ -760,24 +924,24 @@ def handle_message(event):
     if user_id in WAITING_SUGGESTION:
         WAITING_SUGGESTION.discard(user_id)
         save_suggestion_to_sheets(user_id, text)
-        push_to_owner(f"💬 收到新建議！\n時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n內容：{text}")
-        reply(event.reply_token, "✅ 感謝您的建議！\n我們會持續改善 Lumistock 🌱")
+        push_to_owner(f"💬 收到新建議！\n時間：{now_taipei().strftime('%Y-%m-%d %H:%M')}\n內容：{text}")
+        reply_text(event.reply_token, "✅ 感謝您的建議！\n我們會持續改善 Lumistock 🌱")
         return
 
     if text in ["大盤", "指數", "市場", "大盤行情"]:
         log_to_sheets(user_id, "查詢大盤", "", "成功")
-        reply(event.reply_token, get_market_summary())
+        reply_text(event.reply_token, get_market_summary())
     elif text in ["持股", "查持股", "我的持股"]:
-        reply(event.reply_token, get_portfolio_summary(user_id))
+        reply_text(event.reply_token, get_portfolio_summary(user_id))
     elif text in ["推薦股", "今日推薦股", "推薦"]:
         log_to_sheets(user_id, "查詢推薦股", "", "成功")
-        reply(event.reply_token, get_recommendation())
+        reply_text(event.reply_token, get_recommendation())
     elif text in ["新聞", "市場新聞"]:
         log_to_sheets(user_id, "查詢新聞", "", "成功")
-        reply(event.reply_token, get_market_news())
+        reply_text(event.reply_token, get_market_news())
     elif text in ["建議"]:
         WAITING_SUGGESTION.add(user_id)
-        reply(event.reply_token,
+        reply_text(event.reply_token,
               "💬 請輸入您的建議\n"
               "━━━━━━━━━━━━━━\n"
               "直接輸入文字送出即可\n"
@@ -789,16 +953,16 @@ def handle_message(event):
                 records = sheet.get_all_records()
                 suggestions = [r for r in records if r.get("操作類型") == "建議"]
                 if not suggestions:
-                    reply(event.reply_token, "目前還沒有建議")
+                    reply_text(event.reply_token, "目前還沒有建議")
                 else:
                     msg = f"💬 共 {len(suggestions)} 則建議\n━━━━━━━━━━━━━━\n"
                     for i, s in enumerate(suggestions[-10:], 1):
                         msg += f"{i}. {s.get('時間','')}\n　{s.get('用戶建議','')}\n\n"
-                    reply(event.reply_token, msg.strip())
+                    reply_text(event.reply_token, msg.strip())
         except:
-            reply(event.reply_token, "查詢建議失敗")
+            reply_text(event.reply_token, "查詢建議失敗")
     elif text in ["說明", "help", "Help", "?"]:
-        reply(event.reply_token, HELP_MSG)
+        reply_text(event.reply_token, HELP_MSG)
     elif text.startswith("新增"):
         parts = text.split()
         if len(parts) == 4:
@@ -814,15 +978,15 @@ def handle_message(event):
                 name = (tw or us or {}).get("name", symbol) if (tw or us) else symbol
                 save_portfolio_to_sheets(user_id, symbol, name, market, int(parts[2]), float(parts[3]))
                 log_to_sheets(user_id, "新增持股", symbol, "成功")
-                reply(event.reply_token,
+                reply_text(event.reply_token,
                       f"✅ 新增成功\n"
                       f"━━━━━━━━━━━━━━\n"
                       f"　{symbol}｜{name}\n"
                       f"　{parts[2]} 股　均價 {parts[3]}")
             except:
-                reply(event.reply_token, "格式錯誤\n範例：新增 2330 100 200")
+                reply_text(event.reply_token, "格式錯誤\n範例：新增 2330 100 200")
         else:
-            reply(event.reply_token, "格式：新增 代碼 股數 買入價\n範例：新增 2330 100 200")
+            reply_text(event.reply_token, "格式：新增 代碼 股數 買入價\n範例：新增 2330 100 200")
     elif text.startswith("刪除"):
         parts = text.split()
         if len(parts) == 2:
@@ -834,21 +998,25 @@ def handle_message(event):
                 save_portfolio(p)
                 delete_portfolio_from_sheets(user_id, symbol)
                 log_to_sheets(user_id, "刪除持股", symbol, "成功")
-                reply(event.reply_token, f"✅ 已刪除 {symbol}")
+                reply_text(event.reply_token, f"✅ 已刪除 {symbol}")
             else:
-                reply(event.reply_token, f"找不到 {symbol}")
+                reply_text(event.reply_token, f"找不到 {symbol}")
         else:
-            reply(event.reply_token, "格式：刪除 代碼\n範例：刪除 2330")
+            reply_text(event.reply_token, "格式：刪除 代碼\n範例：刪除 2330")
     else:
         t = text.upper().replace("查", "").strip()
         if t and (t.isdigit() or t.isalpha() or t.replace("-", "").isalnum()):
-            reply(event.reply_token, get_stock_summary(t, user_id))
+            flex, err = get_stock_flex(t, user_id)
+            if flex:
+                reply_flex(event.reply_token, flex, f"{t} 股票資訊")
+            else:
+                reply_text(event.reply_token, err or "查詢失敗")
         else:
-            reply(event.reply_token, HELP_MSG)
+            reply_text(event.reply_token, HELP_MSG)
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v9.0 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.0 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
