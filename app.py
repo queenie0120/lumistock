@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v8.0（Rich Menu 自動設定）
+LINE Bot 模組 v8.1（台股名稱修正）
 """
 
 from flask import Flask, request, abort
@@ -41,15 +41,12 @@ def setup_rich_menu():
             "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
             "Content-Type": "application/json"
         }
-
-        # 先刪除舊的 Rich Menu
         r = requests.get("https://api.line.me/v2/bot/richmenu/list",
                          headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
         for menu in r.json().get("richmenus", []):
             requests.delete(f"https://api.line.me/v2/bot/richmenu/{menu['richMenuId']}",
                            headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
 
-        # 建立新 Rich Menu
         rich_menu_body = {
             "size": {"width": 2500, "height": 1686},
             "selected": True,
@@ -71,19 +68,13 @@ def setup_rich_menu():
         if not rich_menu_id:
             return
 
-        # 從 GitHub 下載圖片並上傳
         img_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/richmenu.png"
         img_r = requests.get(img_url, timeout=15)
         requests.post(
             f"https://api-data.line.me/v2/bot/richmenu/{rich_menu_id}/content",
-            headers={
-                "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-                "Content-Type": "image/png"
-            },
+            headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "image/png"},
             data=img_r.content
         )
-
-        # 設為預設選單
         requests.post(
             f"https://api.line.me/v2/bot/user/all/richmenu/{rich_menu_id}",
             headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
@@ -94,16 +85,12 @@ def setup_rich_menu():
 
 
 # ══════════════════════════════════════════
-#  Google Sheets 連線
+#  Google Sheets
 # ══════════════════════════════════════════
 def get_sheets_client():
     try:
-        creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-        creds_dict = json.loads(creds_json)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
+        creds_dict = json.loads(os.environ.get("GOOGLE_SHEETS_CREDENTIALS"))
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         return gspread.authorize(creds)
     except:
@@ -118,14 +105,11 @@ def get_sheet(sheet_name):
         pass
     return None
 
-def log_to_sheets(user_id, action, content, result, suggestion="", error=""):
+def log_to_sheets(user_id, action, content, result):
     try:
         sheet = get_sheet("系統記錄")
         if sheet:
-            sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-                user_id, action, content, result, suggestion, error
-            ])
+            sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M"), user_id, action, content, result, "", ""])
     except:
         pass
 
@@ -133,10 +117,7 @@ def save_suggestion_to_sheets(user_id, text):
     try:
         sheet = get_sheet("系統記錄")
         if sheet:
-            sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-                user_id, "建議", "", "", text, ""
-            ])
+            sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M"), user_id, "建議", "", "", text, ""])
     except:
         pass
 
@@ -145,10 +126,7 @@ def save_portfolio_to_sheets(user_id, symbol, name, market, shares, buy_price):
         sheet = get_sheet("自選股")
         if sheet:
             now = datetime.now().strftime("%Y-%m-%d %H:%M")
-            sheet.append_row([
-                user_id, symbol, name, market,
-                shares, buy_price, "", "", "", now, now
-            ])
+            sheet.append_row([user_id, symbol, name, market, shares, buy_price, "", "", "", now, now])
     except:
         pass
 
@@ -169,12 +147,10 @@ def update_tw_data_to_sheets(stock_id, data):
         sheet = get_sheet("台股資料")
         if sheet and data:
             sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d"),
-                stock_id, data.get("name",""),
+                datetime.now().strftime("%Y-%m-%d"), stock_id, data.get("name",""),
                 "", data.get("high",""), data.get("low",""),
                 data.get("price",""), data.get("vol",""),
-                f"{data.get('pct',0):+.2f}%",
-                "", "", "", "", ""
+                f"{data.get('pct',0):+.2f}%", "", "", "", "", ""
             ])
     except:
         pass
@@ -184,10 +160,8 @@ def update_us_data_to_sheets(symbol, data):
         sheet = get_sheet("美股資料")
         if sheet and data:
             sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d"),
-                symbol, data.get("name",""),
-                data.get("price",""),
-                f"{data.get('pct',0):+.2f}%",
+                datetime.now().strftime("%Y-%m-%d"), symbol, data.get("name",""),
+                data.get("price",""), f"{data.get('pct',0):+.2f}%",
                 "", "", "", "", "", "", "", ""
             ])
     except:
@@ -215,41 +189,90 @@ def push_to_owner(text):
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(
-                PushMessageRequest(
-                    to=OWNER_USER_ID,
-                    messages=[TextMessage(text=text)]
-                )
+                PushMessageRequest(to=OWNER_USER_ID, messages=[TextMessage(text=text)])
             )
     except:
         pass
 
 
 # ══════════════════════════════════════════
-#  台股資料
+#  台股中文名稱
+# ══════════════════════════════════════════
+def get_tw_stock_name(stock_id: str) -> str:
+    """從證交所抓台股中文名稱"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
+        r = requests.get(url, headers=headers, timeout=5)
+        data = r.json()
+        if data.get("stat") == "OK":
+            title = data.get("title", "")
+            if " " in title:
+                return title.split(" ")[-1].strip()
+    except:
+        pass
+    # 備援：用櫃買
+    try:
+        url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&o=json&s=0,asc&q={stock_id}"
+        r = requests.get(url, headers=headers, timeout=5)
+        data = r.json()
+        rows = data.get("aaData", [])
+        if rows and len(rows[0]) > 1:
+            return rows[0][1]
+    except:
+        pass
+    return stock_id
+
+
+# ══════════════════════════════════════════
+#  台股資料（盤中＋盤後多重備援）
 # ══════════════════════════════════════════
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
-    for market in ["tse", "otc"]:
-        try:
-            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{stock_id}.tw&json=1&delay=0"
-            r = requests.get(url, headers=headers, timeout=8)
-            data = r.json()
-            items = data.get("msgArray", [])
-            if items and items[0].get("z", "-") != "-":
-                d = items[0]
-                price = float(d.get("z", 0) or d.get("y", 0))
-                prev  = float(d.get("y", price))
-                chg   = price - prev
-                pct   = chg / prev * 100 if prev else 0
-                return {
-                    "name": d.get("n", stock_id), "price": price,
-                    "chg": chg, "pct": pct,
-                    "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
-                    "vol": d.get("v", "N/A"),
-                    "market": "上市" if market == "tse" else "上櫃"
-                }
-        except:
-            pass
+
+    # 第一優先：盤中即時（上市）
+    try:
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw&json=1&delay=0"
+        r = requests.get(url, headers=headers, timeout=8)
+        data = r.json()
+        items = data.get("msgArray", [])
+        if items and items[0].get("z", "-") != "-":
+            d = items[0]
+            price = float(d.get("z", 0) or d.get("y", 0))
+            prev  = float(d.get("y", price))
+            chg   = price - prev
+            pct   = chg / prev * 100 if prev else 0
+            return {
+                "name": d.get("n", stock_id), "price": price,
+                "chg": chg, "pct": pct,
+                "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
+                "vol": d.get("v", "N/A"), "market": "上市"
+            }
+    except:
+        pass
+
+    # 第二優先：盤中即時（上櫃）
+    try:
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=otc_{stock_id}.tw&json=1&delay=0"
+        r = requests.get(url, headers=headers, timeout=8)
+        data = r.json()
+        items = data.get("msgArray", [])
+        if items and items[0].get("z", "-") != "-":
+            d = items[0]
+            price = float(d.get("z", 0) or d.get("y", 0))
+            prev  = float(d.get("y", price))
+            chg   = price - prev
+            pct   = chg / prev * 100 if prev else 0
+            return {
+                "name": d.get("n", stock_id), "price": price,
+                "chg": chg, "pct": pct,
+                "high": d.get("h", "N/A"), "low": d.get("l", "N/A"),
+                "vol": d.get("v", "N/A"), "market": "上櫃"
+            }
+    except:
+        pass
+
+    # 第三優先：盤後收盤（上市）
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
@@ -261,7 +284,8 @@ def get_tw_stock(stock_id: str) -> dict:
             prev  = float(rows[-2][6].replace(",", "")) if len(rows) > 1 else price
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
-            name  = data.get("title", "").split(" ")[-1] if data.get("title") else stock_id
+            title = data.get("title", "")
+            name  = title.split(" ")[-1].strip() if " " in title else stock_id
             return {
                 "name": name, "price": price,
                 "chg": chg, "pct": pct,
@@ -270,6 +294,8 @@ def get_tw_stock(stock_id: str) -> dict:
             }
     except:
         pass
+
+    # 第四優先：Yahoo Finance + 證交所名稱
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}.TW?interval=1d&range=5d"
         r = requests.get(url, headers=headers, timeout=10)
@@ -279,15 +305,16 @@ def get_tw_stock(stock_id: str) -> dict:
         prev  = meta.get("chartPreviousClose", price)
         chg   = price - prev
         pct   = chg / prev * 100 if prev else 0
-        name  = meta.get("longName") or meta.get("shortName") or stock_id
+        name  = get_tw_stock_name(stock_id)
         return {
-            "name": name[:10], "price": price,
+            "name": name, "price": price,
             "chg": chg, "pct": pct,
             "high": "N/A", "low": "N/A", "vol": "N/A",
             "market": "收盤"
         }
     except:
         pass
+
     return None
 
 
@@ -309,11 +336,7 @@ def get_us_stock(symbol: str) -> dict:
         chg   = price - prev
         pct   = chg / prev * 100 if prev else 0
         name  = meta.get("longName") or meta.get("shortName") or symbol
-        return {
-            "name": name[:20], "price": price,
-            "chg": chg, "pct": pct,
-            "closes": closes
-        }
+        return {"name": name[:20], "price": price, "chg": chg, "pct": pct, "closes": closes}
     except:
         pass
     return None
@@ -359,6 +382,17 @@ def get_tw_kline(stock_id: str) -> str:
                 except:
                     pass
             return get_kline_text(closes)
+    except:
+        pass
+    # 備援：Yahoo Finance
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}.TW?interval=1d&range=60d"
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        closes = [c for c in closes if c is not None]
+        return get_kline_text(closes)
     except:
         pass
     return "📈 K線資料暫無法取得"
@@ -431,9 +465,29 @@ def get_stock_summary(symbol: str, user_id: str = "") -> str:
 #  大盤
 # ══════════════════════════════════════════
 def get_market_summary() -> str:
-    indices = [("^TWII","台灣加權"),("^GSPC","S&P 500"),("^IXIC","那斯達克"),("^DJI","道瓊")]
     headers = {"User-Agent": "Mozilla/5.0"}
     msg = f"🌐 全球大盤　{datetime.now().strftime('%m/%d %H:%M')}\n━━━━━━━━━━━━━━\n"
+
+    # 台灣加權
+    try:
+        url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0"
+        r = requests.get(url, headers=headers, timeout=8)
+        data = r.json()
+        items = data.get("msgArray", [])
+        if items:
+            d = items[0]
+            price = float(d.get("z", 0) or d.get("y", 0))
+            prev  = float(d.get("y", price))
+            pct   = (price - prev) / prev * 100 if prev else 0
+            icon  = "🟢" if pct >= 0 else "🔴"
+            msg  += f"{icon} 台灣加權　{price:,.2f}　{pct:+.2f}%\n"
+        else:
+            msg += "⚪ 台灣加權　--\n"
+    except:
+        msg += "⚪ 台灣加權　--\n"
+
+    # 美股指數
+    indices = [("^GSPC","S&P 500"),("^IXIC","那斯達克"),("^DJI","道瓊")]
     for sym, name in indices:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
@@ -447,6 +501,7 @@ def get_market_summary() -> str:
             msg  += f"{icon} {name}　{price:,.2f}　{pct:+.2f}%\n"
         except:
             msg += f"⚪ {name}　--\n"
+
     return msg.strip()
 
 
@@ -563,10 +618,7 @@ HELP_MSG = """✨ 慧股拾光 Lumistock
 def reply(reply_token, text):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text)]
-            )
+            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
         )
 
 
@@ -594,7 +646,6 @@ def handle_message(event):
     text = event.message.text.strip()
     user_id = event.source.user_id
 
-    # 查股票模式
     if text == "查股票":
         reply(event.reply_token, "🔍 請直接輸入股票代號\n台股範例：2330\n美股範例：AAPL")
         return
@@ -682,11 +733,10 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v8.0 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v8.1 啟動中...")
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)
 
 
-# 用 gunicorn 啟動時也執行 Rich Menu 設定
 setup_rich_menu()
