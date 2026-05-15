@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.2（名稱修正＋盤中資料修正）
+LINE Bot 模組 v10.4（market顯示修正）
 """
 
 from flask import Flask, request, abort
@@ -45,8 +45,6 @@ def now_taipei():
 # ══════════════════════════════════════════
 def init_name_cache():
     headers = {"User-Agent": "Mozilla/5.0"}
-
-    # 上市股票
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         r = requests.get(url, headers=headers, timeout=15)
@@ -61,8 +59,6 @@ def init_name_cache():
         print(f"✅ 上市股票名稱載入：{count} 筆")
     except Exception as e:
         print(f"上市名稱載入失敗：{e}")
-
-    # 上櫃股票
     try:
         url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
         r = requests.get(url, headers=headers, timeout=15)
@@ -77,7 +73,6 @@ def init_name_cache():
         print(f"✅ 上櫃股票名稱載入：{count} 筆")
     except Exception as e:
         print(f"上櫃名稱載入失敗：{e}")
-
     print(f"✅ 股票名稱總計：{len(NAME_CACHE)} 筆")
 
 
@@ -245,8 +240,9 @@ def push_to_owner(text):
 #  台股名稱（統一來源）
 # ══════════════════════════════════════════
 def get_tw_stock_name(stock_id: str) -> str:
-    if stock_id in NAME_CACHE and NAME_CACHE[stock_id] != stock_id:
-        return NAME_CACHE[stock_id]
+    cached = NAME_CACHE.get(stock_id, "")
+    if cached and cached != stock_id:
+        return cached
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
@@ -262,16 +258,31 @@ def get_tw_stock_name(stock_id: str) -> str:
                     return name
     except:
         pass
-    return NAME_CACHE.get(stock_id, stock_id)
+    try:
+        today = now_taipei()
+        civil_year = today.year - 1911
+        date_str = f"{civil_year}/{today.month:02d}/{today.day:02d}"
+        url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&o=json&d={date_str}&s=0,asc&q={stock_id}"
+        r = requests.get(url, headers=headers, timeout=5)
+        data = r.json()
+        rows = data.get("aaData", [])
+        if rows and len(rows[0]) > 1:
+            name = rows[0][1].strip()
+            if name and name != stock_id:
+                NAME_CACHE[stock_id] = name
+                return name
+    except:
+        pass
+    return stock_id
 
 
 # ══════════════════════════════════════════
-#  台股資料（盤中優先）
+#  台股資料（盤中優先，market 標示正確）
 # ══════════════════════════════════════════
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 盤中即時（上市＋上櫃）
+    # 盤中即時（上市＋上櫃）→ market 標示「盤中」
     for market_type, market_label in [("tse", "上市"), ("otc", "上櫃")]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market_type}_{stock_id}.tw&json=1&delay=0"
@@ -291,7 +302,8 @@ def get_tw_stock(stock_id: str) -> dict:
                     "name": name, "price": price, "chg": chg, "pct": pct,
                     "open": d.get("o", "N/A"), "high": d.get("h", "N/A"),
                     "low": d.get("l", "N/A"), "vol": d.get("v", "N/A"),
-                    "market": market_label, "time": d.get("t", "")
+                    "market": f"{market_label}・盤中",
+                    "time": d.get("t", "")
                 }
         except:
             pass
@@ -313,7 +325,7 @@ def get_tw_stock(stock_id: str) -> dict:
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": last[3].replace(",",""), "high": last[4].replace(",",""),
                 "low": last[5].replace(",",""), "vol": last[1].replace(",",""),
-                "market": "上市（收盤）", "time": last[0]
+                "market": "上市・收盤", "time": last[0]
             }
     except:
         pass
@@ -340,7 +352,7 @@ def get_tw_stock(stock_id: str) -> dict:
                 "high": last[4].replace(",","") if len(last) > 4 else "N/A",
                 "low":  last[5].replace(",","") if len(last) > 5 else "N/A",
                 "vol":  last[0].replace(",","") if len(last) > 0 else "N/A",
-                "market": "上櫃（收盤）", "time": date_str
+                "market": "上櫃・收盤", "time": date_str
             }
     except:
         pass
@@ -359,7 +371,7 @@ def get_tw_stock(stock_id: str) -> dict:
         return {
             "name": name, "price": price, "chg": chg, "pct": pct,
             "open": "N/A", "high": "N/A", "low": "N/A", "vol": "N/A",
-            "market": "收盤", "time": ""
+            "market": "Yahoo備援", "time": ""
         }
     except:
         pass
@@ -425,14 +437,13 @@ def get_kline_analysis(closes: list) -> dict:
     ma60  = ma(60)
     ma120 = ma(120)
     ma240 = ma(240)
-    price = closes[-1]
 
     if ma5 and ma20 and ma60:
         if ma5 > ma20 > ma60:
             trend = "多頭排列 📈"
         elif ma5 < ma20 < ma60:
             trend = "空頭排列 📉"
-        elif price > ma60:
+        elif closes[-1] > ma60:
             trend = "季線之上"
         else:
             trend = "季線之下"
@@ -555,6 +566,9 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
     rsi_label = kline.get("rsi_label", "--")
     rsi_color = "#C47055" if rsi > 70 else ("#5B8DB8" if rsi < 30 else "#8B6B5A")
 
+    # 統一顯示：代號 + 名稱
+    display_name = f"{symbol} {name}" if name and name != symbol else symbol
+
     news_contents = []
     for title, url in news_list[:4]:
         if url:
@@ -590,8 +604,14 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
                         {"type": "text", "text": market, "size": "xxs", "color": "#F0D0C0", "align": "end"}
                     ]
                 },
-                {"type": "text", "text": symbol, "size": "sm", "color": "#FFE8DC"},
-                {"type": "text", "text": name, "size": "xl", "color": "#FFFFFF", "weight": "bold", "wrap": True}
+                {
+                    "type": "text",
+                    "text": display_name,
+                    "size": "xl",
+                    "color": "#FFFFFF",
+                    "weight": "bold",
+                    "wrap": True
+                }
             ]
         },
         "body": {
@@ -601,7 +621,6 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
             "paddingAll": "14px",
             "spacing": "sm",
             "contents": [
-                # 價格
                 {
                     "type": "box", "layout": "vertical",
                     "contents": [
@@ -610,7 +629,6 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
                     ]
                 },
                 {"type": "separator", "color": "#E8C4B4"},
-                # 開高低收
                 {
                     "type": "box", "layout": "horizontal",
                     "contents": [
@@ -645,7 +663,6 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
                     ]
                 },
                 {"type": "separator", "color": "#E8C4B4"},
-                # 技術分析
                 {"type": "text", "text": "📊 技術分析", "size": "sm", "weight": "bold", "color": "#7A3828"},
                 {"type": "text", "text": spark, "size": "xl", "color": color},
                 {"type": "text", "text": f"趨勢　{trend}", "size": "sm", "color": "#7A3828"},
@@ -690,8 +707,12 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         tw = get_tw_stock(symbol)
         if not tw:
             return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
+        # 統一名稱來源
+        tw_name = get_tw_stock_name(symbol)
         if not tw.get("name") or tw["name"] == symbol:
-            tw["name"] = get_tw_stock_name(symbol)
+            tw["name"] = tw_name
+        if tw["name"] == symbol and tw_name != symbol:
+            tw["name"] = tw_name
         closes = get_tw_closes(symbol)
         kline  = get_kline_analysis(closes)
         news   = get_news(f"{symbol} {tw['name']} 股票")
@@ -1049,12 +1070,8 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.2 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.4 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-init_name_cache()
-setup_rich_menu()
