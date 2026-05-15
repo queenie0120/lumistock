@@ -503,17 +503,13 @@ def push_to_owner(text):
 
 
 # ══════════════════════════════════════════
-#  台股名稱（強制中文，Yahoo 英文不寫快取）
+#  台股名稱（強制中文）
 # ══════════════════════════════════════════
 def get_tw_stock_name(stock_id: str) -> str:
-    # 1. NAME_CACHE 有中文直接回傳
     cached = NAME_CACHE.get(stock_id, "")
     if cached and has_chinese(cached):
         return cached
-
     headers = {"User-Agent": "Mozilla/5.0"}
-
-    # 2. TWSE STOCK_DAY title
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=5)
@@ -528,8 +524,6 @@ def get_tw_stock_name(stock_id: str) -> str:
                     return name
     except:
         pass
-
-    # 3. TWSE 盤中 API
     for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
@@ -543,8 +537,6 @@ def get_tw_stock_name(stock_id: str) -> str:
                     return name
         except:
             pass
-
-    # 4. TPEx 盤後
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -560,8 +552,6 @@ def get_tw_stock_name(stock_id: str) -> str:
                 return name
     except:
         pass
-
-    # 5. Yahoo Finance 最後備援（英文不寫快取）
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -572,16 +562,14 @@ def get_tw_stock_name(stock_id: str) -> str:
             if name:
                 if has_chinese(name):
                     NAME_CACHE[stock_id] = name
-                # 英文名稱只回傳，不寫快取
                 return name
         except:
             pass
-
     return stock_id
 
 
 # ══════════════════════════════════════════
-#  台股資料（名稱強制走 get_tw_stock_name）
+#  台股資料
 # ══════════════════════════════════════════
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -611,14 +599,11 @@ def get_tw_stock(stock_id: str) -> dict:
                 is_realtime = False
             chg  = price - prev
             pct  = chg / prev * 100 if prev else 0
-
-            # 名稱強制中文
             if has_chinese(raw_name):
                 NAME_CACHE[stock_id] = raw_name
             name = get_tw_stock_name(stock_id)
             if not has_chinese(name):
-                name = raw_name  # fallback 到 API 回傳值
-
+                name = raw_name
             status = "盤中" if is_realtime else "試撮"
             open_v = d.get("o", "-")
             high_v = d.get("h", "-")
@@ -714,7 +699,6 @@ def get_tw_stock(stock_id: str) -> dict:
             prev   = meta.get("regularMarketPreviousClose") or (closes[-2] if len(closes) >= 2 else price)
             chg    = price - prev
             pct    = chg / prev * 100 if prev else 0
-            # 強制走名稱函數
             name   = get_tw_stock_name(stock_id)
             vol_str = f"{int(vols[-1]/1000):,} 張" if vols else "N/A"
             return {
@@ -1043,27 +1027,16 @@ def score_news_sentiment(sentiment: dict) -> int:
 
 
 # ══════════════════════════════════════════
-#  法人資料（修正欄位＋自動往前找5交易日）
+#  法人資料（修正欄位 row[4]=外資 row[10]=投信）
 # ══════════════════════════════════════════
 def fetch_institution_data() -> tuple:
-    """
-    回傳 (candidates, data_date, is_today)
-    T86 欄位：
-      row[0]  = 證券代號
-      row[1]  = 證券名稱
-      row[4]  = 外資買賣超（股）
-      row[10] = 投信買賣超（股）
-    單位轉換：股 ÷ 1000 = 張
-    """
     headers = {"User-Agent": "Mozilla/5.0"}
 
     for offset in range(7):
         try:
             check_date = now_taipei() - timedelta(days=offset)
-            # 跳過週末
             if check_date.weekday() >= 5:
                 continue
-
             if offset == 0:
                 url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
             else:
@@ -1079,14 +1052,11 @@ def fetch_institution_data() -> tuple:
                     try:
                         if len(row) < 11:
                             continue
-                        # 外資：row[4]，投信：row[10]，單位為股
-                        foreign = int(row[4].replace(",","").replace("+","").replace("-","0") or 0)
-                        invest  = int(row[10].replace(",","").replace("+","").replace("-","0") or 0)
-                        # 有負號需保留
-                        if row[4].strip().startswith("-"):
-                            foreign = -abs(foreign)
-                        if row[10].strip().startswith("-"):
-                            invest = -abs(invest)
+                        # 外資 row[4]，投信 row[10]，單位：股
+                        f_str = row[4].strip().replace(",", "").replace("+", "")
+                        i_str = row[10].strip().replace(",", "").replace("+", "")
+                        foreign = int(f_str) if f_str and f_str != "-" else 0
+                        invest  = int(i_str) if i_str and i_str != "-" else 0
                         # 轉換為張
                         foreign_lot = foreign // 1000
                         invest_lot  = invest  // 1000
@@ -1099,10 +1069,10 @@ def fetch_institution_data() -> tuple:
                 if candidates:
                     data_date = data.get("date", check_date.strftime("%Y/%m/%d"))
                     is_today  = (offset == 0)
-                    print(f"✅ 法人資料載入：{data_date}，共 {len(candidates)} 筆")
+                    print(f"✅ 法人資料：{data_date}，{len(candidates)} 筆")
                     return candidates, data_date, is_today
         except Exception as e:
-            print(f"法人資料 offset={offset} 失敗：{e}")
+            print(f"法人 offset={offset} 失敗：{e}")
 
     return [], "", False
 
@@ -1113,7 +1083,6 @@ def fetch_institution_data() -> tuple:
 def get_recommendation() -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 大盤
     mkt_str   = ""
     market_ok = True
     try:
@@ -1130,7 +1099,6 @@ def get_recommendation() -> str:
     except:
         mkt_str = "⚪ 大盤資料取得中"
 
-    # 法人資料
     candidates, data_date, is_today = fetch_institution_data()
 
     if not candidates:
@@ -1142,23 +1110,20 @@ def get_recommendation() -> str:
     candidates.sort(key=lambda x: x[2], reverse=True)
     top10 = candidates[:10]
 
-    # 評分
     scored = []
     for sid, name, total_lot, foreign_lot, invest_lot in top10:
         tw = get_tw_stock(sid)
         if not tw:
             continue
-        closes    = get_tw_closes(sid)
-        tech      = score_technical(closes, tw["pct"])
-        chip      = score_chip(foreign_lot, invest_lot)
-        news_list = get_news(f"{sid} {tw['name']} 股票", count=4, trusted_only=True)
-        sentiment = analyze_news_sentiment(news_list)
+        closes     = get_tw_closes(sid)
+        tech       = score_technical(closes, tw["pct"])
+        chip       = score_chip(foreign_lot, invest_lot)
+        news_list  = get_news(f"{sid} {tw['name']} 股票", count=4, trusted_only=True)
+        sentiment  = analyze_news_sentiment(news_list)
         news_score = score_news_sentiment(sentiment)
-
         total_score = tech["score"] + chip["score"] + news_score
         if not market_ok:
             total_score = int(total_score * 0.8)
-
         scored.append({
             "sid": sid, "name": tw["name"],
             "price": tw["price"], "pct": tw["pct"],
@@ -1175,7 +1140,6 @@ def get_recommendation() -> str:
                 "━━━━━━━━━━━━━━\n"
                 "　目前無符合條件個股")
 
-    # 日期標註
     date_note = f"　資料日期：{data_date}"
     if not is_today:
         date_note += "（前交易日）"
@@ -1449,7 +1413,6 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         tw = get_tw_stock(symbol)
         if not tw:
             return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
-        # 最終名稱保護
         if not has_chinese(tw.get("name", "")):
             tw["name"] = get_tw_stock_name(symbol)
         closes = get_tw_closes(symbol)
@@ -1536,7 +1499,7 @@ def index():
 
 @app.after_request
 def add_header(response):
-    response.headers["ngrok-skip-browser-warning"] as "true"
+    response.headers["ngrok-skip-browser-warning"] = "true"
     return response
 
 @app.route("/callback", methods=["POST"])
