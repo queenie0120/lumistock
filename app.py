@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.7（上市名稱三重備援）
+LINE Bot 模組 v10.8（Header重構＋美股完整化）
 """
 
 from flask import Flask, request, abort
@@ -52,7 +52,6 @@ def init_name_cache():
     headers = {"User-Agent": "Mozilla/5.0"}
     tw_loaded = False
 
-    # 上市方法1：openapi.twse.com.tw
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         r = requests.get(url, headers=headers, timeout=15)
@@ -71,7 +70,6 @@ def init_name_cache():
     except Exception as e:
         print(f"上市方法1失敗：{e}")
 
-    # 上市方法2：TWSE rwd endpoint
     if not tw_loaded:
         try:
             url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
@@ -91,7 +89,6 @@ def init_name_cache():
         except Exception as e:
             print(f"上市方法2失敗：{e}")
 
-    # 上市方法3：openapi 公司清單
     if not tw_loaded:
         try:
             url = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
@@ -112,9 +109,8 @@ def init_name_cache():
             print(f"上市方法3失敗：{e}")
 
     if not tw_loaded:
-        print("⚠️ 上市名稱全部備援失敗，將使用即時查詢")
+        print("⚠️ 上市名稱全部備援失敗")
 
-    # 上櫃
     try:
         url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
         r = requests.get(url, headers=headers, timeout=15)
@@ -294,13 +290,17 @@ def push_to_owner(text):
 
 
 # ══════════════════════════════════════════
-#  台股名稱（強化多重備援）
+#  台股名稱（完整 fallback chain）
 # ══════════════════════════════════════════
 def get_tw_stock_name(stock_id: str) -> str:
+    # 1. 快取
     cached = NAME_CACHE.get(stock_id, "")
     if cached and cached != stock_id:
         return cached
+
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 2. TWSE STOCK_DAY title
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=5)
@@ -315,6 +315,8 @@ def get_tw_stock_name(stock_id: str) -> str:
                     return name
     except:
         pass
+
+    # 3. TWSE 盤中 API
     for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
@@ -328,6 +330,23 @@ def get_tw_stock_name(stock_id: str) -> str:
                     return name
         except:
             pass
+
+    # 4. Yahoo Finance（ETF 最有效）
+    for suffix in [".TW", ".TWO"]:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
+            r = requests.get(url, headers=headers, timeout=5)
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            name = meta.get("shortName") or meta.get("longName") or ""
+            name = name.strip()
+            if name and name != stock_id:
+                NAME_CACHE[stock_id] = name
+                return name
+        except:
+            pass
+
+    # 5. 上櫃盤後
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -343,11 +362,12 @@ def get_tw_stock_name(stock_id: str) -> str:
                 return name
     except:
         pass
+
     return stock_id
 
 
 # ══════════════════════════════════════════
-#  台股資料（盤中開高低補值）
+#  台股資料
 # ══════════════════════════════════════════
 def get_yahoo_ohlc(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -376,6 +396,7 @@ def get_yahoo_ohlc(stock_id: str) -> dict:
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
 
+    # 盤中即時
     for market_type, market_label in [("tse", "上市"), ("otc", "上櫃")]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market_type}_{stock_id}.tw&json=1&delay=0"
@@ -403,7 +424,7 @@ def get_tw_stock(stock_id: str) -> dict:
             pct  = chg / prev * 100 if prev else 0
             name = raw_name if raw_name != stock_id else get_tw_stock_name(stock_id)
             NAME_CACHE[stock_id] = name
-            market_status = f"{market_label}・盤中" if is_realtime else f"{market_label}・試撮"
+            status = "盤中" if is_realtime else "試撮"
 
             open_v = clean_value(d.get("o"))
             high_v = clean_value(d.get("h"))
@@ -420,12 +441,13 @@ def get_tw_stock(stock_id: str) -> dict:
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": open_v, "high": high_v, "low": low_v, "vol": vol_v,
-                "market": market_status, "time": d.get("t", "")
+                "market_type": "台股", "status": status,
+                "source": "TWSE 即時", "time": d.get("t", "")
             }
         except:
             pass
 
-    # 盤後備援：上市收盤
+    # 盤後備援：上市
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
@@ -442,12 +464,13 @@ def get_tw_stock(stock_id: str) -> dict:
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": last[3].replace(",",""), "high": last[4].replace(",",""),
                 "low": last[5].replace(",",""), "vol": last[1].replace(",",""),
-                "market": "上市・收盤", "time": last[0]
+                "market_type": "台股", "status": "收盤",
+                "source": "TWSE", "time": last[0]
             }
     except:
         pass
 
-    # 盤後備援：上櫃收盤
+    # 盤後備援：上櫃
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -469,12 +492,13 @@ def get_tw_stock(stock_id: str) -> dict:
                 "high": last[4].replace(",","") if len(last) > 4 else "N/A",
                 "low":  last[5].replace(",","") if len(last) > 5 else "N/A",
                 "vol":  last[0].replace(",","") if len(last) > 0 else "N/A",
-                "market": "上櫃・收盤", "time": date_str
+                "market_type": "台股", "status": "收盤",
+                "source": "TPEx", "time": date_str
             }
     except:
         pass
 
-    # 最後備援：Yahoo Finance
+    # Yahoo 備援
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -497,7 +521,8 @@ def get_tw_stock(stock_id: str) -> dict:
                 "high": f"{highs[-1]:.2f}" if highs else "N/A",
                 "low":  f"{lows[-1]:.2f}"  if lows  else "N/A",
                 "vol": "N/A",
-                "market": "Yahoo備援", "time": ""
+                "market_type": "台股", "status": "收盤",
+                "source": "Yahoo Finance", "time": ""
             }
         except:
             pass
@@ -506,31 +531,35 @@ def get_tw_stock(stock_id: str) -> dict:
 
 
 # ══════════════════════════════════════════
-#  美股資料
+#  美股資料（range=1y，補成交量）
 # ══════════════════════════════════════════
 def get_us_stock(symbol: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=20d"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1y"
         r = requests.get(url, headers=headers, timeout=10)
         data = r.json()
         result = data["chart"]["result"][0]
         meta = result["meta"]
         quotes = result.get("indicators", {}).get("quote", [{}])[0]
-        closes = [c for c in quotes.get("close", []) if c is not None]
-        opens  = [o for o in quotes.get("open",  []) if o is not None]
-        highs  = [h for h in quotes.get("high",  []) if h is not None]
-        lows   = [l for l in quotes.get("low",   []) if l is not None]
+        closes = [c for c in quotes.get("close",  []) if c is not None]
+        opens  = [o for o in quotes.get("open",   []) if o is not None]
+        highs  = [h for h in quotes.get("high",   []) if h is not None]
+        lows   = [l for l in quotes.get("low",    []) if l is not None]
+        vols   = [v for v in quotes.get("volume", []) if v is not None]
         price = meta.get("regularMarketPrice", 0)
         prev  = meta.get("chartPreviousClose", price)
         chg   = price - prev
         pct   = chg / prev * 100 if prev else 0
-        name  = meta.get("longName") or meta.get("shortName") or symbol
+        name  = meta.get("shortName") or meta.get("longName") or symbol
+        # 成交量：最新一筆，轉成萬股
+        vol_str = f"{int(vols[-1]/10000)}萬" if vols else "N/A"
         return {
-            "name": name[:20], "price": price, "chg": chg, "pct": pct,
+            "name": name[:16], "price": price, "chg": chg, "pct": pct,
             "open":  f"{opens[-1]:.2f}"  if opens  else "N/A",
             "high":  f"{highs[-1]:.2f}"  if highs  else "N/A",
             "low":   f"{lows[-1]:.2f}"   if lows   else "N/A",
+            "vol": vol_str,
             "closes": closes
         }
     except:
@@ -665,7 +694,7 @@ def get_news(query: str, count: int = 4) -> list:
 
 
 # ══════════════════════════════════════════
-#  Flex Message 股票卡片
+#  Flex Message 股票卡片（Header重構）
 # ══════════════════════════════════════════
 def make_ma_row(label, value):
     val_str = f"{value:.0f}" if value else "N/A"
@@ -679,7 +708,7 @@ def make_ma_row(label, value):
         ]
     }
 
-def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vol, kline, news_list, query_time):
+def make_stock_flex(symbol, name, market_type, status, source, price, chg, pct, open_p, high, low, vol, kline, news_list, query_time):
     is_up  = chg >= 0
     color  = "#C47055" if is_up else "#5B8DB8"
     arrow  = "▲" if is_up else "▼"
@@ -694,6 +723,8 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
     rsi    = kline.get("rsi", 0)
     rsi_label = kline.get("rsi_label", "--")
     rsi_color = "#C47055" if rsi > 70 else ("#5B8DB8" if rsi < 30 else "#8B6B5A")
+
+    # Header 只顯示「代號 名稱」
     display_name = f"{symbol} {name}" if name and name != symbol else symbol
 
     news_contents = []
@@ -724,9 +755,11 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
                     "type": "box", "layout": "horizontal",
                     "contents": [
                         {"type": "text", "text": "✨ 慧股拾光 Lumistock", "size": "xxs", "color": "#F0D0C0", "flex": 1},
-                        {"type": "text", "text": market, "size": "xxs", "color": "#F0D0C0", "align": "end"}
+                        # Header 右上角固定顯示市場類型
+                        {"type": "text", "text": market_type, "size": "xxs", "color": "#F0D0C0", "align": "end"}
                     ]
                 },
+                # Header 只顯示「代號 名稱」
                 {"type": "text", "text": display_name, "size": "xl", "color": "#FFFFFF", "weight": "bold", "wrap": True}
             ]
         },
@@ -792,7 +825,13 @@ def make_stock_flex(symbol, name, market, price, chg, pct, open_p, high, low, vo
                 {"type": "text", "text": "📰 相關新聞", "size": "sm", "weight": "bold", "color": "#7A3828"},
             ] + news_contents + [
                 {"type": "separator", "color": "#E8C4B4"},
-                {"type": "text", "text": f"🕐 查詢時間　{query_time}", "size": "xxs", "color": "#C4907A"}
+                {
+                    "type": "box", "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": f"🕐 {query_time}　{status}", "size": "xxs", "color": "#C4907A", "flex": 1},
+                        {"type": "text", "text": source, "size": "xxs", "color": "#D4B0A0", "align": "end", "flex": 1}
+                    ]
+                }
             ]
         }
     }
@@ -810,6 +849,7 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         tw = get_tw_stock(symbol)
         if not tw:
             return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
+        # 強化名稱保護
         if not tw.get("name") or tw["name"] == symbol:
             tw["name"] = get_tw_stock_name(symbol)
         if tw["name"] == symbol:
@@ -820,7 +860,10 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         update_tw_data_to_sheets(symbol, tw)
         log_to_sheets(user_id, "查詢台股", symbol, "成功")
         flex = make_stock_flex(
-            symbol, tw["name"], tw["market"],
+            symbol, tw["name"],
+            tw.get("market_type", "台股"),
+            tw.get("status", ""),
+            tw.get("source", ""),
             tw["price"], tw["chg"], tw["pct"],
             tw.get("open", "N/A"), tw["high"], tw["low"], tw["vol"],
             kline, news, query_time
@@ -835,10 +878,11 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         update_us_data_to_sheets(symbol, us)
         log_to_sheets(user_id, "查詢美股", symbol, "成功")
         flex = make_stock_flex(
-            symbol, us["name"], "美股",
+            symbol, us["name"],
+            "美股", "", "Yahoo Finance",
             us["price"], us["chg"], us["pct"],
             us.get("open", "N/A"), us.get("high", "N/A"),
-            us.get("low", "N/A"), "N/A",
+            us.get("low", "N/A"), us.get("vol", "N/A"),
             kline, news, query_time
         )
         return flex, None
@@ -1171,7 +1215,7 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.7 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.8 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
