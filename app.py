@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.6（推薦股多維度評分）
+LINE Bot 模組 v10.9.7（推薦股法人資料備援）
 """
 
 from flask import Flask, request, abort
@@ -911,13 +911,10 @@ def get_news(query: str, count: int = 4, trusted_only: bool = False) -> list:
                 all_results.append((title[:28] + "…" if len(title) > 28 else title, link))
     except:
         pass
-
     trusted   = deduplicate_news([(t,u) for t,u in all_results if is_trusted_source(u)])
     untrusted = deduplicate_news([(t,u) for t,u in all_results if not is_trusted_source(u)])
-
     if trusted_only:
         return trusted[:count]
-
     combined = trusted[:count]
     if len(combined) < count:
         combined += untrusted[:count - len(combined)]
@@ -963,15 +960,13 @@ def analyze_news_sentiment(news_list: list) -> dict:
 
 
 # ══════════════════════════════════════════
-#  推薦股（多維度評分）
+#  推薦股評分
 # ══════════════════════════════════════════
 def score_technical(closes: list, pct: float) -> dict:
-    """技術面評分（滿分40）"""
     score = 0
     detail = []
-
     if not closes or len(closes) < 5:
-        return {"score": 0, "detail": []}
+        return {"score": 0, "detail": [], "rsi": 50}
 
     def ma(n):
         return sum(closes[-n:]) / n if len(closes) >= n else None
@@ -981,7 +976,6 @@ def score_technical(closes: list, pct: float) -> dict:
     ma60 = ma(60)
     price = closes[-1]
 
-    # 均線多頭
     if ma5 and ma20 and ma60 and ma5 > ma20 > ma60:
         score += 15
         detail.append("均線多頭排列")
@@ -989,12 +983,10 @@ def score_technical(closes: list, pct: float) -> dict:
         score += 8
         detail.append("短線均線向上")
 
-    # 站上季線
     if ma60 and price > ma60:
         score += 8
         detail.append("站上季線")
 
-    # RSI
     gains  = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
     losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
     avg_gain = sum(gains[-14:]) / min(14, len(gains)) if gains else 0
@@ -1003,66 +995,101 @@ def score_technical(closes: list, pct: float) -> dict:
 
     if 45 <= rsi <= 70:
         score += 10
-        detail.append(f"RSI 健康區間（{rsi:.0f}）")
+        detail.append(f"RSI 健康（{rsi:.0f}）")
     elif rsi < 30:
         score += 5
-        detail.append(f"RSI 超賣反彈機會（{rsi:.0f}）")
+        detail.append(f"RSI 超賣（{rsi:.0f}）")
     elif rsi > 80:
         score -= 5
-        detail.append(f"RSI 過熱（{rsi:.0f}）")
 
-    # 今日漲幅
     if 1 <= pct <= 6:
         score += 7
-        detail.append(f"今日漲幅健康（{pct:+.2f}%）")
+        detail.append(f"漲幅健康（{pct:+.2f}%）")
     elif pct > 8:
         score -= 3
-        detail.append(f"漲幅過大（{pct:+.2f}%）")
     elif pct < -5:
         score -= 8
-        detail.append(f"今日大跌（{pct:+.2f}%）")
 
     return {"score": max(0, min(score, 40)), "detail": detail, "rsi": rsi}
 
 def score_chip(foreign: int, invest: int) -> dict:
-    """籌碼面評分（滿分30）"""
     score = 0
     detail = []
-    total = foreign + invest
-
     if foreign > 5000:
         score += 15
-        detail.append(f"外資大買（{foreign:+,} 張）")
+        detail.append(f"外資大買 {foreign:+,}")
     elif foreign > 1000:
         score += 8
-        detail.append(f"外資買超（{foreign:+,} 張）")
+        detail.append(f"外資買超 {foreign:+,}")
     elif foreign < -3000:
         score -= 10
-        detail.append(f"外資大賣（{foreign:+,} 張）")
-
     if invest > 2000:
         score += 10
-        detail.append(f"投信大買（{invest:+,} 張）")
+        detail.append(f"投信大買 {invest:+,}")
     elif invest > 500:
         score += 5
-        detail.append(f"投信買超（{invest:+,} 張）")
-
+        detail.append(f"投信買超 {invest:+,}")
     if foreign > 0 and invest > 0:
         score += 5
-        detail.append("外資投信同步買")
-
-    return {"score": max(0, min(score, 30)), "detail": detail, "total": total}
+        detail.append("外資投信同買")
+    return {"score": max(0, min(score, 30)), "detail": detail}
 
 def score_news(sentiment: dict) -> dict:
-    """新聞情緒評分（滿分30）"""
-    score = 30 + sentiment["score"]  # 中性基礎30，偏多+，偏空-
-    score = max(0, min(score, 30))
+    score = max(0, min(30 + sentiment["score"], 30))
     return {"score": score, "label": sentiment["label"]}
 
+
+# ══════════════════════════════════════════
+#  法人資料（今日優先，自動往前找近5交易日）
+# ══════════════════════════════════════════
+def fetch_institution_data() -> tuple:
+    """回傳 (candidates list, data_date str)"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for offset in range(6):
+        try:
+            check_date = now_taipei() - timedelta(days=offset)
+            # 跳過週末
+            if check_date.weekday() >= 5:
+                continue
+            if offset == 0:
+                url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
+            else:
+                date_str = check_date.strftime("%Y%m%d")
+                url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL&date={date_str}"
+
+            r = requests.get(url, headers=headers, timeout=10)
+            data = r.json()
+
+            if data.get("stat") == "OK" and data.get("data"):
+                candidates = []
+                for row in data.get("data", []):
+                    try:
+                        foreign = int(row[4].replace(",","").replace("+",""))
+                        invest  = int(row[6].replace(",","").replace("+",""))
+                        total   = foreign + invest
+                        if total > 500:
+                            candidates.append((row[0], row[1], total, foreign, invest))
+                    except:
+                        pass
+                if candidates:
+                    data_date = data.get("date", check_date.strftime("%Y/%m/%d"))
+                    is_today = (offset == 0)
+                    return candidates, data_date, is_today
+        except:
+            pass
+
+    return [], "", False
+
+
+# ══════════════════════════════════════════
+#  推薦股（多維度評分）
+# ══════════════════════════════════════════
 def get_recommendation() -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 取得大盤狀況
+    # 大盤狀況
+    mkt_str   = ""
     market_ok = True
     try:
         url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0"
@@ -1078,62 +1105,37 @@ def get_recommendation() -> str:
     except:
         mkt_str = "⚪ 大盤資料取得中"
 
-    # 法人買超資料
-    candidates = []
-    try:
-        url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
-        r = requests.get(url, headers=headers, timeout=8)
-        data = r.json()
-        if data.get("stat") == "OK":
-            for row in data.get("data", []):
-                try:
-                    foreign = int(row[4].replace(",","").replace("+",""))
-                    invest  = int(row[6].replace(",","").replace("+",""))
-                    total   = foreign + invest
-                    if total > 500:
-                        candidates.append((row[0], row[1], total, foreign, invest))
-                except:
-                    pass
-    except:
-        pass
+    # 法人資料
+    candidates, data_date, is_today = fetch_institution_data()
 
     if not candidates:
-        return "⭐ 今日推薦股\n━━━━━━━━━━━━━━\n暫時無法取得法人資料"
+        return ("⭐ 今日推薦股\n"
+                "━━━━━━━━━━━━━━\n"
+                "　法人資料尚未更新\n"
+                "　請於交易日 15:30 後查詢")
 
     candidates.sort(key=lambda x: x[2], reverse=True)
-    top = candidates[:10]  # 取前10再評分篩選
+    top10 = candidates[:10]
 
     # 評分
     scored = []
-    for sid, name, total, foreign, invest in top:
+    for sid, name, total, foreign, invest in top10:
         tw = get_tw_stock(sid)
         if not tw:
             continue
-        price = tw["price"]
-        pct   = tw["pct"]
-
-        # 技術面
         closes = get_tw_closes(sid)
-        tech   = score_technical(closes, pct)
-
-        # 籌碼面
+        tech   = score_technical(closes, tw["pct"])
         chip   = score_chip(foreign, invest)
-
-        # 新聞情緒
         news_list = get_news(f"{sid} {name} 股票", count=4, trusted_only=True)
         sentiment = analyze_news_sentiment(news_list)
         news_s    = score_news(sentiment)
-
         total_score = tech["score"] + chip["score"] + news_s["score"]
-
-        # 大盤差時降低評分
         if not market_ok:
             total_score = int(total_score * 0.8)
-
         scored.append({
-            "sid": sid, "name": name, "price": price, "pct": pct,
+            "sid": sid, "name": name,
+            "price": tw["price"], "pct": tw["pct"],
             "foreign": foreign, "invest": invest,
-            "tech": tech, "chip": chip, "news": news_s,
             "sentiment": sentiment["label"],
             "score": total_score
         })
@@ -1141,24 +1143,31 @@ def get_recommendation() -> str:
     scored.sort(key=lambda x: x["score"], reverse=True)
     top5 = scored[:5]
 
-    # 組合訊息
+    # 日期標註
+    date_note = f"　資料日期：{data_date}" if data_date else ""
+    if not is_today:
+        date_note += "（前交易日）"
+
     msg = (f"⭐ 慧股推薦榜\n"
            f"━━━━━━━━━━━━━━\n"
            f"　{now_taipei().strftime('%m/%d %H:%M')} 更新\n"
+           f"{date_note}\n"
            f"　{mkt_str}\n"
            f"━━━━━━━━━━━━━━\n")
 
     for i, s in enumerate(top5, 1):
-        score_bar = "█" * (s["score"] // 10) + "░" * (10 - s["score"] // 10)
-        pct_str   = f"{s['pct']:+.2f}%"
+        filled  = s["score"] // 10
+        empty   = 10 - filled
+        bar     = "█" * filled + "░" * empty
+        pct_str = f"{s['pct']:+.2f}%"
         msg += (f"　{i}. {s['sid']} {s['name']}\n"
                 f"　   現價 {s['price']:.2f}　{pct_str}\n"
                 f"　   外資 {s['foreign']:+,}　投信 {s['invest']:+,} 張\n"
                 f"　   新聞 {s['sentiment']}\n"
-                f"　   評分 {score_bar} {s['score']}/100\n\n")
+                f"　   評分 {bar} {s['score']}/100\n\n")
 
     msg += ("━━━━━━━━━━━━━━\n"
-            "📊 評分維度：技術面＋籌碼面＋新聞情緒\n"
+            "📊 技術面＋籌碼面＋新聞情緒\n"
             "⚠️ 以上僅供參考，非投資建議")
     return msg
 
@@ -1381,7 +1390,7 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         log_to_sheets(user_id, "查詢台股", symbol, "成功")
         return make_stock_flex(
             symbol, tw["name"],
-            tw.get("market_type", "台股"), tw.get("status", ""), tw.get("source", ""),
+            tw.get("market_type","台股"), tw.get("status",""), tw.get("source",""),
             tw["price"], tw["chg"], tw["pct"],
             tw.get("open","N/A"), tw["high"], tw["low"], tw["vol"],
             kline, news, query_time
@@ -1668,7 +1677,7 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.6 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.7 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
