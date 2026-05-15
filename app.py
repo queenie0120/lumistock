@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.4（漲幅修正＋新聞白名單）
+LINE Bot 模組 v10.9.5（名稱/成交量/TPEx欄位/漲幅全修正）
 """
 
 from flask import Flask, request, abort
@@ -49,11 +49,27 @@ def has_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", str(text)))
 
 def format_tw_volume(v) -> str:
+    """台股成交量格式化（張）"""
     if v in ["-", "", None, "N/A"]:
         return "N/A"
     try:
         n = int(float(str(v).replace(",", "")))
-        return f"{n:,}"
+        return f"{n:,} 張"
+    except:
+        return str(v)
+
+def format_us_volume(v) -> str:
+    """美股成交量格式化"""
+    if v in ["-", "", None, "N/A", 0]:
+        return "N/A"
+    try:
+        n = int(float(str(v).replace(",", "")))
+        if n >= 100_000_000:
+            return f"{n/100_000_000:.2f} 億"
+        elif n >= 10_000:
+            return f"{n/10_000:.2f} 萬"
+        else:
+            return f"{n:,}"
     except:
         return str(v)
 
@@ -86,7 +102,7 @@ def init_name_cache():
             for item in data:
                 code = item.get("Code", "").strip()
                 name = item.get("Name", "").strip()
-                if code and name:
+                if code and name and has_chinese(name):
                     NAME_CACHE[code] = name
                     count += 1
             if count > 0:
@@ -103,8 +119,11 @@ def init_name_cache():
             count = 0
             for item in data.get("data", []):
                 if len(item) >= 2:
-                    NAME_CACHE[item[0].strip()] = item[1].strip()
-                    count += 1
+                    code = item[0].strip()
+                    name = item[1].strip()
+                    if code and name and has_chinese(name):
+                        NAME_CACHE[code] = name
+                        count += 1
             if count > 0:
                 print(f"✅ 上市備援2載入：{count} 筆")
                 tw_loaded = True
@@ -121,7 +140,7 @@ def init_name_cache():
                 for item in data:
                     code = item.get("公司代號", "").strip()
                     name = (item.get("公司簡稱", "") or item.get("公司名稱", "")).strip()
-                    if code and name:
+                    if code and name and has_chinese(name):
                         NAME_CACHE[code] = name
                         count += 1
                 if count > 0:
@@ -138,7 +157,7 @@ def init_name_cache():
         for item in data:
             code = item.get("SecuritiesCompanyCode", "").strip()
             name = item.get("CompanyName", "").strip()
-            if code and name:
+            if code and name and has_chinese(name):
                 NAME_CACHE[code] = name
                 count += 1
         print(f"✅ 上櫃股票名稱載入：{count} 筆")
@@ -486,13 +505,17 @@ def push_to_owner(text):
 
 
 # ══════════════════════════════════════════
-#  台股名稱（中文優先）
+#  台股名稱（中文優先，Yahoo 英文不寫快取）
 # ══════════════════════════════════════════
 def get_tw_stock_name(stock_id: str) -> str:
+    # 1. NAME_CACHE 有中文直接回傳
     cached = NAME_CACHE.get(stock_id, "")
-    if cached and cached != stock_id and has_chinese(cached):
+    if cached and has_chinese(cached):
         return cached
+
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 2. TWSE STOCK_DAY title
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=5)
@@ -502,11 +525,13 @@ def get_tw_stock_name(stock_id: str) -> str:
             parts = title.strip().split()
             if len(parts) >= 2:
                 name = parts[-1].strip()
-                if name and name != stock_id and has_chinese(name):
+                if name and has_chinese(name):
                     NAME_CACHE[stock_id] = name
                     return name
     except:
         pass
+
+    # 3. TWSE 盤中 API
     for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
@@ -515,11 +540,13 @@ def get_tw_stock_name(stock_id: str) -> str:
             items = data.get("msgArray", [])
             if items:
                 name = items[0].get("n", "").strip()
-                if name and name != stock_id and has_chinese(name):
+                if name and has_chinese(name):
                     NAME_CACHE[stock_id] = name
                     return name
         except:
             pass
+
+    # 4. TPEx 盤後
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -530,11 +557,13 @@ def get_tw_stock_name(stock_id: str) -> str:
         rows = data.get("aaData", [])
         if rows and len(rows[0]) > 1:
             name = rows[0][1].strip()
-            if name and name != stock_id and has_chinese(name):
+            if name and has_chinese(name):
                 NAME_CACHE[stock_id] = name
                 return name
     except:
         pass
+
+    # 5. Yahoo Finance 最後備援（英文不寫快取）
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -542,53 +571,24 @@ def get_tw_stock_name(stock_id: str) -> str:
             data = r.json()
             meta = data["chart"]["result"][0]["meta"]
             name = (meta.get("shortName") or meta.get("longName") or "").strip()
-            if name and name != stock_id:
+            if name:
                 if has_chinese(name):
                     NAME_CACHE[stock_id] = name
-                return name
+                return name  # 英文只回傳，不寫快取
         except:
             pass
-    if cached and cached != stock_id:
-        return cached
+
     return stock_id
 
 
 # ══════════════════════════════════════════
-#  台股資料（漲幅修正）
+#  台股資料（盤中/盤後分離，TPEx欄位修正）
 # ══════════════════════════════════════════
-def get_yahoo_ohlc(stock_id: str) -> dict:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for suffix in [".TW", ".TWO"]:
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
-            r = requests.get(url, headers=headers, timeout=8)
-            data = r.json()
-            result = data["chart"]["result"][0]
-            meta   = result["meta"]
-            quotes = result.get("indicators", {}).get("quote", [{}])[0]
-            opens  = [o for o in quotes.get("open",  []) if o is not None]
-            highs  = [h for h in quotes.get("high",  []) if h is not None]
-            lows   = [l for l in quotes.get("low",   []) if l is not None]
-            vols   = [v for v in quotes.get("volume",[]) if v is not None]
-            # 正確昨收
-            prev_close = meta.get("regularMarketPreviousClose") or meta.get("chartPreviousClose", 0)
-            if opens:
-                return {
-                    "open": f"{opens[-1]:.2f}",
-                    "high": f"{highs[-1]:.2f}" if highs else "N/A",
-                    "low":  f"{lows[-1]:.2f}"  if lows  else "N/A",
-                    "vol":  format_tw_volume(int(vols[-1] / 1000)) if vols else "N/A",
-                    "prev_close": prev_close
-                }
-        except:
-            pass
-    return {}
-
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 盤中即時
-    for market_type, market_label in [("tse", "上市"), ("otc", "上櫃")]:
+    # ── 盤中即時（TWSE mis API）──
+    for market_type in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market_type}_{stock_id}.tw&json=1&delay=0"
             r = requests.get(url, headers=headers, timeout=8)
@@ -600,44 +600,59 @@ def get_tw_stock(stock_id: str) -> dict:
             raw_name = d.get("n", "").strip()
             if not raw_name:
                 continue
+
+            # 現價 z，昨收 y
             z = d.get("z", "-")
-            y = d.get("y", "0")
-            if z and z != "-" and z != "0":
+            y = d.get("y", "-")
+            prev = float(y) if y not in ["-", "", "0"] else None
+            if prev is None:
+                continue
+
+            if z not in ["-", "", "0"]:
                 price = float(z)
                 is_realtime = True
-            elif y and y != "-" and y != "0":
-                price = float(y)
-                is_realtime = False
             else:
-                continue
-            # 昨收
-            prev = float(y) if y and y != "-" and y != "0" else price
-            chg  = price - prev
-            pct  = chg / prev * 100 if prev else 0
-            name = raw_name if raw_name != stock_id and has_chinese(raw_name) else get_tw_stock_name(stock_id)
-            NAME_CACHE[stock_id] = name
+                # 試撮：用昨收顯示，漲跌 0
+                price = prev
+                is_realtime = False
+
+            chg = price - prev
+            pct = chg / prev * 100 if prev else 0
+
+            # 名稱優先中文
+            name = raw_name if has_chinese(raw_name) else get_tw_stock_name(stock_id)
+            NAME_CACHE[stock_id] = name if has_chinese(name) else NAME_CACHE.get(stock_id, name)
+
             status = "盤中" if is_realtime else "試撮"
-            open_v = clean_value(d.get("o"))
-            high_v = clean_value(d.get("h"))
-            low_v  = clean_value(d.get("l"))
-            vol_v  = clean_value(d.get("v"))
-            if "N/A" in [open_v, high_v, low_v, vol_v]:
-                yohlc = get_yahoo_ohlc(stock_id)
-                if open_v == "N/A": open_v = yohlc.get("open", "N/A")
-                if high_v == "N/A": high_v = yohlc.get("high", "N/A")
-                if low_v  == "N/A": low_v  = yohlc.get("low",  "N/A")
-                if vol_v  == "N/A": vol_v  = yohlc.get("vol",  "N/A")
-            vol_v = format_tw_volume(vol_v)
+
+            # 開高低成交量
+            open_v = d.get("o", "-")
+            high_v = d.get("h", "-")
+            low_v  = d.get("l", "-")
+            vol_v  = d.get("v", "-")  # 累計成交量（張）
+
+            open_v = "N/A" if open_v in ["-", "", "0"] else open_v
+            high_v = "N/A" if high_v in ["-", "", "0"] else high_v
+            low_v  = "N/A" if low_v  in ["-", "", "0"] else low_v
+            vol_v  = "N/A" if vol_v  in ["-", "", "0"] else vol_v
+
+            # 成交量格式化（已是張）
+            if vol_v != "N/A":
+                try:
+                    vol_v = f"{int(float(vol_v.replace(',', ''))):,} 張"
+                except:
+                    vol_v = "N/A"
+
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": open_v, "high": high_v, "low": low_v, "vol": vol_v,
                 "market_type": "台股", "status": status,
-                "source": "TWSE 即時", "time": d.get("t", "")
+                "source": "TWSE 即時"
             }
         except:
             pass
 
-    # 盤後上市
+    # ── 盤後上市（TWSE STOCK_DAY）──
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
@@ -645,25 +660,31 @@ def get_tw_stock(stock_id: str) -> dict:
         if data.get("stat") == "OK" and data.get("data"):
             rows = data["data"]
             last = rows[-1]
+            # 欄位：[日期, 成交量(股), 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 漲跌幅]
             price = float(last[6].replace(",", ""))
-            # 昨收用倒數第二筆收盤
             prev  = float(rows[-2][6].replace(",", "")) if len(rows) > 1 else price
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
-            name  = get_tw_stock_name(stock_id)
+            # 成交量欄位[1] 是股數，/1000 轉張
+            vol_shares = last[1].replace(",", "")
+            try:
+                vol_str = f"{int(float(vol_shares)//1000):,} 張"
+            except:
+                vol_str = "N/A"
+            name = get_tw_stock_name(stock_id)
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": last[3].replace(",",""),
                 "high": last[4].replace(",",""),
                 "low":  last[5].replace(",",""),
-                "vol":  format_tw_volume(last[1].replace(",","")),
+                "vol":  vol_str,
                 "market_type": "台股", "status": "收盤",
-                "source": "TWSE", "time": last[0]
+                "source": "TWSE"
             }
     except:
         pass
 
-    # 盤後上櫃
+    # ── 盤後上櫃（TPEx）欄位修正 ──
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -674,24 +695,32 @@ def get_tw_stock(stock_id: str) -> dict:
         rows = data.get("aaData", [])
         if rows:
             last = rows[-1]
+            # TPEx 欄位：[成交量(張), 名稱, 收盤, 漲跌, 開盤, 最高, 最低, ...]
+            # 實際欄位 index（以 TPEx API 為準）:
+            # 0=成交量(張), 1=名稱?, 2=收盤, 3=漲跌, 4=%, 5=開盤, 6=最高, 7=最低
             price = float(last[2].replace(",", ""))
             prev  = float(rows[-2][2].replace(",", "")) if len(rows) > 1 else price
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
-            name  = get_tw_stock_name(stock_id)
+            # 成交量已是張
+            try:
+                vol_str = f"{int(float(last[0].replace(',',''))):,} 張"
+            except:
+                vol_str = "N/A"
+            open_v = last[5].replace(",","") if len(last) > 5 else "N/A"
+            high_v = last[6].replace(",","") if len(last) > 6 else "N/A"
+            low_v  = last[7].replace(",","") if len(last) > 7 else "N/A"
+            name   = get_tw_stock_name(stock_id)
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
-                "open": last[3].replace(",","") if len(last) > 3 else "N/A",
-                "high": last[4].replace(",","") if len(last) > 4 else "N/A",
-                "low":  last[5].replace(",","") if len(last) > 5 else "N/A",
-                "vol":  format_tw_volume(last[0].replace(",","")) if len(last) > 0 else "N/A",
+                "open": open_v, "high": high_v, "low": low_v, "vol": vol_str,
                 "market_type": "台股", "status": "收盤",
-                "source": "TPEx", "time": date_str
+                "source": "TPEx"
             }
     except:
         pass
 
-    # Yahoo 備援
+    # ── Yahoo 備援（最後手段）──
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -704,13 +733,13 @@ def get_tw_stock(stock_id: str) -> dict:
             highs  = [h for h in quotes.get("high",  []) if h is not None]
             lows   = [l for l in quotes.get("low",   []) if l is not None]
             vols   = [v for v in quotes.get("volume",[]) if v is not None]
-            price = meta.get("regularMarketPrice") or meta.get("previousClose", 0)
-            # 用 regularMarketPreviousClose 避免計算錯誤
-            prev  = meta.get("regularMarketPreviousClose") or meta.get("chartPreviousClose", price)
-            chg   = price - prev
-            pct   = chg / prev * 100 if prev else 0
-            name  = get_tw_stock_name(stock_id)
-            vol_str = format_tw_volume(int(vols[-1] / 1000)) if vols else "N/A"
+            closes = [c for c in quotes.get("close", []) if c is not None]
+            price  = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
+            prev   = meta.get("regularMarketPreviousClose") or (closes[-2] if len(closes) >= 2 else price)
+            chg    = price - prev
+            pct    = chg / prev * 100 if prev else 0
+            name   = get_tw_stock_name(stock_id)
+            vol_str = f"{int(vols[-1]/1000):,} 張" if vols else "N/A"
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": f"{opens[-1]:.2f}" if opens else "N/A",
@@ -718,7 +747,7 @@ def get_tw_stock(stock_id: str) -> dict:
                 "low":  f"{lows[-1]:.2f}"  if lows  else "N/A",
                 "vol":  vol_str,
                 "market_type": "台股", "status": "收盤",
-                "source": "Yahoo Finance", "time": ""
+                "source": "Yahoo Finance"
             }
         except:
             pass
@@ -727,12 +756,11 @@ def get_tw_stock(stock_id: str) -> dict:
 
 
 # ══════════════════════════════════════════
-#  美股資料（漲幅修正）
+#  美股資料（漲幅修正＋成交量專業化）
 # ══════════════════════════════════════════
 def get_us_stock(symbol: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        # 用 range=5d 取近期資料，range=1y 只用來算均線
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         r = requests.get(url, headers=headers, timeout=10)
         data = r.json()
@@ -743,28 +771,29 @@ def get_us_stock(symbol: str) -> dict:
         highs  = [h for h in quotes.get("high",   []) if h is not None]
         lows   = [l for l in quotes.get("low",    []) if l is not None]
         vols   = [v for v in quotes.get("volume", []) if v is not None]
-        price = meta.get("regularMarketPrice", 0)
-        # 關鍵：用 regularMarketPreviousClose 而不是 chartPreviousClose
-        prev  = meta.get("regularMarketPreviousClose") or meta.get("chartPreviousClose", price)
+        closes = [c for c in quotes.get("close",  []) if c is not None]
+
+        price = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
+        # 優先用 regularMarketPreviousClose
+        prev  = (meta.get("regularMarketPreviousClose")
+                 or (closes[-2] if len(closes) >= 2 else price))
         chg   = price - prev
         pct   = chg / prev * 100 if prev else 0
         name  = meta.get("shortName") or meta.get("longName") or symbol
-        vol_str = f"{int(vols[-1]/10000)}萬" if vols else "N/A"
-        # 今日開高低（最後一筆）
+
         return {
-            "name": name[:16], "price": price, "chg": chg, "pct": pct,
+            "name": name[:18], "price": price, "chg": chg, "pct": pct,
             "open":  f"{opens[-1]:.2f}"  if opens  else "N/A",
             "high":  f"{highs[-1]:.2f}"  if highs  else "N/A",
             "low":   f"{lows[-1]:.2f}"   if lows   else "N/A",
-            "vol": vol_str,
-            "closes": []  # K線另外抓
+            "vol":   format_us_volume(vols[-1]) if vols else "N/A",
+            "closes": []
         }
     except:
         pass
     return None
 
 def get_us_closes(symbol: str) -> list:
-    """美股K線專用，抓1年資料"""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1y"
@@ -872,18 +901,18 @@ def get_tw_closes(stock_id: str) -> list:
 #  新聞（白名單篩選＋去重）
 # ══════════════════════════════════════════
 TRUSTED_SOURCES = [
-    "cnyes.com", "anue.com",           # 鉅亨網
-    "money.udn.com", "udn.com",        # 經濟日報
-    "ctee.com.tw",                     # 工商時報
-    "moneydj.com",                     # MoneyDJ
-    "cna.com.tw",                      # 中央社
-    "tw.stock.yahoo.com", "yahoo.com", # Yahoo 股市
-    "reuters.com",                     # Reuters
-    "bloomberg.com",                   # Bloomberg
-    "marketwatch.com",                 # MarketWatch
-    "finance.yahoo.com",               # Yahoo Finance
-    "technews.tw",                     # 科技新報
-    "bnext.com.tw",                    # 數位時代
+    "cnyes.com", "anue.com",
+    "money.udn.com", "udn.com",
+    "ctee.com.tw",
+    "moneydj.com",
+    "cna.com.tw",
+    "tw.stock.yahoo.com", "yahoo.com",
+    "reuters.com",
+    "bloomberg.com",
+    "marketwatch.com",
+    "finance.yahoo.com",
+    "technews.tw",
+    "bnext.com.tw",
 ]
 
 def is_trusted_source(url: str) -> bool:
@@ -895,11 +924,9 @@ def is_trusted_source(url: str) -> bool:
     return False
 
 def deduplicate_news(news_list: list) -> list:
-    """去除相似標題的重複新聞"""
     seen = []
     result = []
     for title, url in news_list:
-        # 取標題前10個字作為去重key
         key = re.sub(r'[^\u4e00-\u9fffa-zA-Z0-9]', '', title)[:10]
         if key not in seen:
             seen.append(key)
@@ -909,7 +936,6 @@ def deduplicate_news(news_list: list) -> list:
 def get_news(query: str, count: int = 4) -> list:
     headers = {"User-Agent": "Mozilla/5.0"}
     all_results = []
-
     try:
         url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         r = requests.get(url, timeout=8, headers=headers)
@@ -921,7 +947,6 @@ def get_news(query: str, count: int = 4) -> list:
                 all_results.append((title[:28] + "…" if len(title) > 28 else title, link))
     except:
         pass
-
     try:
         url = "https://news.cnyes.com/rss/news/tw_stock"
         r = requests.get(url, timeout=8, headers=headers)
@@ -933,20 +958,11 @@ def get_news(query: str, count: int = 4) -> list:
                 all_results.append((title[:28] + "…" if len(title) > 28 else title, link))
     except:
         pass
-
-    # 優先可信來源
-    trusted   = [(t, u) for t, u in all_results if is_trusted_source(u)]
-    untrusted = [(t, u) for t, u in all_results if not is_trusted_source(u)]
-
-    # 去重
-    trusted   = deduplicate_news(trusted)
-    untrusted = deduplicate_news(untrusted)
-
-    # 可信來源優先，不足才補其他
-    combined = trusted[:count]
+    trusted   = deduplicate_news([(t,u) for t,u in all_results if is_trusted_source(u)])
+    untrusted = deduplicate_news([(t,u) for t,u in all_results if not is_trusted_source(u)])
+    combined  = trusted[:count]
     if len(combined) < count:
         combined += untrusted[:count - len(combined)]
-
     return combined[:count]
 
 
@@ -1102,14 +1118,15 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         tw = get_tw_stock(symbol)
         if not tw:
             return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
-        if not tw.get("name") or tw["name"] == symbol or not has_chinese(tw["name"]):
+        # 最終名稱保護：確保是中文
+        if not has_chinese(tw.get("name", "")):
             tw["name"] = get_tw_stock_name(symbol)
         closes = get_tw_closes(symbol)
         kline  = get_kline_analysis(closes)
         news   = get_news(f"{symbol} {tw['name']} 股票")
         update_tw_data_to_sheets(symbol, tw)
         log_to_sheets(user_id, "查詢台股", symbol, "成功")
-        flex = make_stock_flex(
+        return make_stock_flex(
             symbol, tw["name"],
             tw.get("market_type", "台股"),
             tw.get("status", ""),
@@ -1117,27 +1134,24 @@ def get_stock_flex(symbol: str, user_id: str = ""):
             tw["price"], tw["chg"], tw["pct"],
             tw.get("open", "N/A"), tw["high"], tw["low"], tw["vol"],
             kline, news, query_time
-        )
-        return flex, None
+        ), None
     else:
         us = get_us_stock(symbol)
         if not us:
             return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
-        # 美股K線另外抓1年
         closes = get_us_closes(symbol)
         kline  = get_kline_analysis(closes)
         news   = get_news(f"{symbol} {us['name']} stock")
         update_us_data_to_sheets(symbol, us)
         log_to_sheets(user_id, "查詢美股", symbol, "成功")
-        flex = make_stock_flex(
+        return make_stock_flex(
             symbol, us["name"],
             "美股", "", "Yahoo Finance",
             us["price"], us["chg"], us["pct"],
             us.get("open", "N/A"), us.get("high", "N/A"),
             us.get("low", "N/A"), us.get("vol", "N/A"),
             kline, news, query_time
-        )
-        return flex, None
+        ), None
 
 
 # ══════════════════════════════════════════
@@ -1211,7 +1225,7 @@ def get_recommendation() -> str:
             for i, (sid, name, total, foreign, invest) in enumerate(candidates[:5], 1):
                 tw = get_tw_stock(sid)
                 price_str = f"{tw['price']:.2f}" if tw else "N/A"
-                pct_str = f"{tw['pct']:+.2f}%" if tw else ""
+                pct_str   = f"{tw['pct']:+.2f}%" if tw else ""
                 msg += (f"　{i}. {sid} {name}\n"
                         f"　   現價 {price_str}　{pct_str}\n"
                         f"　   外資 {foreign:+,} 投信 {invest:+,} 張\n\n")
@@ -1367,7 +1381,7 @@ def handle_message(event):
 
     if user_id == OWNER_USER_ID:
         if text.startswith("封鎖 "):
-            parts = text.split(" ", 2)
+            parts  = text.split(" ", 2)
             name   = parts[1] if len(parts) > 1 else ""
             reason = parts[2] if len(parts) > 2 else "未說明"
             if name:
@@ -1515,7 +1529,7 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.4 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.5 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
