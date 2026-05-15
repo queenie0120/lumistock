@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.2（台股中文名稱＋成交量修正）
+LINE Bot 模組 v10.9.3（startup 修正）
 """
 
 from flask import Flask, request, abort
@@ -34,6 +34,7 @@ handler       = WebhookHandler(CHANNEL_SECRET)
 WAITING_SUGGESTION = set()
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 NAME_CACHE         = {}
+STARTUP_DONE       = False
 TZ_TAIPEI          = timezone(timedelta(hours=8))
 
 def now_taipei():
@@ -58,6 +59,18 @@ def format_tw_volume(v) -> str:
         return f"{n:,}"
     except:
         return str(v)
+
+
+# ══════════════════════════════════════════
+#  啟動初始化（gunicorn 相容）
+# ══════════════════════════════════════════
+@app.before_request
+def startup():
+    global STARTUP_DONE
+    if not STARTUP_DONE:
+        STARTUP_DONE = True
+        init_name_cache()
+        setup_rich_menu()
 
 
 # ══════════════════════════════════════════
@@ -119,6 +132,9 @@ def init_name_cache():
                     tw_loaded = True
         except Exception as e:
             print(f"上市方法3失敗：{e}")
+
+    if not tw_loaded:
+        print("⚠️ 上市名稱全部備援失敗")
 
     try:
         url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
@@ -481,17 +497,15 @@ def push_to_owner(text):
 
 
 # ══════════════════════════════════════════
-#  台股名稱（中文優先，Yahoo 英文不寫入快取）
+#  台股名稱（中文優先）
 # ══════════════════════════════════════════
 def get_tw_stock_name(stock_id: str) -> str:
-    # 1. 快取中有中文名稱
     cached = NAME_CACHE.get(stock_id, "")
     if cached and cached != stock_id and has_chinese(cached):
         return cached
 
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 2. TWSE STOCK_DAY title（中文）
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=5)
@@ -507,7 +521,6 @@ def get_tw_stock_name(stock_id: str) -> str:
     except:
         pass
 
-    # 3. TWSE 盤中 API（中文）
     for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
@@ -522,7 +535,6 @@ def get_tw_stock_name(stock_id: str) -> str:
         except:
             pass
 
-    # 4. 上櫃盤後（中文）
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -539,7 +551,7 @@ def get_tw_stock_name(stock_id: str) -> str:
     except:
         pass
 
-    # 5. Yahoo Finance（最後備援，英文不寫入快取）
+    # Yahoo 最後備援，英文不寫入快取
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -549,16 +561,13 @@ def get_tw_stock_name(stock_id: str) -> str:
             name = (meta.get("shortName") or meta.get("longName") or "").strip()
             if name and name != stock_id:
                 if has_chinese(name):
-                    # 有中文才寫入快取
                     NAME_CACHE[stock_id] = name
                     return name
                 else:
-                    # 英文只當暫時備援，不寫入快取
-                    return name
+                    return name  # 英文只回傳，不存快取
         except:
             pass
 
-    # 快取中有任何值（即使非中文）也回傳
     if cached and cached != stock_id:
         return cached
 
@@ -566,7 +575,7 @@ def get_tw_stock_name(stock_id: str) -> str:
 
 
 # ══════════════════════════════════════════
-#  台股資料（成交量修正）
+#  台股資料
 # ══════════════════════════════════════════
 def get_yahoo_ohlc(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -620,30 +629,23 @@ def get_tw_stock(stock_id: str) -> dict:
             prev = float(y) if y and y != "-" and y != "0" else price
             chg  = price - prev
             pct  = chg / prev * 100 if prev else 0
-            # 名稱：盤中 API 回傳的優先，但確保是中文
             if raw_name and raw_name != stock_id and has_chinese(raw_name):
                 name = raw_name
                 NAME_CACHE[stock_id] = name
             else:
                 name = get_tw_stock_name(stock_id)
             status = "盤中" if is_realtime else "試撮"
-
             open_v = clean_value(d.get("o"))
             high_v = clean_value(d.get("h"))
             low_v  = clean_value(d.get("l"))
             vol_v  = clean_value(d.get("v"))
-
-            # 任何欄位為 N/A 就補 Yahoo
             if "N/A" in [open_v, high_v, low_v, vol_v]:
                 yohlc = get_yahoo_ohlc(stock_id)
                 if open_v == "N/A": open_v = yohlc.get("open", "N/A")
                 if high_v == "N/A": high_v = yohlc.get("high", "N/A")
                 if low_v  == "N/A": low_v  = yohlc.get("low",  "N/A")
                 if vol_v  == "N/A": vol_v  = yohlc.get("vol",  "N/A")
-
-            # 成交量格式化
             vol_v = format_tw_volume(vol_v)
-
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": open_v, "high": high_v, "low": low_v, "vol": vol_v,
@@ -653,7 +655,6 @@ def get_tw_stock(stock_id: str) -> dict:
         except:
             pass
 
-    # 盤後備援：上市
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
@@ -678,7 +679,6 @@ def get_tw_stock(stock_id: str) -> dict:
     except:
         pass
 
-    # 盤後備援：上櫃
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -706,7 +706,6 @@ def get_tw_stock(stock_id: str) -> dict:
     except:
         pass
 
-    # Yahoo 備援（補成交量）
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -1470,7 +1469,7 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.2 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.3 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
