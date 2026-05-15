@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.1（註冊重名防護）
+LINE Bot 模組 v10.9.2（台股中文名稱＋成交量修正）
 """
 
 from flask import Flask, request, abort
@@ -43,6 +43,21 @@ def clean_value(v):
     if v in ["-", "", None, "0", 0]:
         return "N/A"
     return str(v)
+
+def has_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", str(text)))
+
+def is_mostly_english(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]{3,}", str(text))) and not has_chinese(text)
+
+def format_tw_volume(v) -> str:
+    if v in ["-", "", None, "N/A"]:
+        return "N/A"
+    try:
+        n = int(float(str(v).replace(",", "")))
+        return f"{n:,}"
+    except:
+        return str(v)
 
 
 # ══════════════════════════════════════════
@@ -314,7 +329,6 @@ def register_user(user_id: str, reg_name: str) -> str:
         picture_url  = profile.get("pictureUrl", "")
 
         for i, row in enumerate(records, start=2):
-            # 已註冊過
             if str(row.get("user_id")) == user_id:
                 if row.get("註冊姓名"):
                     return f"✅ 您已經註冊過了！\n姓名：{row.get('註冊姓名')}"
@@ -322,7 +336,6 @@ def register_user(user_id: str, reg_name: str) -> str:
                 sheet.update_cell(i, 5, now)
                 sheet.update_cell(i, 7, "正常")
                 return f"✅ 註冊成功！歡迎 {reg_name} 使用慧股拾光 🌸"
-            # 名字已被別人使用
             if str(row.get("註冊姓名")) == reg_name:
                 return (f"❌ 姓名「{reg_name}」已被使用\n"
                         f"請換一個名字重新註冊\n\n"
@@ -330,7 +343,6 @@ def register_user(user_id: str, reg_name: str) -> str:
                         f"　註冊 {reg_name}2\n"
                         f"　註冊 {reg_name}（暱稱）")
 
-        # 新用戶
         sheet.append_row([user_id, display_name, picture_url, reg_name, now, "", "正常"])
         return f"✅ 註冊成功！歡迎 {reg_name} 使用慧股拾光 🌸\n\n現在可以直接輸入股票代號查詢！"
     except Exception as e:
@@ -469,13 +481,17 @@ def push_to_owner(text):
 
 
 # ══════════════════════════════════════════
-#  台股名稱
+#  台股名稱（中文優先，Yahoo 英文不寫入快取）
 # ══════════════════════════════════════════
 def get_tw_stock_name(stock_id: str) -> str:
+    # 1. 快取中有中文名稱
     cached = NAME_CACHE.get(stock_id, "")
-    if cached and cached != stock_id:
+    if cached and cached != stock_id and has_chinese(cached):
         return cached
+
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 2. TWSE STOCK_DAY title（中文）
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=5)
@@ -485,11 +501,13 @@ def get_tw_stock_name(stock_id: str) -> str:
             parts = title.strip().split()
             if len(parts) >= 2:
                 name = parts[-1].strip()
-                if name and name != stock_id:
+                if name and name != stock_id and has_chinese(name):
                     NAME_CACHE[stock_id] = name
                     return name
     except:
         pass
+
+    # 3. TWSE 盤中 API（中文）
     for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
@@ -498,23 +516,13 @@ def get_tw_stock_name(stock_id: str) -> str:
             items = data.get("msgArray", [])
             if items:
                 name = items[0].get("n", "").strip()
-                if name and name != stock_id:
+                if name and name != stock_id and has_chinese(name):
                     NAME_CACHE[stock_id] = name
                     return name
         except:
             pass
-    for suffix in [".TW", ".TWO"]:
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
-            r = requests.get(url, headers=headers, timeout=5)
-            data = r.json()
-            meta = data["chart"]["result"][0]["meta"]
-            name = meta.get("shortName") or meta.get("longName") or ""
-            if name and name != stock_id:
-                NAME_CACHE[stock_id] = name
-                return name
-        except:
-            pass
+
+    # 4. 上櫃盤後（中文）
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -525,16 +533,40 @@ def get_tw_stock_name(stock_id: str) -> str:
         rows = data.get("aaData", [])
         if rows and len(rows[0]) > 1:
             name = rows[0][1].strip()
-            if name and name != stock_id:
+            if name and name != stock_id and has_chinese(name):
                 NAME_CACHE[stock_id] = name
                 return name
     except:
         pass
+
+    # 5. Yahoo Finance（最後備援，英文不寫入快取）
+    for suffix in [".TW", ".TWO"]:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
+            r = requests.get(url, headers=headers, timeout=5)
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            name = (meta.get("shortName") or meta.get("longName") or "").strip()
+            if name and name != stock_id:
+                if has_chinese(name):
+                    # 有中文才寫入快取
+                    NAME_CACHE[stock_id] = name
+                    return name
+                else:
+                    # 英文只當暫時備援，不寫入快取
+                    return name
+        except:
+            pass
+
+    # 快取中有任何值（即使非中文）也回傳
+    if cached and cached != stock_id:
+        return cached
+
     return stock_id
 
 
 # ══════════════════════════════════════════
-#  台股資料
+#  台股資料（成交量修正）
 # ══════════════════════════════════════════
 def get_yahoo_ohlc(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -554,7 +586,7 @@ def get_yahoo_ohlc(stock_id: str) -> dict:
                     "open": f"{opens[-1]:.2f}",
                     "high": f"{highs[-1]:.2f}" if highs else "N/A",
                     "low":  f"{lows[-1]:.2f}"  if lows  else "N/A",
-                    "vol":  str(int(vols[-1] / 1000)) if vols else "N/A"
+                    "vol":  format_tw_volume(int(vols[-1] / 1000)) if vols else "N/A"
                 }
         except:
             pass
@@ -588,19 +620,30 @@ def get_tw_stock(stock_id: str) -> dict:
             prev = float(y) if y and y != "-" and y != "0" else price
             chg  = price - prev
             pct  = chg / prev * 100 if prev else 0
-            name = raw_name if raw_name != stock_id else get_tw_stock_name(stock_id)
-            NAME_CACHE[stock_id] = name
+            # 名稱：盤中 API 回傳的優先，但確保是中文
+            if raw_name and raw_name != stock_id and has_chinese(raw_name):
+                name = raw_name
+                NAME_CACHE[stock_id] = name
+            else:
+                name = get_tw_stock_name(stock_id)
             status = "盤中" if is_realtime else "試撮"
+
             open_v = clean_value(d.get("o"))
             high_v = clean_value(d.get("h"))
             low_v  = clean_value(d.get("l"))
             vol_v  = clean_value(d.get("v"))
-            if "N/A" in [open_v, high_v, low_v]:
+
+            # 任何欄位為 N/A 就補 Yahoo
+            if "N/A" in [open_v, high_v, low_v, vol_v]:
                 yohlc = get_yahoo_ohlc(stock_id)
                 if open_v == "N/A": open_v = yohlc.get("open", "N/A")
                 if high_v == "N/A": high_v = yohlc.get("high", "N/A")
                 if low_v  == "N/A": low_v  = yohlc.get("low",  "N/A")
                 if vol_v  == "N/A": vol_v  = yohlc.get("vol",  "N/A")
+
+            # 成交量格式化
+            vol_v = format_tw_volume(vol_v)
+
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": open_v, "high": high_v, "low": low_v, "vol": vol_v,
@@ -610,6 +653,7 @@ def get_tw_stock(stock_id: str) -> dict:
         except:
             pass
 
+    # 盤後備援：上市
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
@@ -624,14 +668,17 @@ def get_tw_stock(stock_id: str) -> dict:
             name  = get_tw_stock_name(stock_id)
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
-                "open": last[3].replace(",",""), "high": last[4].replace(",",""),
-                "low": last[5].replace(",",""), "vol": last[1].replace(",",""),
+                "open": last[3].replace(",",""),
+                "high": last[4].replace(",",""),
+                "low":  last[5].replace(",",""),
+                "vol":  format_tw_volume(last[1].replace(",","")),
                 "market_type": "台股", "status": "收盤",
                 "source": "TWSE", "time": last[0]
             }
     except:
         pass
 
+    # 盤後備援：上櫃
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -652,13 +699,14 @@ def get_tw_stock(stock_id: str) -> dict:
                 "open": last[3].replace(",","") if len(last) > 3 else "N/A",
                 "high": last[4].replace(",","") if len(last) > 4 else "N/A",
                 "low":  last[5].replace(",","") if len(last) > 5 else "N/A",
-                "vol":  last[0].replace(",","") if len(last) > 0 else "N/A",
+                "vol":  format_tw_volume(last[0].replace(",","")) if len(last) > 0 else "N/A",
                 "market_type": "台股", "status": "收盤",
                 "source": "TPEx", "time": date_str
             }
     except:
         pass
 
+    # Yahoo 備援（補成交量）
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -670,22 +718,25 @@ def get_tw_stock(stock_id: str) -> dict:
             opens  = [o for o in quotes.get("open",  []) if o is not None]
             highs  = [h for h in quotes.get("high",  []) if h is not None]
             lows   = [l for l in quotes.get("low",   []) if l is not None]
+            vols   = [v for v in quotes.get("volume",[]) if v is not None]
             price = meta.get("regularMarketPrice") or meta.get("previousClose", 0)
             prev  = meta.get("chartPreviousClose", price)
             chg   = price - prev
             pct   = chg / prev * 100 if prev else 0
             name  = get_tw_stock_name(stock_id)
+            vol_str = format_tw_volume(int(vols[-1] / 1000)) if vols else "N/A"
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": f"{opens[-1]:.2f}" if opens else "N/A",
                 "high": f"{highs[-1]:.2f}" if highs else "N/A",
                 "low":  f"{lows[-1]:.2f}"  if lows  else "N/A",
-                "vol": "N/A",
+                "vol":  vol_str,
                 "market_type": "台股", "status": "收盤",
                 "source": "Yahoo Finance", "time": ""
             }
         except:
             pass
+
     return None
 
 
@@ -1002,10 +1053,8 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         tw = get_tw_stock(symbol)
         if not tw:
             return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
-        if not tw.get("name") or tw["name"] == symbol:
+        if not tw.get("name") or tw["name"] == symbol or not has_chinese(tw["name"]):
             tw["name"] = get_tw_stock_name(symbol)
-        if tw["name"] == symbol:
-            tw["name"] = NAME_CACHE.get(symbol, symbol)
         closes = get_tw_closes(symbol)
         kline  = get_kline_analysis(closes)
         news   = get_news(f"{symbol} {tw['name']} 股票")
@@ -1259,7 +1308,7 @@ def handle_message(event):
     text    = event.message.text.strip()
     user_id = event.source.user_id
 
-    # ══ 1. 停權檢查（最優先）══
+    # ══ 1. 停權檢查 ══
     if is_blocked_user(user_id):
         reply_text(event.reply_token, "⛔ 此帳號已停止使用權限\n如有疑問請聯繫管理員")
         return
@@ -1290,7 +1339,7 @@ def handle_message(event):
                 reply_text(event.reply_token, get_user_detail(name))
                 return
 
-    # ══ 4. 註冊指令（未註冊也可用）══
+    # ══ 4. 註冊指令 ══
     if text.startswith("註冊 "):
         reg_name = text.replace("註冊 ", "").strip()
         if reg_name:
@@ -1421,7 +1470,7 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.1 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.2 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
