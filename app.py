@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.8（Header重構＋美股完整化）
+LINE Bot 模組 v10.9.1（註冊重名防護）
 """
 
 from flask import Flask, request, abort
@@ -46,7 +46,7 @@ def clean_value(v):
 
 
 # ══════════════════════════════════════════
-#  啟動時載入全部股票名稱（三重備援）
+#  啟動時載入全部股票名稱
 # ══════════════════════════════════════════
 def init_name_cache():
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -78,11 +78,8 @@ def init_name_cache():
             count = 0
             for item in data.get("data", []):
                 if len(item) >= 2:
-                    code = item[0].strip()
-                    name = item[1].strip()
-                    if code and name:
-                        NAME_CACHE[code] = name
-                        count += 1
+                    NAME_CACHE[item[0].strip()] = item[1].strip()
+                    count += 1
             if count > 0:
                 print(f"✅ 上市備援2載入：{count} 筆")
                 tw_loaded = True
@@ -107,9 +104,6 @@ def init_name_cache():
                     tw_loaded = True
         except Exception as e:
             print(f"上市方法3失敗：{e}")
-
-    if not tw_loaded:
-        print("⚠️ 上市名稱全部備援失敗")
 
     try:
         url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
@@ -263,6 +257,191 @@ def update_us_data_to_sheets(symbol, data):
 
 
 # ══════════════════════════════════════════
+#  會員系統
+# ══════════════════════════════════════════
+def get_line_profile(user_id: str) -> dict:
+    try:
+        r = requests.get(
+            f"https://api.line.me/v2/bot/profile/{user_id}",
+            headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
+            timeout=5
+        )
+        data = r.json()
+        return {
+            "displayName": data.get("displayName", ""),
+            "pictureUrl": data.get("pictureUrl", "")
+        }
+    except:
+        return {"displayName": "", "pictureUrl": ""}
+
+def get_user_record(user_id: str) -> dict:
+    try:
+        sheet = get_sheet("使用者名單")
+        if sheet:
+            records = sheet.get_all_records()
+            for row in records:
+                if str(row.get("user_id")) == user_id:
+                    return row
+    except:
+        pass
+    return {}
+
+def is_registered(user_id: str) -> bool:
+    record = get_user_record(user_id)
+    return bool(record.get("註冊姓名"))
+
+def is_blocked_user(user_id: str) -> bool:
+    try:
+        sheet = get_sheet("黑名單")
+        if sheet:
+            records = sheet.get_all_records()
+            for row in records:
+                if str(row.get("user_id")) == user_id and str(row.get("狀態")) == "封鎖":
+                    return True
+    except:
+        pass
+    return False
+
+def register_user(user_id: str, reg_name: str) -> str:
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet:
+            return "❌ 系統錯誤，請稍後再試"
+        records = sheet.get_all_records()
+        now = now_taipei().strftime("%Y-%m-%d %H:%M")
+        profile = get_line_profile(user_id)
+        display_name = profile.get("displayName", "")
+        picture_url  = profile.get("pictureUrl", "")
+
+        for i, row in enumerate(records, start=2):
+            # 已註冊過
+            if str(row.get("user_id")) == user_id:
+                if row.get("註冊姓名"):
+                    return f"✅ 您已經註冊過了！\n姓名：{row.get('註冊姓名')}"
+                sheet.update_cell(i, 4, reg_name)
+                sheet.update_cell(i, 5, now)
+                sheet.update_cell(i, 7, "正常")
+                return f"✅ 註冊成功！歡迎 {reg_name} 使用慧股拾光 🌸"
+            # 名字已被別人使用
+            if str(row.get("註冊姓名")) == reg_name:
+                return (f"❌ 姓名「{reg_name}」已被使用\n"
+                        f"請換一個名字重新註冊\n\n"
+                        f"例如：\n"
+                        f"　註冊 {reg_name}2\n"
+                        f"　註冊 {reg_name}（暱稱）")
+
+        # 新用戶
+        sheet.append_row([user_id, display_name, picture_url, reg_name, now, "", "正常"])
+        return f"✅ 註冊成功！歡迎 {reg_name} 使用慧股拾光 🌸\n\n現在可以直接輸入股票代號查詢！"
+    except Exception as e:
+        print(f"註冊失敗：{e}")
+        return "❌ 註冊失敗，請稍後再試"
+
+def update_user_activity(user_id: str, message: str):
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        now = now_taipei().strftime("%Y-%m-%d %H:%M")
+        for i, row in enumerate(records, start=2):
+            if str(row.get("user_id")) == user_id:
+                sheet.update_cell(i, 5, now)
+                sheet.update_cell(i, 6, message[:50])
+                return
+        profile = get_line_profile(user_id)
+        sheet.append_row([
+            user_id,
+            profile.get("displayName", ""),
+            profile.get("pictureUrl", ""),
+            "", now, message[:50], "未註冊"
+        ])
+    except Exception as e:
+        print(f"更新互動失敗：{e}")
+
+def block_user_by_name(reg_name: str, reason: str) -> str:
+    try:
+        sheet = get_sheet("使用者名單")
+        bl_sheet = get_sheet("黑名單")
+        if not sheet or not bl_sheet:
+            return "❌ 系統錯誤"
+        records = sheet.get_all_records()
+        for i, row in enumerate(records, start=2):
+            if str(row.get("註冊姓名")) == reg_name:
+                uid = str(row.get("user_id"))
+                now = now_taipei().strftime("%Y-%m-%d %H:%M")
+                sheet.update_cell(i, 7, "封鎖")
+                bl_sheet.append_row([uid, reg_name, reason, now, "封鎖"])
+                return f"✅ 已封鎖 {reg_name}\n原因：{reason}"
+        return f"❌ 找不到用戶：{reg_name}"
+    except Exception as e:
+        return f"❌ 封鎖失敗：{e}"
+
+def unblock_user_by_name(reg_name: str) -> str:
+    try:
+        sheet = get_sheet("使用者名單")
+        bl_sheet = get_sheet("黑名單")
+        if not sheet or not bl_sheet:
+            return "❌ 系統錯誤"
+        records = sheet.get_all_records()
+        found = False
+        for i, row in enumerate(records, start=2):
+            if str(row.get("註冊姓名")) == reg_name:
+                sheet.update_cell(i, 7, "正常")
+                found = True
+                break
+        bl_records = bl_sheet.get_all_records()
+        for i, row in enumerate(bl_records, start=2):
+            if str(row.get("註冊姓名")) == reg_name and str(row.get("狀態")) == "封鎖":
+                bl_sheet.update_cell(i, 5, "解除")
+                break
+        if found:
+            return f"✅ 已解除封鎖 {reg_name}"
+        return f"❌ 找不到用戶：{reg_name}"
+    except Exception as e:
+        return f"❌ 解除失敗：{e}"
+
+def get_user_list() -> str:
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet:
+            return "❌ 無法讀取使用者名單"
+        records = sheet.get_all_records()
+        if not records:
+            return "📋 目前沒有使用者記錄"
+        msg = f"📋 使用者名單（共 {len(records)} 人）\n━━━━━━━━━━━━━━\n"
+        for row in records:
+            name   = row.get("註冊姓名", "未註冊")
+            nick   = row.get("LINE暱稱", "")
+            status = row.get("狀態", "")
+            last   = row.get("最後互動時間", "")
+            icon   = "🔴" if status == "封鎖" else ("⚪" if status == "未註冊" else "🟢")
+            msg += f"{icon} {name}（{nick}）\n　{status}　{last}\n"
+        return msg.strip()
+    except Exception as e:
+        return f"❌ 查詢失敗：{e}"
+
+def get_user_detail(reg_name: str) -> str:
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet:
+            return "❌ 系統錯誤"
+        records = sheet.get_all_records()
+        for row in records:
+            if str(row.get("註冊姓名")) == reg_name:
+                return (f"👤 {reg_name}\n"
+                        f"━━━━━━━━━━━━━━\n"
+                        f"LINE暱稱：{row.get('LINE暱稱','')}\n"
+                        f"user_id：{row.get('user_id','')}\n"
+                        f"狀態：{row.get('狀態','')}\n"
+                        f"最後互動：{row.get('最後互動時間','')}\n"
+                        f"最後訊息：{row.get('最後訊息','')}")
+        return f"❌ 找不到用戶：{reg_name}"
+    except Exception as e:
+        return f"❌ 查詢失敗：{e}"
+
+
+# ══════════════════════════════════════════
 #  持股
 # ══════════════════════════════════════════
 def load_portfolio():
@@ -290,17 +469,13 @@ def push_to_owner(text):
 
 
 # ══════════════════════════════════════════
-#  台股名稱（完整 fallback chain）
+#  台股名稱
 # ══════════════════════════════════════════
 def get_tw_stock_name(stock_id: str) -> str:
-    # 1. 快取
     cached = NAME_CACHE.get(stock_id, "")
     if cached and cached != stock_id:
         return cached
-
     headers = {"User-Agent": "Mozilla/5.0"}
-
-    # 2. TWSE STOCK_DAY title
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=5)
@@ -315,8 +490,6 @@ def get_tw_stock_name(stock_id: str) -> str:
                     return name
     except:
         pass
-
-    # 3. TWSE 盤中 API
     for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
@@ -330,8 +503,6 @@ def get_tw_stock_name(stock_id: str) -> str:
                     return name
         except:
             pass
-
-    # 4. Yahoo Finance（ETF 最有效）
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -339,14 +510,11 @@ def get_tw_stock_name(stock_id: str) -> str:
             data = r.json()
             meta = data["chart"]["result"][0]["meta"]
             name = meta.get("shortName") or meta.get("longName") or ""
-            name = name.strip()
             if name and name != stock_id:
                 NAME_CACHE[stock_id] = name
                 return name
         except:
             pass
-
-    # 5. 上櫃盤後
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -362,7 +530,6 @@ def get_tw_stock_name(stock_id: str) -> str:
                 return name
     except:
         pass
-
     return stock_id
 
 
@@ -396,7 +563,6 @@ def get_yahoo_ohlc(stock_id: str) -> dict:
 def get_tw_stock(stock_id: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 盤中即時
     for market_type, market_label in [("tse", "上市"), ("otc", "上櫃")]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market_type}_{stock_id}.tw&json=1&delay=0"
@@ -425,19 +591,16 @@ def get_tw_stock(stock_id: str) -> dict:
             name = raw_name if raw_name != stock_id else get_tw_stock_name(stock_id)
             NAME_CACHE[stock_id] = name
             status = "盤中" if is_realtime else "試撮"
-
             open_v = clean_value(d.get("o"))
             high_v = clean_value(d.get("h"))
             low_v  = clean_value(d.get("l"))
             vol_v  = clean_value(d.get("v"))
-
             if "N/A" in [open_v, high_v, low_v]:
                 yohlc = get_yahoo_ohlc(stock_id)
                 if open_v == "N/A": open_v = yohlc.get("open", "N/A")
                 if high_v == "N/A": high_v = yohlc.get("high", "N/A")
                 if low_v  == "N/A": low_v  = yohlc.get("low",  "N/A")
                 if vol_v  == "N/A": vol_v  = yohlc.get("vol",  "N/A")
-
             return {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": open_v, "high": high_v, "low": low_v, "vol": vol_v,
@@ -447,7 +610,6 @@ def get_tw_stock(stock_id: str) -> dict:
         except:
             pass
 
-    # 盤後備援：上市
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r = requests.get(url, headers=headers, timeout=8)
@@ -470,7 +632,6 @@ def get_tw_stock(stock_id: str) -> dict:
     except:
         pass
 
-    # 盤後備援：上櫃
     try:
         today = now_taipei()
         civil_year = today.year - 1911
@@ -498,7 +659,6 @@ def get_tw_stock(stock_id: str) -> dict:
     except:
         pass
 
-    # Yahoo 備援
     for suffix in [".TW", ".TWO"]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
@@ -526,12 +686,11 @@ def get_tw_stock(stock_id: str) -> dict:
             }
         except:
             pass
-
     return None
 
 
 # ══════════════════════════════════════════
-#  美股資料（range=1y，補成交量）
+#  美股資料
 # ══════════════════════════════════════════
 def get_us_stock(symbol: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -552,15 +711,13 @@ def get_us_stock(symbol: str) -> dict:
         chg   = price - prev
         pct   = chg / prev * 100 if prev else 0
         name  = meta.get("shortName") or meta.get("longName") or symbol
-        # 成交量：最新一筆，轉成萬股
         vol_str = f"{int(vols[-1]/10000)}萬" if vols else "N/A"
         return {
             "name": name[:16], "price": price, "chg": chg, "pct": pct,
             "open":  f"{opens[-1]:.2f}"  if opens  else "N/A",
             "high":  f"{highs[-1]:.2f}"  if highs  else "N/A",
             "low":   f"{lows[-1]:.2f}"   if lows   else "N/A",
-            "vol": vol_str,
-            "closes": closes
+            "vol": vol_str, "closes": closes
         }
     except:
         pass
@@ -568,7 +725,7 @@ def get_us_stock(symbol: str) -> dict:
 
 
 # ══════════════════════════════════════════
-#  K線（Yahoo 優先，抓1年）
+#  K線
 # ══════════════════════════════════════════
 def get_sparkline(closes: list) -> str:
     if not closes or len(closes) < 2:
@@ -694,7 +851,7 @@ def get_news(query: str, count: int = 4) -> list:
 
 
 # ══════════════════════════════════════════
-#  Flex Message 股票卡片（Header重構）
+#  Flex Message 股票卡片
 # ══════════════════════════════════════════
 def make_ma_row(label, value):
     val_str = f"{value:.0f}" if value else "N/A"
@@ -723,8 +880,6 @@ def make_stock_flex(symbol, name, market_type, status, source, price, chg, pct, 
     rsi    = kline.get("rsi", 0)
     rsi_label = kline.get("rsi_label", "--")
     rsi_color = "#C47055" if rsi > 70 else ("#5B8DB8" if rsi < 30 else "#8B6B5A")
-
-    # Header 只顯示「代號 名稱」
     display_name = f"{symbol} {name}" if name and name != symbol else symbol
 
     news_contents = []
@@ -755,11 +910,9 @@ def make_stock_flex(symbol, name, market_type, status, source, price, chg, pct, 
                     "type": "box", "layout": "horizontal",
                     "contents": [
                         {"type": "text", "text": "✨ 慧股拾光 Lumistock", "size": "xxs", "color": "#F0D0C0", "flex": 1},
-                        # Header 右上角固定顯示市場類型
                         {"type": "text", "text": market_type, "size": "xxs", "color": "#F0D0C0", "align": "end"}
                     ]
                 },
-                # Header 只顯示「代號 名稱」
                 {"type": "text", "text": display_name, "size": "xl", "color": "#FFFFFF", "weight": "bold", "wrap": True}
             ]
         },
@@ -849,7 +1002,6 @@ def get_stock_flex(symbol: str, user_id: str = ""):
         tw = get_tw_stock(symbol)
         if not tw:
             return None, f"查無此股票：{symbol}\n請確認代碼是否正確"
-        # 強化名稱保護
         if not tw.get("name") or tw["name"] == symbol:
             tw["name"] = get_tw_stock_name(symbol)
         if tw["name"] == symbol:
@@ -913,7 +1065,6 @@ def get_market_summary() -> str:
             msg += "⚪ 台灣加權　--\n"
     except:
         msg += "⚪ 台灣加權　--\n"
-
     for sym, name in [("^GSPC","S&P 500"),("^IXIC","那斯達克"),("^DJI","道瓊")]:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
@@ -927,7 +1078,6 @@ def get_market_summary() -> str:
             msg  += f"{icon} {name}　{price:,.2f}　{pct:+.2f}%\n"
         except:
             msg += f"⚪ {name}　--\n"
-
     msg += "━━━━━━━━━━━━━━\n⚠️ 僅供參考，非投資建議"
     return msg
 
@@ -1106,9 +1256,65 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
-    text = event.message.text.strip()
+    text    = event.message.text.strip()
     user_id = event.source.user_id
 
+    # ══ 1. 停權檢查（最優先）══
+    if is_blocked_user(user_id):
+        reply_text(event.reply_token, "⛔ 此帳號已停止使用權限\n如有疑問請聯繫管理員")
+        return
+
+    # ══ 2. 更新互動記錄 ══
+    update_user_activity(user_id, text)
+
+    # ══ 3. 管理員指令 ══
+    if user_id == OWNER_USER_ID:
+        if text.startswith("封鎖 "):
+            parts = text.split(" ", 2)
+            name   = parts[1] if len(parts) > 1 else ""
+            reason = parts[2] if len(parts) > 2 else "未說明"
+            if name:
+                reply_text(event.reply_token, block_user_by_name(name, reason))
+                return
+        elif text.startswith("解除封鎖 "):
+            name = text.replace("解除封鎖 ", "").strip()
+            if name:
+                reply_text(event.reply_token, unblock_user_by_name(name))
+                return
+        elif text == "使用者列表":
+            reply_text(event.reply_token, get_user_list())
+            return
+        elif text.startswith("查使用者 "):
+            name = text.replace("查使用者 ", "").strip()
+            if name:
+                reply_text(event.reply_token, get_user_detail(name))
+                return
+
+    # ══ 4. 註冊指令（未註冊也可用）══
+    if text.startswith("註冊 "):
+        reg_name = text.replace("註冊 ", "").strip()
+        if reg_name:
+            result = register_user(user_id, reg_name)
+            reply_text(event.reply_token, result)
+            if "成功" in result:
+                push_to_owner(f"🆕 新用戶註冊！\n姓名：{reg_name}\n時間：{now_taipei().strftime('%Y-%m-%d %H:%M')}")
+        else:
+            reply_text(event.reply_token, "格式：註冊 姓名\n例如：註冊 王小明")
+        return
+
+    # ══ 5. 未註冊攔截 ══
+    if not is_registered(user_id):
+        reply_text(event.reply_token,
+              "👋 歡迎使用慧股拾光 Lumistock！\n"
+              "━━━━━━━━━━━━━━\n"
+              "請先完成註冊才能使用全部功能\n\n"
+              "📝 註冊方式：\n"
+              "　輸入「註冊 您的姓名」\n\n"
+              "　例如：\n"
+              "　註冊 王小明")
+        return
+
+    # ══ 6. 一般功能 ══
     if text == "查股票":
         reply_text(event.reply_token,
               "🔍 請直接輸入股票代號\n"
@@ -1215,7 +1421,7 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.8 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.1 啟動中...")
     init_name_cache()
     setup_rich_menu()
     port = int(os.environ.get("PORT", 5001))
