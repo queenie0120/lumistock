@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.17（背景非同步載入名稱快取）
+LINE Bot 模組 v10.9.18（全市場名稱統一來源）
 """
 
 from flask import Flask, request, abort
@@ -31,13 +31,13 @@ SHEETS_ID            = os.environ.get("GOOGLE_SHEETS_ID")
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(CHANNEL_SECRET)
 
-WAITING_SUGGESTION  = set()
-PORTFOLIO_FILE      = "/tmp/lumistock_portfolio.json"
-NAME_CACHE          = {}
-STARTUP_DONE        = False
-NAME_CACHE_LOADING  = False   # 防止重複載入
-NAME_CACHE_LOADED   = False   # 是否已完成完整載入
-TZ_TAIPEI           = timezone(timedelta(hours=8))
+WAITING_SUGGESTION = set()
+PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
+NAME_CACHE         = {}
+STARTUP_DONE       = False
+NAME_CACHE_LOADING = False
+NAME_CACHE_LOADED  = False
+TZ_TAIPEI          = timezone(timedelta(hours=8))
 
 def now_taipei():
     return datetime.now(TZ_TAIPEI)
@@ -70,7 +70,7 @@ def format_us_volume(v) -> str:
 
 
 # ══════════════════════════════════════════
-#  保底名稱（任何時候都有中文）
+#  保底名稱
 # ══════════════════════════════════════════
 FALLBACK_NAMES = {
     "2330":"台積電",   "2317":"鴻海",     "2454":"聯發科",
@@ -82,7 +82,7 @@ FALLBACK_NAMES = {
     "2823":"中壽",     "2801":"彰銀",     "5876":"上海商銀",
     "3533":"嘉澤端子", "6147":"頎邦",     "2379":"瑞昱",
     "2395":"研華",     "3008":"大立光",   "2357":"華碩",
-    "2376":"技嘉",     "2353":"宏碁",     "2325":"矽品",
+    "2376":"技嘉",     "2353":"宏碁",     "2367":"耀華",
     "2337":"旺宏",     "2408":"南亞科",   "3034":"聯詠",
     "3231":"緯創",     "2356":"英業達",   "2324":"仁寶",
     "2327":"國巨",     "2347":"聯強",     "2383":"台光電",
@@ -93,73 +93,79 @@ FALLBACK_NAMES = {
     "2409":"友達",     "2492":"華新科",   "3045":"台灣大",
     "4904":"遠傳",     "2498":"宏達電",   "2207":"和泰車",
     "2105":"正新",     "1216":"統一",     "2912":"統一超",
-    "2367":"耀華",     "2313":"華通",     "2301":"光寶科",
-    "2352":"佳世達",   "2371":"大同",     "2385":"群光",
-    "2441":"超豐",     "2449":"京元電子", "2451":"創見",
-    "2458":"義隆",     "3006":"晶豪科",   "3017":"奇鋐",
-    "3023":"信邦",     "3035":"智原",     "3036":"文曄",
-    "3037":"欣興",     "3044":"健鼎",     "3057":"喬鼎",
-    "3059":"華晶科",   "3064":"泰偉",     "4958":"臻鼎-KY",
-    "5388":"中磊",     "5471":"松翰",     "6176":"瑞儀",
-    "6213":"聯茂",     "6214":"精誠",     "6230":"超眾",
-    "6239":"力成",     "6269":"台郡",     "6271":"同欣電",
-    "6278":"台表科",   "6285":"啟碁",     "6290":"良維",
-    "6303":"耕興",     "6315":"閎康",     "6331":"玉晶光",
-    "6332":"辛耘",     "6338":"茂達",     "6414":"樺漢",
-    "6416":"瑞祺電",   "6419":"威聯通",   "6420":"京鼎",
-    "6431":"光洋科",   "6438":"迅得",     "6446":"藥華藥",
-    "3388":"崇越電",   "2388":"威盛",     "3019":"亞光",
-    "2002":"中鋼",     "1102":"亞泥",     "1101":"台泥",
-    "2882":"國泰金",   "2883":"開發金",   "2887":"台新金",
-    "2888":"新光金",   "2889":"國票金",   "2809":"京城銀",
+    "2313":"華通",     "2301":"光寶科",   "2352":"佳世達",
+    "2371":"大同",     "2385":"群光",     "2441":"超豐",
+    "2449":"京元電子", "2451":"創見",     "2458":"義隆",
+    "3006":"晶豪科",   "3017":"奇鋐",     "3023":"信邦",
+    "3035":"智原",     "3036":"文曄",     "3037":"欣興",
+    "3044":"健鼎",     "3388":"崇越電",   "2002":"中鋼",
+    "1102":"亞泥",     "1101":"台泥",     "2883":"開發金",
+    "2887":"台新金",   "2888":"新光金",   "2809":"京城銀",
+    "6285":"啟碁",     "6271":"同欣電",   "6239":"力成",
+    "6176":"瑞儀",     "6230":"超眾",     "6414":"樺漢",
+    "6446":"藥華藥",   "6331":"玉晶光",   "6438":"迅得",
     "0050":"元大台灣50",        "0056":"元大高股息",
     "00878":"國泰永續高股息",   "006208":"富邦台50",
     "00919":"群益台灣精選高息", "00713":"元大台灣高息低波",
     "00929":"復華台灣科技優息", "00934":"中信成長高股息",
-    "00940":"元大台灣價值高息", "00900":"富邦特選高股息30",
+    "00940":"元大台灣價值高息",
 }
 
 
 # ══════════════════════════════════════════
-#  啟動初始化（背景非同步，不阻塞請求）
+#  啟動初始化（背景非同步）
 # ══════════════════════════════════════════
 @app.before_request
 def startup():
     global STARTUP_DONE
     if not STARTUP_DONE:
         STARTUP_DONE = True
-        # 先載入保底名稱（立即可用）
         for code, name in FALLBACK_NAMES.items():
             NAME_CACHE[code] = name
         print(f"✅ 保底名稱立即載入：{len(FALLBACK_NAMES)} 筆")
-        # 背景非同步載入完整名稱
         t = threading.Thread(target=_bg_init)
         t.daemon = True
         t.start()
-        # Rich Menu 也背景執行
         t2 = threading.Thread(target=setup_rich_menu)
         t2.daemon = True
         t2.start()
 
-
 def _bg_init():
-    """背景初始化：等待網路就緒後載入完整名稱"""
-    time.sleep(5)   # 等 5 秒讓 Render 網路完全就緒
+    time.sleep(5)
     init_name_cache()
 
 
 # ══════════════════════════════════════════
-#  完整名稱快取載入（重試機制）
+#  全市場名稱快取（TWSE opendata 三檔）
 # ══════════════════════════════════════════
-def init_name_cache():
-    global NAME_CACHE_LOADING, NAME_CACHE_LOADED
-    if NAME_CACHE_LOADING:
-        return
-    NAME_CACHE_LOADING = True
+def _load_opendata(url: str, label: str) -> int:
+    """通用：載入 TWSE opendata t187ap03 系列"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    tw_loaded = False
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            if r.status_code == 200 and r.text.strip().startswith("["):
+                count = 0
+                for item in r.json():
+                    code = str(item.get("公司代號","")).strip()
+                    name = (str(item.get("公司簡稱","")) or
+                            str(item.get("公司名稱",""))).strip()
+                    if code and name and has_chinese(name):
+                        NAME_CACHE[code] = name
+                        count += 1
+                if count > 0:
+                    print(f"✅ {label}：{count} 筆（第{attempt+1}次）")
+                    return count
+                else:
+                    print(f"⚠️ {label} 筆數0（第{attempt+1}次）")
+        except Exception as e:
+            print(f"{label} 第{attempt+1}次失敗：{e}")
+            time.sleep(2)
+    return 0
 
-    # ── 上市方法1：TWSE openapi STOCK_DAY_ALL ──
+def _load_twse_stock_day_all() -> int:
+    """TWSE STOCK_DAY_ALL（最完整的上市清單）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
     for attempt in range(3):
         try:
             url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -173,15 +179,70 @@ def init_name_cache():
                         NAME_CACHE[code] = name
                         count += 1
                 if count > 100:
-                    print(f"✅ 上市openapi：{count} 筆（第{attempt+1}次）")
-                    tw_loaded = True
-                    break
+                    print(f"✅ TWSE STOCK_DAY_ALL：{count} 筆（第{attempt+1}次）")
+                    return count
         except Exception as e:
-            print(f"上市openapi第{attempt+1}次失敗：{e}")
+            print(f"STOCK_DAY_ALL 第{attempt+1}次失敗：{e}")
             time.sleep(2)
+    return 0
 
-    # ── 上市方法2：TWSE rwd ──
-    if not tw_loaded:
+def _load_tpex_quotes() -> int:
+    """TPEx 上櫃報價清單"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(3):
+        try:
+            url   = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+            r     = requests.get(url, headers=headers, timeout=30)
+            count = 0
+            for item in r.json():
+                code = str(item.get("SecuritiesCompanyCode","")).strip()
+                name = str(item.get("CompanyName","")).strip()
+                if code and name and has_chinese(name):
+                    NAME_CACHE[code] = name
+                    count += 1
+            if count > 0:
+                print(f"✅ TPEx mainboard_quotes：{count} 筆（第{attempt+1}次）")
+                return count
+        except Exception as e:
+            print(f"TPEx quotes 第{attempt+1}次失敗：{e}")
+            time.sleep(2)
+    return 0
+
+def init_name_cache():
+    global NAME_CACHE_LOADING, NAME_CACHE_LOADED
+    if NAME_CACHE_LOADING:
+        return
+    NAME_CACHE_LOADING = True
+    total_before = len(NAME_CACHE)
+
+    # ── 1. TWSE STOCK_DAY_ALL（上市股票，最完整）──
+    tw_count = _load_twse_stock_day_all()
+
+    # ── 2. TWSE opendata t187ap03_L（上市公司名稱）──
+    _load_opendata(
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+        "上市t187ap03_L"
+    )
+
+    # ── 3. TWSE opendata t187ap03_O（上櫃公司名稱）──
+    otc_count = _load_opendata(
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
+        "上櫃t187ap03_O"
+    )
+
+    # ── 4. TWSE opendata t187ap03_R（興櫃公司名稱）──
+    _load_opendata(
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_R",
+        "興櫃t187ap03_R"
+    )
+
+    # ── 5. TPEx 上櫃報價（備援，若 _O 失敗）──
+    if otc_count == 0:
+        _load_tpex_quotes()
+
+    # ── 6. TWSE rwd 備援（若 STOCK_DAY_ALL 失敗）──
+    if tw_count == 0:
+        headers = {"User-Agent": "Mozilla/5.0"}
         for attempt in range(3):
             try:
                 url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
@@ -195,110 +256,28 @@ def init_name_cache():
                             NAME_CACHE[code] = name
                             count += 1
                 if count > 100:
-                    print(f"✅ 上市rwd：{count} 筆（第{attempt+1}次）")
-                    tw_loaded = True
+                    print(f"✅ TWSE rwd 備援：{count} 筆（第{attempt+1}次）")
                     break
             except Exception as e:
-                print(f"上市rwd第{attempt+1}次失敗：{e}")
+                print(f"TWSE rwd 第{attempt+1}次失敗：{e}")
                 time.sleep(2)
 
-    # ── 上市方法3：opendata t187ap03_L ──
-    if not tw_loaded:
-        for attempt in range(2):
-            try:
-                url = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
-                r   = requests.get(url, headers=headers, timeout=30)
-                if r.status_code == 200 and r.text.strip().startswith("["):
-                    count = 0
-                    for item in r.json():
-                        code = str(item.get("公司代號","")).strip()
-                        name = (str(item.get("公司簡稱","")) or
-                                str(item.get("公司名稱",""))).strip()
-                        if code and name and has_chinese(name):
-                            NAME_CACHE[code] = name
-                            count += 1
-                    if count > 100:
-                        print(f"✅ 上市opendata：{count} 筆（第{attempt+1}次）")
-                        tw_loaded = True
-                        break
-            except Exception as e:
-                print(f"上市opendata第{attempt+1}次失敗：{e}")
-                time.sleep(2)
-
-    if not tw_loaded:
-        print("⚠️ 上市名稱所有來源失敗")
-
-    # ── 上櫃方法1：tpex_mainboard_quotes ──
-    tpex_loaded = False
-    for attempt in range(3):
-        try:
-            url   = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
-            r     = requests.get(url, headers=headers, timeout=30)
-            count = 0
-            for item in r.json():
-                code = str(item.get("SecuritiesCompanyCode","")).strip()
-                name = str(item.get("CompanyName","")).strip()
-                if code and name and has_chinese(name):
-                    NAME_CACHE[code] = name
-                    count += 1
-            if count > 0:
-                print(f"✅ 上櫃mainboard：{count} 筆（第{attempt+1}次）")
-                tpex_loaded = True
-                break
-        except Exception as e:
-            print(f"上櫃mainboard第{attempt+1}次失敗：{e}")
-            time.sleep(2)
-
-    # ── 上櫃方法2：tpex_mainboard_peratio_ch ──
-    if not tpex_loaded:
-        for attempt in range(2):
-            try:
-                url   = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_ch"
-                r     = requests.get(url, headers=headers, timeout=30)
-                count = 0
-                for item in r.json():
-                    code = str(item.get("SecuritiesCompanyCode","") or
-                               item.get("Code","")).strip()
-                    name = str(item.get("CompanyName","") or
-                               item.get("Name","")).strip()
-                    if code and name and has_chinese(name):
-                        NAME_CACHE[code] = name
-                        count += 1
-                if count > 0:
-                    print(f"✅ 上櫃peratio：{count} 筆（第{attempt+1}次）")
-                    tpex_loaded = True
-                    break
-            except Exception as e:
-                print(f"上櫃peratio第{attempt+1}次失敗：{e}")
-                time.sleep(2)
-
-    # ── 興櫃 ──
-    try:
-        url   = "https://www.tpex.org.tw/openapi/v1/tpex_esb_list_ch"
-        r     = requests.get(url, headers=headers, timeout=15)
-        count = 0
-        for item in r.json():
-            code = str(item.get("SecuritiesCompanyCode","")).strip()
-            name = str(item.get("CompanyName","")).strip()
-            if code and name and has_chinese(name):
-                NAME_CACHE[code] = name
-                count += 1
-        if count > 0:
-            print(f"✅ 興櫃：{count} 筆")
-    except: pass
-
-    # ── 保底再確認（API 不覆蓋保底）──
+    # ── 7. 保底再確認 ──
     for code, name in FALLBACK_NAMES.items():
         if not has_chinese(NAME_CACHE.get(code,"")):
             NAME_CACHE[code] = name
 
     NAME_CACHE_LOADING = False
     NAME_CACHE_LOADED  = True
-    print(f"✅ 名稱快取完整載入完成：{len(NAME_CACHE)} 筆")
+    added = len(NAME_CACHE) - total_before
+    print(f"✅ 名稱快取完整載入：{len(NAME_CACHE)} 筆（新增 {added} 筆）")
 
-    # 通知 Owner
     try:
-        push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{len(NAME_CACHE)} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
+        push_to_owner(
+            f"✅ Lumistock 名稱快取載入完成\n"
+            f"總筆數：{len(NAME_CACHE)} 筆\n"
+            f"{now_taipei().strftime('%m/%d %H:%M')}"
+        )
     except: pass
 
 
@@ -940,8 +919,11 @@ NON_NEWS_KEYWORDS=[
     "TSM股票","TSMC股票","個股資料","行情資料",
 ]
 
-def is_trusted_source(url:str)->bool: return any(s in url for s in STRICT_TRUSTED) if url else False
-def is_real_news(title:str)->bool: return not any(kw in title for kw in NON_NEWS_KEYWORDS)
+def is_trusted_source(url:str)->bool:
+    return any(s in url for s in STRICT_TRUSTED) if url else False
+
+def is_real_news(title:str)->bool:
+    return not any(kw in title for kw in NON_NEWS_KEYWORDS)
 
 def deduplicate_news(nl:list)->list:
     seen,result=[],[]
@@ -1115,9 +1097,9 @@ def fetch_institution_data()->tuple:
                 if candidates:
                     dd=data.get("date",cd.strftime("%Y/%m/%d"))
                     ts=now.strftime("%Y/%m/%d")
-                    if   dd==ts:              sn=f"✅ 已使用當日法人資料（{dd}）"
+                    if   dd==ts:                sn=f"✅ 已使用當日法人資料（{dd}）"
                     elif weekday<5 and not afc: sn=f"📅 今日法人資料尚未公布，暫用 {dd} 資料"
-                    else:                     sn=f"📅 使用 {dd} 前交易日資料"
+                    else:                       sn=f"📅 使用 {dd} 前交易日資料"
                     return candidates,dd,sn
         except Exception as e:
             print(f"法人資料失敗：{e}")
@@ -1584,7 +1566,8 @@ def handle_message(event):
             reply_text(event.reply_token,
                 f"🔍 快取查詢\n━━━━━━━━━━━━━━\n"
                 f"代號：{sid}\n快取名稱：{cached}\n"
-                f"總筆數：{len(NAME_CACHE)}\n載入完成：{'✅' if NAME_CACHE_LOADED else '⏳載入中'}\n"
+                f"總筆數：{len(NAME_CACHE)}\n"
+                f"載入完成：{'✅' if NAME_CACHE_LOADED else '⏳載入中'}\n"
                 f"中文：{'✅' if has_chinese(cached) else '❌'}"); return
         elif text=="快取狀態":
             total=len(NAME_CACHE)
@@ -1592,7 +1575,8 @@ def handle_message(event):
             ss="\n".join(f"　{k}：{v}" for k,v in samples)
             reply_text(event.reply_token,
                 f"📊 NAME_CACHE 狀態\n━━━━━━━━━━━━━━\n"
-                f"總筆數：{total}\n載入完成：{'✅' if NAME_CACHE_LOADED else '⏳載入中'}\n"
+                f"總筆數：{total}\n"
+                f"載入完成：{'✅' if NAME_CACHE_LOADED else '⏳載入中'}\n"
                 f"前5筆：\n{ss}"); return
         elif text=="重載名稱":
             if not NAME_CACHE_LOADING:
@@ -1712,7 +1696,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.17 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.18 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
