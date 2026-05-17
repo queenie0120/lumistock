@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.25（互動清單按鈕：減少打字、Phase 1+2）
+LINE Bot 模組 v10.9.28（使用者列表改成文字總覽 + 點名字操作）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -152,7 +152,7 @@ def _load_opendata(url: str, label: str) -> int:
     headers = {"User-Agent": "Mozilla/5.0"}
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=headers, timeout=30)
+            r = requests.get(url, headers=headers, timeout=30, verify=False)
             if r.status_code == 200 and r.text.strip().startswith("["):
                 count = 0
                 for item in r.json():
@@ -174,7 +174,7 @@ def _load_twse_stock_day_all() -> int:
     for attempt in range(3):
         try:
             r = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-                           headers=headers, timeout=30)
+                           headers=headers, timeout=30, verify=False)
             if r.status_code == 200 and r.text.strip().startswith("["):
                 count = 0
                 for item in r.json():
@@ -196,7 +196,7 @@ def _load_tpex_quotes() -> int:
     for attempt in range(3):
         try:
             r = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
-                           headers=headers, timeout=30)
+                           headers=headers, timeout=30, verify=False)
             count = 0
             for item in r.json():
                 code = str(item.get("SecuritiesCompanyCode","")).strip()
@@ -212,38 +212,157 @@ def _load_tpex_quotes() -> int:
             time.sleep(2)
     return 0
 
+
+def _load_tpex_etf() -> int:
+    """上櫃 ETF 名單（v10.9.27 新增）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(2):
+        try:
+            r = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_etf_summary_quotes",
+                           headers=headers, timeout=20, verify=False)
+            count = 0
+            for item in r.json():
+                code = (str(item.get("SecuritiesCompanyCode","")) or str(item.get("Code",""))).strip()
+                name = (str(item.get("CompanyName","")) or str(item.get("Name",""))).strip()
+                if code and name and has_chinese(name):
+                    NAME_CACHE[code] = name
+                    count += 1
+            if count > 0:
+                dlog("CACHE", f"TPEx ETF：{count} 筆")
+                return count
+        except Exception as e:
+            dlog("CACHE", f"TPEx ETF 第{attempt+1}次失敗：{e}")
+            time.sleep(2)
+    return 0
+
+
+def _load_tpex_emerging() -> int:
+    """興櫃股票（v10.9.27 新增）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(2):
+        try:
+            r = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics",
+                           headers=headers, timeout=20, verify=False)
+            count = 0
+            for item in r.json():
+                code = (str(item.get("SecuritiesCompanyCode","")) or str(item.get("Code",""))).strip()
+                name = (str(item.get("CompanyName","")) or str(item.get("Name",""))).strip()
+                if code and name and has_chinese(name):
+                    NAME_CACHE[code] = name
+                    count += 1
+            if count > 0:
+                dlog("CACHE", f"TPEx 興櫃：{count} 筆")
+                return count
+        except Exception as e:
+            dlog("CACHE", f"TPEx 興櫃第{attempt+1}次失敗：{e}")
+            time.sleep(2)
+    return 0
+
+
+def _load_twse_etf() -> int:
+    """上市 ETF 名單（v10.9.27 新增）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(2):
+        try:
+            # ETF e添富 JSON
+            r = requests.get("https://www.twse.com.tw/rwd/zh/ETFortune/ETFRanking?response=json",
+                           headers=headers, timeout=20, verify=False)
+            data = r.json()
+            count = 0
+            for row in data.get("data", []):
+                if len(row) >= 2:
+                    code = str(row[0]).strip()
+                    name = str(row[1]).strip()
+                    if code and name and has_chinese(name):
+                        NAME_CACHE[code] = name
+                        count += 1
+            if count > 0:
+                dlog("CACHE", f"TWSE ETF：{count} 筆")
+                return count
+        except Exception as e:
+            dlog("CACHE", f"TWSE ETF 第{attempt+1}次失敗：{e}")
+            time.sleep(2)
+    return 0
+
+
+def _load_twse_securities_list() -> int:
+    """證券基本資料（包含全部上市股票，最完整）（v10.9.27 新增）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(2):
+        try:
+            # 證券編碼公告檔
+            r = requests.get("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
+                           headers=headers, timeout=20, verify=False)
+            r.encoding = "big5"
+            count = 0
+            # 解析 HTML 表格（簡單版）
+            import re as _re
+            rows = _re.findall(r"<tr[^>]*>(.*?)</tr>", r.text, _re.DOTALL)
+            for row in rows:
+                cells = _re.findall(r"<td[^>]*>(.*?)</td>", row, _re.DOTALL)
+                if len(cells) >= 2:
+                    first = _re.sub(r"<[^>]+>","",cells[0]).strip()
+                    # 格式像「2330　台積電」或「0050　元大台灣50」
+                    parts = first.replace("\u3000", " ").split()
+                    if len(parts) >= 2:
+                        code = parts[0].strip()
+                        name = parts[1].strip()
+                        if code and name and has_chinese(name) and (code.isdigit() or code[:1].isdigit()):
+                            NAME_CACHE[code] = name
+                            count += 1
+            if count > 100:
+                dlog("CACHE", f"TWSE ISIN 證券公告：{count} 筆")
+                return count
+        except Exception as e:
+            dlog("CACHE", f"TWSE ISIN 第{attempt+1}次失敗：{e}")
+            time.sleep(2)
+    return 0
+
+
 def init_name_cache():
     global NAME_CACHE_LOADING, NAME_CACHE_LOADED
     if NAME_CACHE_LOADING: return
     NAME_CACHE_LOADING = True
 
-    tw_count  = _load_twse_stock_day_all()
-    _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_L","上市")
-    otc_count = _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_O","上櫃")
-    _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_R","興櫃")
+    # ── 第一輪：核心 API（上市/上櫃公司 + 報價）
+    _load_twse_stock_day_all()
+    _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_L","上市公司")
+    _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_O","上櫃公司")
+    _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_R","興櫃公司")
+    _load_tpex_quotes()
 
-    if otc_count == 0: _load_tpex_quotes()
-    if tw_count == 0:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        for attempt in range(3):
-            try:
-                r = requests.get("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json",
-                               headers=headers, timeout=30)
-                count = 0
-                for item in r.json().get("data",[]):
-                    if len(item) >= 2:
-                        code = str(item[0]).strip()
-                        name = str(item[1]).strip()
-                        if code and name and has_chinese(name):
-                            NAME_CACHE[code] = name
-                            count += 1
-                if count > 100:
-                    dlog("CACHE", f"TWSE rwd備援：{count} 筆")
-                    break
-            except Exception as e:
-                dlog("CACHE", f"TWSE rwd第{attempt+1}次失敗：{e}")
-                time.sleep(2)
+    # ── 第二輪：ETF（v10.9.27 新增）
+    _load_twse_etf()
+    _load_tpex_etf()
 
+    # ── 第三輪：興櫃股票（v10.9.27 新增）
+    _load_tpex_emerging()
+
+    # ── 第四輪：證券公告檔（最完整）（v10.9.27 新增）
+    _load_twse_securities_list()
+
+    # ── 第五輪：rwd 備援
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(2):
+        try:
+            r = requests.get("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json",
+                           headers=headers, timeout=20, verify=False)
+            count = 0
+            for item in r.json().get("data",[]):
+                if len(item) >= 2:
+                    code = str(item[0]).strip()
+                    name = str(item[1]).strip()
+                    if code and name and has_chinese(name):
+                        NAME_CACHE[code] = name
+                        count += 1
+            if count > 100:
+                dlog("CACHE", f"TWSE rwd備援：{count} 筆")
+                break
+        except Exception as e:
+            dlog("CACHE", f"TWSE rwd第{attempt+1}次失敗：{e}")
+            time.sleep(2)
+
+    # ── 補保底
     for code, name in FALLBACK_NAMES.items():
         if not has_chinese(NAME_CACHE.get(code,"")): NAME_CACHE[code] = name
 
@@ -564,8 +683,9 @@ def make_action_card(title: str, subtitle: str, color: str, action_buttons: list
     }
 
 
-def make_user_list_carousel() -> dict:
-    """使用者列表（每個用戶一張卡片，有「查詳情」「封鎖」按鈕）"""
+def make_user_list_carousel(page: int = 0) -> dict:
+    """使用者列表（每個用戶一張卡片，有「查詳情」「封鎖」按鈕）
+    v10.9.27 新增分頁：page=0 為第一頁（前 9 筆），第 10 張是「載入更多」"""
     try:
         sheet = get_sheet("使用者名單")
         if not sheet:
@@ -573,12 +693,24 @@ def make_user_list_carousel() -> dict:
         records = sheet.get_all_records()
         if not records:
             return None
+
+        # 依「最後互動時間」排序（新到舊）
+        records.sort(key=lambda r: str(r.get("最後互動時間","")), reverse=True)
+
+        PER_PAGE = 9  # 一頁 9 張，第 10 張留給「載入更多」
+        start = page * PER_PAGE
+        end = start + PER_PAGE
+        page_records = records[start:end]
+        has_more = len(records) > end
+
+        if not page_records:
+            return None
+
         bubbles = []
-        for row in records[:10]:  # LINE carousel 最多 10 張
+        for row in page_records:
             name = row.get("註冊姓名","未註冊")
             nick = row.get("LINE暱稱","")
             status = row.get("狀態","")
-            uid = str(row.get("user_id",""))
             icon = "🔴" if status=="封鎖" else ("⚪" if status=="未註冊" else "🟢")
             subtitle = f"{icon} {status}　{nick[:10]}"
 
@@ -590,9 +722,160 @@ def make_user_list_carousel() -> dict:
                 buttons.append(("🟢 解除封鎖", f"action=unblock&name={name}"))
 
             bubbles.append(make_action_card(f"👤 {name}", subtitle, "#C4907A", buttons))
+
+        # 加「載入更多」卡片
+        if has_more:
+            remaining = len(records) - end
+            more_card = {
+                "type":"bubble","size":"kilo",
+                "header":{
+                    "type":"box","layout":"vertical","backgroundColor":"#9B7BAB","paddingAll":"10px",
+                    "contents":[
+                        {"type":"text","text":"📋 還有更多用戶","size":"md","color":"#FFFFFF","weight":"bold"},
+                        {"type":"text","text":f"剩餘 {remaining} 位","size":"xxs","color":"#FFFFFF"}
+                    ]
+                },
+                "body":{
+                    "type":"box","layout":"vertical","spacing":"sm","paddingAll":"10px",
+                    "contents":[
+                        {"type":"button","style":"primary","height":"sm","color":"#9B7BAB",
+                         "action":{"type":"postback","label":f"➡️ 載入下 {min(PER_PAGE, remaining)} 位",
+                                   "data":f"action=user_list_page&page={page+1}",
+                                   "displayText":"載入下一頁"}}
+                    ]
+                }
+            }
+            bubbles.append(more_card)
+
         return {"type":"carousel","contents":bubbles}
     except Exception as e:
         dlog("UI", f"make_user_list_carousel 失敗：{e}")
+        return None
+
+
+def make_user_search_quickreply(filter_status: str = "all", batch: int = 0) -> tuple:
+    """
+    產生 Quick Reply：列出使用者名字。
+    filter_status: "all" / "正常" / "封鎖" / "未註冊"
+    batch: 0 = 前 12 個，1 = 第 13-24 個，依此類推
+    回傳：(items 列表, total 該篩選總人數, has_more 是否還有更多)
+    """
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet: return [], 0, False
+        records = sheet.get_all_records()
+        # 篩選
+        if filter_status != "all":
+            records = [r for r in records if str(r.get("狀態","")) == filter_status]
+        # 依互動時間排序，新到舊
+        records.sort(key=lambda r: str(r.get("最後互動時間","")), reverse=True)
+
+        total = len(records)
+        PER_BATCH = 12  # 留 1 格給「下一批」
+        start = batch * PER_BATCH
+        end = start + PER_BATCH
+        batch_records = records[start:end]
+        has_more = total > end
+
+        items = []
+        for row in batch_records:
+            name = row.get("註冊姓名","")
+            nick = row.get("LINE暱稱","")
+            display = name if name else f"未註冊({nick[:6]})"
+            target = name if name else nick
+            if target:
+                items.append((display[:10], f"action=user_card&name={target}"))
+
+        # 加「下一批」按鈕（如果還有更多）
+        if has_more:
+            items.append(("➡️ 下一批", f"action=user_search&filter={filter_status}&batch={batch+1}"))
+
+        return items, total, has_more
+    except Exception as e:
+        dlog("UI", f"make_user_search_quickreply 失敗：{e}")
+        return [], 0, False
+
+
+def make_user_text_list(filter_status: str = "all") -> tuple:
+    """產生文字版使用者列表
+    filter_status: "all" / "正常" / "封鎖" / "未註冊"
+    回傳：(訊息文字, 該篩選總人數)
+    """
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet: return "❌ 無法讀取使用者名單", 0
+        records = sheet.get_all_records()
+        # 篩選
+        if filter_status != "all":
+            records = [r for r in records if str(r.get("狀態","")) == filter_status]
+        records.sort(key=lambda r: str(r.get("最後互動時間","")), reverse=True)
+        total = len(records)
+        if total == 0:
+            label = {"all":"使用者", "正常":"正常用戶", "封鎖":"封鎖用戶", "未註冊":"未註冊用戶"}.get(filter_status, "用戶")
+            return f"📋 目前沒有{label}", 0
+
+        # 構造文字
+        title_map = {
+            "all":"👥 使用者名單",
+            "正常":"🟢 正常用戶名單",
+            "封鎖":"🔴 封鎖用戶名單",
+            "未註冊":"⚪ 未註冊用戶名單",
+        }
+        title = title_map.get(filter_status, "👥 使用者名單")
+        msg = f"{title}（共 {total} 人）\n━━━━━━━━━━━━━━\n"
+
+        for row in records[:30]:  # 文字最多顯示 30 個
+            name = row.get("註冊姓名","")
+            nick = row.get("LINE暱稱","")
+            status = row.get("狀態","")
+            last = str(row.get("最後互動時間",""))[:10]  # 只取日期
+            icon = "🔴" if status=="封鎖" else ("⚪" if status=="未註冊" else "🟢")
+            display = name if name else f"未註冊({nick[:6]})"
+            msg += f"{icon} {display}　{last}\n"
+
+        if total > 30:
+            msg += f"\n（顯示前 30 位，共 {total} 人）"
+
+        msg += "\n\n🔍 點下方按鈕進入個人操作"
+        return msg, total
+    except Exception as e:
+        dlog("UI", f"make_user_text_list 失敗：{e}")
+        return f"❌ 列表載入失敗：{e}", 0
+
+
+def make_single_user_action_flex(reg_name: str) -> dict:
+    """單人操作 Flex 卡片（含查詳情/封鎖/設管理者按鈕）"""
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet: return None
+        target_row = None
+        for row in sheet.get_all_records():
+            if str(row.get("註冊姓名","")) == reg_name or str(row.get("LINE暱稱","")) == reg_name:
+                target_row = row
+                break
+        if not target_row:
+            return None
+
+        name = target_row.get("註冊姓名","") or f"未註冊({target_row.get('LINE暱稱','')[:6]})"
+        nick = target_row.get("LINE暱稱","")
+        status = target_row.get("狀態","")
+        last = str(target_row.get("最後互動時間",""))[:16]
+        icon = "🔴" if status=="封鎖" else ("⚪" if status=="未註冊" else "🟢")
+
+        subtitle = f"{icon} {status}　LINE：{nick[:10]}"
+
+        buttons = [
+            ("🔍 查詳細資料", f"action=user_detail&name={name}"),
+        ]
+        if status == "封鎖":
+            buttons.append(("🟢 解除封鎖", f"action=unblock&name={name}"))
+        elif status == "正常":
+            buttons.append(("🔴 封鎖此用戶", f"action=block_start&name={name}"))
+            buttons.append(("👑 設為管理者", f"action=add_admin&name={name}"))
+
+        return make_action_card(f"👤 {name}", subtitle + f"\n最後互動：{last}", "#C4907A", buttons)
+    except Exception as e:
+        dlog("UI", f"make_single_user_action_flex 失敗：{e}")
         return None
 
 
@@ -1198,9 +1481,10 @@ def make_admin_menu_flex(user_id: str) -> dict:
     )
 
 def make_user_mgmt_flex(owner: bool) -> dict:
-    # v10.9.25：點清單按鈕，不用打字
+    # v10.9.27：加搜尋功能
     buttons = [
         ("👥 使用者列表","使用者列表"),    # 點進去可選人封鎖/查詳情/設管理者
+        ("🔍 搜尋使用者","搜尋使用者"),    # 用 Quick Reply 快速找人
         ("⛔ 黑名單","黑名單"),            # 點進去可選人解除封鎖
     ]
     if owner:
@@ -1211,9 +1495,11 @@ def make_user_mgmt_flex(owner: bool) -> dict:
 
 def make_system_mgmt_flex() -> dict:
     return make_menu_flex(
-        "⚙️ 系統管理","快取 / 名稱 / 狀態","#C4907A",
-        [("📊 快取狀態","快取狀態"), ("🔄 重載名稱","重載名稱"),
-         ("🔍 查快取","查快取說明")]
+        "⚙️ 系統管理","點按鈕即可操作 ✨","#C4907A",
+        [("🔄 重新載入名稱快取","重載名稱"),    # 最常用，放第一個
+         ("📊 查看快取狀態","快取狀態"),
+         ("🔍 查詢個別代號","查快取說明"),
+         ("🌸 重設 Rich Menu","重設選單")]     # 緊急救援
     )
 
 
@@ -1301,7 +1587,7 @@ def get_tw_stock_name_fallback(stock_id: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
-        r   = requests.get(url, headers=headers, timeout=5)
+        r   = requests.get(url, headers=headers, timeout=5, verify=False)
         data = r.json()
         if data.get("stat")=="OK":
             parts = data.get("title","").strip().split()
@@ -1313,7 +1599,7 @@ def get_tw_stock_name_fallback(stock_id: str) -> str:
     for ex in ["tse","otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
-            r   = requests.get(url, headers=headers, timeout=5)
+            r   = requests.get(url, headers=headers, timeout=5, verify=False)
             items = r.json().get("msgArray",[])
             if items:
                 name = items[0].get("n","").strip()
@@ -1340,7 +1626,7 @@ def get_tw_stock(stock_id: str) -> dict:
     for ex in ["tse","otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
-            r   = requests.get(url, headers=headers, timeout=8)
+            r   = requests.get(url, headers=headers, timeout=8, verify=False)
             d   = r.json().get("msgArray",[])
             if not d: continue
             d = d[0]
@@ -1377,7 +1663,7 @@ def get_tw_stock(stock_id: str) -> dict:
 
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
-        r   = requests.get(url, headers=headers, timeout=8)
+        r   = requests.get(url, headers=headers, timeout=8, verify=False)
         data = r.json()
         if data.get("stat")=="OK" and data.get("data"):
             rows=data["data"]; last=rows[-1]
@@ -1398,7 +1684,7 @@ def get_tw_stock(stock_id: str) -> dict:
         today=now_taipei(); cy=today.year-1911
         ds=f"{cy}/{today.month:02d}/{today.day:02d}"
         url=f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&o=json&d={ds}&s=0,asc&q={stock_id}"
-        r=requests.get(url,headers=headers,timeout=8)
+        r=requests.get(url,headers=headers,timeout=8, verify=False)
         rows=r.json().get("aaData",[])
         if rows:
             last=rows[-1]; price=float(last[2].replace(",",""))
@@ -1539,7 +1825,7 @@ def get_tw_closes(stock_id: str) -> list:
         except: pass
     try:
         url=f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
-        r=requests.get(url,headers=headers,timeout=8)
+        r=requests.get(url,headers=headers,timeout=8, verify=False)
         data=r.json()
         if data.get("stat")=="OK" and data.get("data"):
             closes=[]
@@ -1700,7 +1986,7 @@ def get_dynamic_watchlist()->list:
     headers={"User-Agent":"Mozilla/5.0"}; wl=[]
     try:
         url="https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX20?response=json"
-        r=requests.get(url,headers=headers,timeout=8); data=r.json()
+        r=requests.get(url,headers=headers,timeout=8,verify=False); data=r.json()
         if data.get("stat")=="OK":
             for row in data.get("data",[])[:15]:
                 sid=row[1].strip() if len(row)>1 else ""
@@ -1730,7 +2016,7 @@ def fetch_institution_data()->tuple:
             else:
                 ds=cd.strftime("%Y%m%d")
                 url=f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL&date={ds}"
-            r=requests.get(url,headers=headers,timeout=10); data=r.json()
+            r=requests.get(url,headers=headers,timeout=10,verify=False); data=r.json()
             if data.get("stat")=="OK" and data.get("data"):
                 candidates=[]
                 for row in data.get("data",[]):
@@ -1756,7 +2042,7 @@ def fetch_tpex_institution_data()->list:
     headers={"User-Agent":"Mozilla/5.0"}; candidates=[]
     try:
         url="https://www.tpex.org.tw/openapi/v1/tpex_mainboard_institution_trading"
-        r=requests.get(url,headers=headers,timeout=10); data=r.json()
+        r=requests.get(url,headers=headers,timeout=10,verify=False); data=r.json()
         if data and isinstance(data,list):
             for item in data:
                 try:
@@ -1781,7 +2067,7 @@ def get_market_status()->dict:
     result={"price":0,"pct":0,"ok":True,"str":"⚪ 大盤資料取得中"}
     try:
         url="https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0"
-        r=requests.get(url,headers=headers,timeout=8)
+        r=requests.get(url,headers=headers,timeout=8, verify=False)
         d=r.json().get("msgArray",[{}])[0]
         price=float(d.get("z",0) or d.get("y",0)); prev=float(d.get("y",price))
         pct=(price-prev)/prev*100 if prev else 0
@@ -1796,7 +2082,7 @@ def get_market_summary()->str:
          f"　{now_taipei().strftime('%m/%d %H:%M')} 更新\n━━━━━━━━━━━━━━\n")
     try:
         url="https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0"
-        r=requests.get(url,headers=headers,timeout=8)
+        r=requests.get(url,headers=headers,timeout=8, verify=False)
         d=r.json().get("msgArray",[{}])[0]
         price=float(d.get("z",0) or d.get("y",0)); prev=float(d.get("y",price))
         pct=(price-prev)/prev*100 if prev else 0
@@ -2178,6 +2464,53 @@ def handle_postback(event):
     action = params.get("action", "")
 
     try:
+        # ── 點名字 → 顯示單人操作 Flex 卡片（v10.9.28 新增）
+        if action == "user_card" and is_admin(user_id):
+            name = params.get("name", "")
+            dlog("POSTBACK", f"→ 用戶操作卡片 {name}")
+            flex = make_single_user_action_flex(name)
+            if flex:
+                reply_flex(event.reply_token, flex, f"操作 {name}")
+            else:
+                reply_text(event.reply_token, f"❌ 找不到用戶：{name}")
+            return
+
+        # ── 用戶搜尋分批 / 篩選（v10.9.28 新增）
+        if action == "user_search" and is_admin(user_id):
+            filter_status = params.get("filter", "all")
+            batch = int(params.get("batch", "0") or "0")
+            dlog("POSTBACK", f"→ 用戶搜尋 filter={filter_status} batch={batch}")
+            msg, total = make_user_text_list(filter_status)
+            items, _, _ = make_user_search_quickreply(filter_status, batch=batch)
+            # 若已是篩選模式，加「回到全部」按鈕
+            if filter_status != "all":
+                items.append(("🔙 回到全部", "action=user_search&filter=all&batch=0"))
+            qr_items = items[:13]
+            if total > 0:
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                            messages=[TextMessage(text=msg,
+                                quick_reply=make_postback_quick_reply(qr_items))]))
+            else:
+                reply_text(event.reply_token, msg)
+            return
+
+        # ── 舊版 user_list_page（向下相容保留）
+        if action == "user_list_page" and is_admin(user_id):
+            page = int(params.get("page", "0") or "0")
+            dlog("POSTBACK", f"→ 使用者列表第 {page+1} 頁（舊版）")
+            flex = make_user_list_carousel(page=page)
+            if flex:
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                            messages=[FlexMessage(alt_text=f"使用者列表 第{page+1}頁",
+                                contents=FlexContainer.from_dict(flex))]))
+            else:
+                reply_text(event.reply_token, "📋 已經到最後一頁了")
+            return
+
         # ── 查使用者詳情
         if action == "user_detail":
             name = params.get("name", "")
@@ -2507,16 +2840,51 @@ def handle_message(event):
             name=text.replace("解除封鎖 ","").strip()
             if name: reply_text(event.reply_token, unblock_user_by_name(name)); return
         elif text=="使用者列表":
-            # v10.9.25：改成可點選的 Flex carousel
-            dlog("HANDLER", "→ 使用者列表（互動清單）")
-            flex = make_user_list_carousel()
-            if flex:
-                reply_flex(event.reply_token, flex, "使用者列表")
+            # v10.9.28：文字總覽 + Quick Reply 點名字操作
+            dlog("HANDLER", "→ 使用者列表（文字 + QR）")
+            msg, total = make_user_text_list("all")
+            items, _, _ = make_user_search_quickreply("all", batch=0)
+            # 加狀態篩選按鈕
+            filter_items = [
+                ("🟢 只看正常", f"action=user_search&filter=正常&batch=0"),
+                ("🔴 只看封鎖", f"action=user_search&filter=封鎖&batch=0"),
+                ("⚪ 只看未註冊", f"action=user_search&filter=未註冊&batch=0"),
+            ]
+            qr_items = items + filter_items
+            qr_items = qr_items[:13]  # Quick Reply 最多 13 個
+
+            if total > 0:
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                            messages=[TextMessage(
+                                text=msg,
+                                quick_reply=make_postback_quick_reply(qr_items))]))
             else:
-                reply_text(event.reply_token, get_user_list())  # 退回文字版
+                reply_text(event.reply_token, msg)
             return
         elif text=="使用者列表文字":
             reply_text(event.reply_token, get_user_list()); return
+        elif text=="搜尋使用者":
+            # v10.9.28：保留舊指令，直接導向使用者列表
+            dlog("HANDLER", "→ 搜尋使用者（導向列表）")
+            msg, total = make_user_text_list("all")
+            items, _, _ = make_user_search_quickreply("all", batch=0)
+            filter_items = [
+                ("🟢 只看正常", f"action=user_search&filter=正常&batch=0"),
+                ("🔴 只看封鎖", f"action=user_search&filter=封鎖&batch=0"),
+                ("⚪ 只看未註冊", f"action=user_search&filter=未註冊&batch=0"),
+            ]
+            qr_items = (items + filter_items)[:13]
+            if total > 0:
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                            messages=[TextMessage(text=msg,
+                                quick_reply=make_postback_quick_reply(qr_items))]))
+            else:
+                reply_text(event.reply_token, "📋 目前沒有使用者")
+            return
         elif text.startswith("查使用者 "):
             name=text.replace("查使用者 ","").strip()
             if name: reply_text(event.reply_token, get_user_detail(name)); return
@@ -2717,7 +3085,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.25 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.28 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
