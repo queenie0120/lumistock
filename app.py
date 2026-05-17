@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.22（修正 Flex header subtitle 空字串造成的 400 錯誤）
+LINE Bot 模組 v10.9.23（管理 Flex 卡片改用粉白少女系 #C4907A）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -938,9 +938,9 @@ def make_portfolio_menu_flex() -> dict:
     )
 
 def make_admin_menu_flex(user_id: str) -> dict:
-    """打字「管理後台」時用的 Flex（保留 v10.9.20 設計）"""
+    """打字「管理後台」時用的 Flex（粉白少女系）"""
     owner = is_owner(user_id)
-    color = "#7A3828"
+    color = "#C4907A"
     buttons = [
         ("👥 使用者管理","使用者管理選單"),
         ("⚙️ 系統管理","系統管理選單"),
@@ -966,11 +966,11 @@ def make_user_mgmt_flex(owner: bool) -> dict:
                ("🔴 封鎖","封鎖說明"), ("🟢 解除封鎖","解除封鎖說明")]
     if owner:
         buttons += [("➕ 新增管理者","新增管理者說明"), ("➖ 移除管理者","移除管理者說明")]
-    return make_menu_flex("👥 使用者管理","帳號 / 權限 / 黑名單","#7A3828", buttons)
+    return make_menu_flex("👥 使用者管理","帳號 / 權限 / 黑名單","#C4907A", buttons)
 
 def make_system_mgmt_flex() -> dict:
     return make_menu_flex(
-        "⚙️ 系統管理","快取 / 名稱 / 狀態","#7A3828",
+        "⚙️ 系統管理","快取 / 名稱 / 狀態","#C4907A",
         [("📊 快取狀態","快取狀態"), ("🔄 重載名稱","重載名稱"),
          ("🔍 查快取","查快取說明")]
     )
@@ -2303,7 +2303,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.22 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.23 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
