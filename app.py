@@ -1,6 +1,17 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v11.0（5 張圖 Rich Menu Alias 多頁切換）
+LINE Bot 模組 v10.9.21（v10.9.20 完整功能 + 5張圖 Rich Menu Alias 多頁切換）
+
+【本次更新】
+1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
+   - richmenu_user.png      一般用戶（玫瑰金）
+   - richmenu_owner_main.png  Owner 主頁（粉白少女）
+   - richmenu_owner_admin.png Owner 管理頁
+   - richmenu_admin_main.png  管理者主頁（粉紫）
+   - richmenu_admin_mgmt.png  管理者管理頁
+2. 圖片路徑改為 static/richmenu/
+3. 新增 debug log：每筆訊息、每個 handler 都會記錄
+4. 完整保留 v10.9.20 所有功能（查股票/推薦股/新聞/權限/Sheets/Flex/Quick Reply）
 """
 
 from flask import Flask, request, abort
@@ -39,6 +50,16 @@ STARTUP_DONE       = False
 NAME_CACHE_LOADING = False
 NAME_CACHE_LOADED  = False
 TZ_TAIPEI          = timezone(timedelta(hours=8))
+
+
+# ══════════════════════════════════════════
+#  Debug Log（新增 v10.9.21）
+# ══════════════════════════════════════════
+def dlog(category: str, msg: str):
+    """統一 debug log 格式：[時間][類別] 訊息"""
+    ts = datetime.now(TZ_TAIPEI).strftime("%H:%M:%S")
+    print(f"[{ts}][{category}] {msg}", flush=True)
+
 
 def now_taipei():
     return datetime.now(TZ_TAIPEI)
@@ -111,7 +132,7 @@ def startup():
         STARTUP_DONE = True
         for code, name in FALLBACK_NAMES.items():
             NAME_CACHE[code] = name
-        print(f"✅ 保底名稱立即載入：{len(FALLBACK_NAMES)} 筆")
+        dlog("STARTUP", f"保底名稱立即載入：{len(FALLBACK_NAMES)} 筆")
         t = threading.Thread(target=_bg_init)
         t.daemon = True
         t.start()
@@ -141,10 +162,10 @@ def _load_opendata(url: str, label: str) -> int:
                         NAME_CACHE[code] = name
                         count += 1
                 if count > 0:
-                    print(f"✅ {label}:{count} 筆")
+                    dlog("CACHE", f"{label}：{count} 筆")
                     return count
         except Exception as e:
-            print(f"{label} 第{attempt+1}次失敗：{e}")
+            dlog("CACHE", f"{label} 第{attempt+1}次失敗：{e}")
             time.sleep(2)
     return 0
 
@@ -163,10 +184,10 @@ def _load_twse_stock_day_all() -> int:
                         NAME_CACHE[code] = name
                         count += 1
                 if count > 100:
-                    print(f"✅ TWSE STOCK_DAY_ALL：{count} 筆")
+                    dlog("CACHE", f"TWSE STOCK_DAY_ALL：{count} 筆")
                     return count
         except Exception as e:
-            print(f"STOCK_DAY_ALL 第{attempt+1}次失敗：{e}")
+            dlog("CACHE", f"STOCK_DAY_ALL 第{attempt+1}次失敗：{e}")
             time.sleep(2)
     return 0
 
@@ -184,10 +205,10 @@ def _load_tpex_quotes() -> int:
                     NAME_CACHE[code] = name
                     count += 1
             if count > 0:
-                print(f"✅ TPEx mainboard_quotes：{count} 筆")
+                dlog("CACHE", f"TPEx mainboard_quotes：{count} 筆")
                 return count
         except Exception as e:
-            print(f"TPEx quotes 第{attempt+1}次失敗：{e}")
+            dlog("CACHE", f"TPEx quotes 第{attempt+1}次失敗：{e}")
             time.sleep(2)
     return 0
 
@@ -217,10 +238,10 @@ def init_name_cache():
                             NAME_CACHE[code] = name
                             count += 1
                 if count > 100:
-                    print(f"✅ TWSE rwd備援：{count} 筆")
+                    dlog("CACHE", f"TWSE rwd備援：{count} 筆")
                     break
             except Exception as e:
-                print(f"TWSE rwd第{attempt+1}次失敗：{e}")
+                dlog("CACHE", f"TWSE rwd第{attempt+1}次失敗：{e}")
                 time.sleep(2)
 
     for code, name in FALLBACK_NAMES.items():
@@ -228,15 +249,15 @@ def init_name_cache():
 
     NAME_CACHE_LOADING = False
     NAME_CACHE_LOADED  = True
-    print(f"✅ 名稱快取完整載入：{len(NAME_CACHE)} 筆")
+    dlog("CACHE", f"✅ 名稱快取完整載入：{len(NAME_CACHE)} 筆")
     try:
         push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{len(NAME_CACHE)} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
     except: pass
 
 
-# ══════════════════════════════════════════
-#  Rich Menu（5 張圖 + Alias 多頁切換）v11.0
-# ══════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+#  Rich Menu v10.9.21（5 張圖 Alias 多頁切換）⭐ 本次重點改動
+# ══════════════════════════════════════════════════════════
 ALIAS_USER        = "lumistock-user"
 ALIAS_OWNER_MAIN  = "lumistock-owner-main"
 ALIAS_OWNER_ADMIN = "lumistock-owner-admin"
@@ -248,45 +269,75 @@ def _delete_all_rich_menus():
     try:
         r = requests.get("https://api.line.me/v2/bot/richmenu/list",
                         headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
-        for menu in r.json().get("richmenus", []):
+        menus = r.json().get("richmenus", [])
+        dlog("RICHMENU", f"刪除舊 Rich Menu：{len(menus)} 個")
+        for menu in menus:
             requests.delete(f"https://api.line.me/v2/bot/richmenu/{menu['richMenuId']}",
                           headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
-    except: pass
+    except Exception as e:
+        dlog("RICHMENU", f"刪除舊 Rich Menu 失敗：{e}")
 
 
 def _delete_all_aliases():
     try:
         r = requests.get("https://api.line.me/v2/bot/richmenu/alias/list",
                         headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
-        for alias in r.json().get("aliases", []):
+        aliases = r.json().get("aliases", [])
+        dlog("RICHMENU", f"刪除舊 Alias：{len(aliases)} 個")
+        for alias in aliases:
             requests.delete(f"https://api.line.me/v2/bot/richmenu/alias/{alias['richMenuAliasId']}",
                           headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
-    except: pass
+    except Exception as e:
+        dlog("RICHMENU", f"刪除舊 Alias 失敗：{e}")
 
 
-def _create_rich_menu(body: dict, img_url: str) -> str:
+def _create_rich_menu(body: dict, img_url: str, label: str) -> str:
+    """建立單一 Rich Menu，回傳 rich_menu_id；失敗回傳 ''"""
     headers_json = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
                     "Content-Type": "application/json"}
+    # Step 1：註冊 Rich Menu 結構
     r = requests.post("https://api.line.me/v2/bot/richmenu",
                      headers=headers_json, json=body)
+    if r.status_code != 200:
+        dlog("RICHMENU", f"❌ [{label}] 建立結構失敗 HTTP {r.status_code}：{r.text[:200]}")
+        return ""
     rid = r.json().get("richMenuId", "")
     if not rid:
-        print(f"❌ 建立 Rich Menu 失敗：{r.text}")
+        dlog("RICHMENU", f"❌ [{label}] 沒拿到 richMenuId")
         return ""
+    dlog("RICHMENU", f"✅ [{label}] 結構建立 {rid[:20]}...")
+
+    # Step 2：下載圖片
     try:
-        img_r = requests.get(img_url, timeout=15)
-        img_resp = requests.post(f"https://api-data.line.me/v2/bot/richmenu/{rid}/content",
+        img_r = requests.get(img_url, timeout=20)
+        if img_r.status_code != 200:
+            dlog("RICHMENU", f"❌ [{label}] 圖片下載失敗 HTTP {img_r.status_code}：{img_url}")
+            return ""
+        img_size_kb = len(img_r.content) / 1024
+        dlog("RICHMENU", f"   [{label}] 圖片下載成功：{img_size_kb:.1f} KB")
+    except Exception as e:
+        dlog("RICHMENU", f"❌ [{label}] 圖片下載例外：{e}")
+        return ""
+
+    # Step 3：上傳圖片到 LINE
+    try:
+        upload = requests.post(f"https://api-data.line.me/v2/bot/richmenu/{rid}/content",
                      headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
                               "Content-Type": "image/png"},
                      data=img_r.content)
-        if img_resp.status_code != 200:
-            print(f"❌ 上傳圖片失敗 {rid}：{img_resp.text}")
+        if upload.status_code != 200:
+            dlog("RICHMENU", f"❌ [{label}] 圖片上傳失敗 HTTP {upload.status_code}：{upload.text[:200]}")
+            return ""
+        dlog("RICHMENU", f"✅ [{label}] 圖片上傳成功")
     except Exception as e:
-        print(f"❌ 上傳圖片例外 {rid}：{e}")
+        dlog("RICHMENU", f"❌ [{label}] 圖片上傳例外：{e}")
+        return ""
+
     return rid
 
 
 def _create_alias(alias_id: str, rich_menu_id: str):
+    """建立 Alias，已存在時先刪除再建"""
     headers_json = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
                     "Content-Type": "application/json"}
     requests.delete(f"https://api.line.me/v2/bot/richmenu/alias/{alias_id}",
@@ -295,9 +346,9 @@ def _create_alias(alias_id: str, rich_menu_id: str):
                      headers=headers_json,
                      json={"richMenuAliasId": alias_id, "richMenuId": rich_menu_id})
     if r.status_code == 200:
-        print(f"✅ Alias 建立成功：{alias_id}")
+        dlog("RICHMENU", f"✅ Alias 建立：{alias_id}")
     else:
-        print(f"❌ Alias 建立失敗 {alias_id}：{r.text}")
+        dlog("RICHMENU", f"❌ Alias 建立失敗 {alias_id}：{r.text[:200]}")
 
 
 # 一般用戶（6 格 2x3）
@@ -310,7 +361,7 @@ AREAS_USER = [
     {"bounds":{"x":1667,"y":843, "width":833,"height":843},"action":{"type":"message","text":"持股管理"}},
 ]
 
-# Owner 主頁（6 格，右下切到管理頁）
+# Owner 主頁（右下「管理後台」→ 切換到 Owner 管理頁）
 AREAS_OWNER_MAIN = [
     {"bounds":{"x":0,   "y":0,   "width":833,"height":843},"action":{"type":"message","text":"查股票"}},
     {"bounds":{"x":833, "y":0,   "width":834,"height":843},"action":{"type":"message","text":"全球大盤"}},
@@ -321,7 +372,7 @@ AREAS_OWNER_MAIN = [
      "action":{"type":"richmenuswitch","richMenuAliasId":ALIAS_OWNER_ADMIN,"data":"to_owner_admin"}},
 ]
 
-# Owner 管理頁（6 格，右下返回主頁）
+# Owner 管理頁（右下「返回主頁」→ 切回 Owner 主頁）
 AREAS_OWNER_ADMIN = [
     {"bounds":{"x":0,   "y":0,   "width":833,"height":843},"action":{"type":"message","text":"使用者管理"}},
     {"bounds":{"x":833, "y":0,   "width":834,"height":843},"action":{"type":"message","text":"系統管理"}},
@@ -332,7 +383,7 @@ AREAS_OWNER_ADMIN = [
      "action":{"type":"richmenuswitch","richMenuAliasId":ALIAS_OWNER_MAIN,"data":"to_owner_main"}},
 ]
 
-# 管理者主頁（6 格，右下切到管理頁）
+# 管理者主頁（右下「管理後台」→ 切換到管理者管理頁）
 AREAS_ADMIN_MAIN = [
     {"bounds":{"x":0,   "y":0,   "width":833,"height":843},"action":{"type":"message","text":"查股票"}},
     {"bounds":{"x":833, "y":0,   "width":834,"height":843},"action":{"type":"message","text":"全球大盤"}},
@@ -343,7 +394,7 @@ AREAS_ADMIN_MAIN = [
      "action":{"type":"richmenuswitch","richMenuAliasId":ALIAS_ADMIN_MGMT,"data":"to_admin_mgmt"}},
 ]
 
-# 管理者管理頁（3 格 1x3，右側返回主頁）
+# 管理者管理頁（3 格 1x3）
 AREAS_ADMIN_MGMT = [
     {"bounds":{"x":0,    "y":0, "width":833, "height":1686},"action":{"type":"message","text":"使用者管理"}},
     {"bounds":{"x":833,  "y":0, "width":834, "height":1686},"action":{"type":"message","text":"持股管理"}},
@@ -357,96 +408,104 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    print("🌸 開始建立 Rich Menu...")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.21 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
 
     # 1. 一般用戶（玫瑰金）
-    user_body = {
-        "size":{"width":2500,"height":1686},"selected":True,
-        "name":"一般用戶選單","chatBarText":"✨ 慧股拾光 功能選單",
-        "areas": AREAS_USER
-    }
-    uid = _create_rich_menu(user_body, f"{base_url}/richmenu_user.png")
+    uid = _create_rich_menu(
+        {"size":{"width":2500,"height":1686},"selected":True,
+         "name":"一般用戶選單","chatBarText":"✨ 慧股拾光 功能選單",
+         "areas": AREAS_USER},
+        f"{base_url}/richmenu_user.png", "user")
     if uid:
         RICH_MENU_IDS["user"] = uid
         _create_alias(ALIAS_USER, uid)
-        requests.post(f"https://api.line.me/v2/bot/user/all/richmenu/{uid}",
+        # 設為全體新加好友的預設選單
+        r = requests.post(f"https://api.line.me/v2/bot/user/all/richmenu/{uid}",
                      headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
+        dlog("RICHMENU", f"✅ user 設為預設選單 HTTP {r.status_code}")
 
     # 2. Owner 主頁（粉白少女）
-    owner_main_body = {
-        "size":{"width":2500,"height":1686},"selected":True,
-        "name":"Owner主頁","chatBarText":"👑 慧股拾光 Owner",
-        "areas": AREAS_OWNER_MAIN
-    }
-    omid = _create_rich_menu(owner_main_body, f"{base_url}/richmenu_owner_main.png")
+    omid = _create_rich_menu(
+        {"size":{"width":2500,"height":1686},"selected":True,
+         "name":"Owner主頁","chatBarText":"👑 慧股拾光 Owner",
+         "areas": AREAS_OWNER_MAIN},
+        f"{base_url}/richmenu_owner_main.png", "owner_main")
     if omid:
         RICH_MENU_IDS["owner_main"] = omid
         _create_alias(ALIAS_OWNER_MAIN, omid)
 
     # 3. Owner 管理頁
-    owner_admin_body = {
-        "size":{"width":2500,"height":1686},"selected":True,
-        "name":"Owner管理頁","chatBarText":"👑 Owner 管理後台",
-        "areas": AREAS_OWNER_ADMIN
-    }
-    oaid = _create_rich_menu(owner_admin_body, f"{base_url}/richmenu_owner_admin.png")
+    oaid = _create_rich_menu(
+        {"size":{"width":2500,"height":1686},"selected":True,
+         "name":"Owner管理頁","chatBarText":"👑 Owner 管理後台",
+         "areas": AREAS_OWNER_ADMIN},
+        f"{base_url}/richmenu_owner_admin.png", "owner_admin")
     if oaid:
         RICH_MENU_IDS["owner_admin"] = oaid
         _create_alias(ALIAS_OWNER_ADMIN, oaid)
 
     # 4. 管理者主頁（粉紫）
-    admin_main_body = {
-        "size":{"width":2500,"height":1686},"selected":True,
-        "name":"管理者主頁","chatBarText":"🛡️ 慧股拾光 管理者",
-        "areas": AREAS_ADMIN_MAIN
-    }
-    amid = _create_rich_menu(admin_main_body, f"{base_url}/richmenu_admin_main.png")
+    amid = _create_rich_menu(
+        {"size":{"width":2500,"height":1686},"selected":True,
+         "name":"管理者主頁","chatBarText":"🛡️ 慧股拾光 管理者",
+         "areas": AREAS_ADMIN_MAIN},
+        f"{base_url}/richmenu_admin_main.png", "admin_main")
     if amid:
         RICH_MENU_IDS["admin_main"] = amid
         _create_alias(ALIAS_ADMIN_MAIN, amid)
 
     # 5. 管理者管理頁
-    admin_mgmt_body = {
-        "size":{"width":2500,"height":1686},"selected":True,
-        "name":"管理者管理頁","chatBarText":"🛡️ 管理者後台",
-        "areas": AREAS_ADMIN_MGMT
-    }
-    amgid = _create_rich_menu(admin_mgmt_body, f"{base_url}/richmenu_admin_mgmt.png")
+    amgid = _create_rich_menu(
+        {"size":{"width":2500,"height":1686},"selected":True,
+         "name":"管理者管理頁","chatBarText":"🛡️ 管理者後台",
+         "areas": AREAS_ADMIN_MGMT},
+        f"{base_url}/richmenu_admin_mgmt.png", "admin_mgmt")
     if amgid:
         RICH_MENU_IDS["admin_mgmt"] = amgid
         _create_alias(ALIAS_ADMIN_MGMT, amgid)
 
     # 綁定 Owner 個人選單
     if omid:
-        requests.post(f"https://api.line.me/v2/bot/user/{OWNER_USER_ID}/richmenu/{omid}",
+        r = requests.post(f"https://api.line.me/v2/bot/user/{OWNER_USER_ID}/richmenu/{omid}",
                      headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
+        dlog("RICHMENU", f"✅ Owner 個人選單綁定 HTTP {r.status_code}")
 
-    print(f"✅ Rich Menu 設定完成")
-    print(f"   user        = {uid}")
-    print(f"   owner_main  = {omid}")
-    print(f"   owner_admin = {oaid}")
-    print(f"   admin_main  = {amid}")
-    print(f"   admin_mgmt  = {amgid}")
+    dlog("RICHMENU", "=" * 50)
+    dlog("RICHMENU", f"Rich Menu 設定完成總結：")
+    dlog("RICHMENU", f"  user        = {uid or '❌ FAIL'}")
+    dlog("RICHMENU", f"  owner_main  = {omid or '❌ FAIL'}")
+    dlog("RICHMENU", f"  owner_admin = {oaid or '❌ FAIL'}")
+    dlog("RICHMENU", f"  admin_main  = {amid or '❌ FAIL'}")
+    dlog("RICHMENU", f"  admin_mgmt  = {amgid or '❌ FAIL'}")
+    dlog("RICHMENU", "=" * 50)
 
 
 def assign_rich_menu(user_id: str):
-    """依角色綁定對應的主頁 Rich Menu"""
+    """新用戶或角色變更時指派正確主頁選單"""
     if user_id == OWNER_USER_ID:
-        rid = RICH_MENU_IDS.get("owner_main", "")
+        rid = RICH_MENU_IDS.get("owner_main","")
+        role = "owner"
     elif is_admin(user_id):
-        rid = RICH_MENU_IDS.get("admin_main", "")
+        rid = RICH_MENU_IDS.get("admin_main","")
+        role = "admin"
     else:
-        rid = RICH_MENU_IDS.get("user", "")
+        rid = RICH_MENU_IDS.get("user","")
+        role = "user"
     if rid:
         r = requests.post(f"https://api.line.me/v2/bot/user/{user_id}/richmenu/{rid}",
                      headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"})
         if r.status_code == 200:
-            print(f"✅ 已綁定 Rich Menu：{user_id[:10]}...")
+            dlog("RICHMENU", f"✅ 綁定 {role}：{user_id[:10]}...")
         else:
-            print(f"❌ 綁定失敗：{r.text}")
+            dlog("RICHMENU", f"❌ 綁定失敗 {role}：{r.text[:200]}")
+    else:
+        dlog("RICHMENU", f"⚠️ 角色 {role} 沒有對應的 rich_menu_id")
+# ══════════════════════════════════════════════════════════
+#  ⬆️ Rich Menu 改動結束
+# ══════════════════════════════════════════════════════════
 
 
 # ══════════════════════════════════════════
@@ -640,7 +699,8 @@ def register_user(user_id: str, reg_name: str) -> str:
         assign_rich_menu(user_id)
         return f"✅ 註冊成功！歡迎 {reg_name} 使用慧股拾光 🌸\n\n現在可以直接輸入股票代號查詢！"
     except Exception as e:
-        print(f"註冊失敗：{e}"); return "❌ 註冊失敗，請稍後再試"
+        dlog("USER", f"註冊失敗：{e}")
+        return "❌ 註冊失敗，請稍後再試"
 
 def update_user_activity(user_id: str, message: str):
     try:
@@ -751,7 +811,7 @@ def push_flex(user_id: str, flex_content: dict, alt_text: str = "推薦股"):
                 PushMessageRequest(to=user_id,
                     messages=[FlexMessage(alt_text=alt_text,
                         contents=FlexContainer.from_dict(flex_content))]))
-    except Exception as e: print(f"push_flex失敗：{e}")
+    except Exception as e: dlog("PUSH", f"push_flex失敗：{e}")
 
 
 # ══════════════════════════════════════════
@@ -872,6 +932,30 @@ def make_portfolio_menu_flex() -> dict:
         [("➕ 新增持股","新增持股說明"), ("📋 查持股","持股"),
          ("📊 損益分析","損益分析"), ("🔴 停損提醒","停損提醒說明"),
          ("🎯 目標價提醒","目標價提醒說明")]
+    )
+
+def make_admin_menu_flex(user_id: str) -> dict:
+    """打字「管理後台」時用的 Flex（保留 v10.9.20 設計）"""
+    owner = is_owner(user_id)
+    color = "#7A3828"
+    buttons = [
+        ("👥 使用者管理","使用者管理選單"),
+        ("⚙️ 系統管理","系統管理選單"),
+    ]
+    if owner:
+        buttons += [
+            ("📢 推播管理","推播管理選單"),
+            ("🤖 AI管理","AI管理選單"),
+            ("🛡️ 管理者名單","管理者名單"),
+            ("📋 持股管理","持股管理選單"),
+        ]
+    else:
+        buttons.append(("📋 持股管理","持股管理選單"))
+
+    return make_menu_flex(
+        "👑 管理後台" if owner else "🛡️ 管理後台",
+        now_taipei().strftime("%m/%d %H:%M"),
+        color, buttons
     )
 
 def make_user_mgmt_flex(owner: bool) -> dict:
@@ -1417,11 +1501,11 @@ def fetch_institution_data()->tuple:
                     except: pass
                 if candidates:
                     dd=data.get("date",cd.strftime("%Y/%m/%d")); ts=now.strftime("%Y/%m/%d")
-                    if   dd==ts:                sn=f"✅ 已使用當日法人資料({dd})"
+                    if   dd==ts:                sn=f"✅ 已使用當日法人資料（{dd}）"
                     elif weekday<5 and not afc: sn=f"📅 今日法人資料尚未公布，暫用 {dd} 資料"
                     else:                       sn=f"📅 使用 {dd} 前交易日資料"
                     return candidates,dd,sn
-        except Exception as e: print(f"法人資料失敗：{e}")
+        except Exception as e: dlog("REC", f"法人資料失敗：{e}")
     return [],"","⚠️ 法人資料來源連線失敗"
 
 def fetch_tpex_institution_data()->list:
@@ -1441,7 +1525,7 @@ def fetch_tpex_institution_data()->list:
                     fl=(fb-fs)//1000; il=(ib-is_)//1000; tl=fl+il
                     if sid and tl>200: candidates.append((sid,nm,tl,fl,il))
                 except: pass
-    except Exception as e: print(f"TPEx法人失敗：{e}")
+    except Exception as e: dlog("REC", f"TPEx法人失敗：{e}")
     return candidates
 
 
@@ -1458,7 +1542,7 @@ def get_market_status()->dict:
         price=float(d.get("z",0) or d.get("y",0)); prev=float(d.get("y",price))
         pct=(price-prev)/prev*100 if prev else 0
         icon="🟢" if pct>=0 else "🔴"
-        result={"price":price,"pct":pct,"ok":pct>=-2,"str":f"{icon} 加權 {price:,.0f}({pct:+.2f}%)"}
+        result={"price":price,"pct":pct,"ok":pct>=-2,"str":f"{icon} 加權 {price:,.0f}（{pct:+.2f}%）"}
     except: pass
     return result
 
@@ -1485,7 +1569,7 @@ def get_market_summary()->str:
             prev=closes[-2] if len(closes)>=2 else price
             pct=(price-prev)/prev*100 if prev else 0
             ms=meta.get("marketState","")
-            state="(盤後)" if ms=="POST" else ""
+            state="（盤後）" if ms=="POST" else ""
             msg+=f"{'🟢' if pct>=0 else '🔴'} {name}　{price:,.2f}　{pct:+.2f}%{state}\n"
         except: msg+=f"⚪ {name}　--\n"
     msg+="━━━━━━━━━━━━━━\n⚠️ 僅供參考，非投資建議"
@@ -1611,7 +1695,7 @@ def build_and_push_recommendation(user_id:str):
             push_message(user_id,"⭐ 推薦股\n━━━━━━━━━━━━━━\n　目前無符合條件個股"); return
         push_flex(user_id,make_rec_flex(top5,mkt,source_note),"慧股推薦榜")
     except Exception as e:
-        print(f"推薦股運算失敗：{e}")
+        dlog("REC", f"推薦股運算失敗：{e}")
         push_message(user_id,"⭐ 推薦股\n━━━━━━━━━━━━━━\n　系統處理中發生錯誤\n　請稍後再試")
 
 
@@ -1622,7 +1706,7 @@ def get_portfolio_summary(user_id:str)->str:
     portfolio=load_portfolio()
     up={k:v for k,v in portfolio.items() if v.get("user_id")==user_id}
     if not up:
-        return "📋 持股清單是空的\n━━━━━━━━━━━━━━\n新增方式：\n　新增 2330 100 200\n　(代碼 股數 買入均價)"
+        return "📋 持股清單是空的\n━━━━━━━━━━━━━━\n新增方式：\n　新增 2330 100 200\n　（代碼 股數 買入均價）"
     msg="📋 我的持股\n━━━━━━━━━━━━━━\n"; total=0
     for symbol,data in up.items():
         try:
@@ -1634,7 +1718,7 @@ def get_portfolio_summary(user_id:str)->str:
             shares=data["shares"]; bp=data["buy_price"]
             profit=(price-bp)*shares; pct=(price-bp)/bp*100
             icon="🟢" if profit>=0 else "🔴"; total+=profit
-            msg+=f"{icon} {symbol}｜{name}\n　現價 {price:.2f}　買入 {bp:.2f}\n　{shares}股　損益 {profit:+,.0f}({pct:+.1f}%)\n\n"
+            msg+=f"{icon} {symbol}｜{name}\n　現價 {price:.2f}　買入 {bp:.2f}\n　{shares}股　損益 {profit:+,.0f}（{pct:+.1f}%）\n\n"
         except: msg+=f"　{symbol}　查詢失敗\n\n"
     msg+=f"━━━━━━━━━━━━━━\n{'🟢' if total>=0 else '🔴'} 總損益　{total:+,.0f}"
     return msg
@@ -1830,7 +1914,11 @@ def callback():
 def handle_message(event):
     text=event.message.text.strip(); user_id=event.source.user_id
 
+    # ── Debug log：每筆訊息都記錄
+    dlog("MSG", f"收到訊息 user={user_id[:10]}... text='{text}'")
+
     if is_blocked_user(user_id):
+        dlog("MSG", f"封鎖用戶嘗試使用：{user_id[:10]}...")
         reply_text(event.reply_token,"⛔ 此帳號已停止使用權限\n如有疑問請聯繫管理員")
         return
 
@@ -1838,52 +1926,65 @@ def handle_message(event):
 
     # ══ 主選單觸發 ══
     if text=="查股票":
+        dlog("HANDLER", "→ 查股票選單")
         reply_flex(event.reply_token, make_stock_menu_flex(), "查股票")
         return
 
     if text=="全球大盤":
+        dlog("HANDLER", "→ 全球大盤選單")
         reply_flex_with_qr(event.reply_token, make_market_menu_flex(), "全球大盤",
             [("台股加權","查台股加權"),("Nasdaq","查Nasdaq"),("S&P500","查SP500"),
              ("SOX","查SOX"),("VIX","查VIX"),("黃金","查黃金"),("原油","查原油")])
         return
 
     if text=="外匯資金":
+        dlog("HANDLER", "→ 外匯資金選單")
         reply_flex(event.reply_token, make_forex_menu_flex(), "全球外匯與資金市場")
         return
 
     if text=="AI分析":
+        dlog("HANDLER", "→ AI分析選單")
         reply_flex_with_qr(event.reply_token, make_ai_menu_flex(), "AI分析",
             [("推薦股","推薦股"),("趨勢股","趨勢股"),("成長股","成長股"),
              ("存股","存股"),("波段股","波段股"),("AI概念股","AI概念股")])
         return
 
     if text=="財經新聞":
+        dlog("HANDLER", "→ 財經新聞選單")
         reply_flex_with_qr(event.reply_token, make_news_menu_flex(), "財經新聞",
             [("台股新聞","台股新聞"),("美股新聞","美股新聞"),
              ("個股新聞","個股新聞"),("國際新聞","國際新聞"),("地緣政治","地緣政治新聞")])
         return
 
     if text=="持股管理":
+        dlog("HANDLER", "→ 持股管理選單")
         reply_flex_with_qr(event.reply_token, make_portfolio_menu_flex(), "持股管理",
             [("查持股","持股"),("新增持股","新增持股說明"),
              ("損益分析","損益分析"),("停損提醒","停損提醒說明")])
         return
 
-    # ══ 管理頁按鈕（從 Rich Menu 切換後觸發）══
+    # 打字「管理後台」→ 顯示 Flex（給沒切換 Rich Menu 的人用）
+    if text=="管理後台" and is_admin(user_id):
+        dlog("HANDLER", "→ 管理後台 Flex")
+        reply_flex(event.reply_token, make_admin_menu_flex(user_id), "管理後台")
+        return
+
+    # ══ Rich Menu 切換後的按鈕（v10.9.21 新增）══
     if text=="使用者管理" and is_admin(user_id):
+        dlog("HANDLER", "→ 使用者管理")
         reply_flex(event.reply_token, make_user_mgmt_flex(is_owner(user_id)), "使用者管理")
         return
-
     if text=="系統管理" and is_admin(user_id):
+        dlog("HANDLER", "→ 系統管理")
         reply_flex(event.reply_token, make_system_mgmt_flex(), "系統管理")
         return
-
     if text=="推播管理" and is_owner(user_id):
+        dlog("HANDLER", "→ 推播管理（開發中）")
         reply_text(event.reply_token,
             "📢 推播管理\n━━━━━━━━━━━━━━\n功能開發中 🚧\n\n後續版本將開放：\n　• 晨報推播\n　• 夜報推播\n　• 全體公告")
         return
-
     if text=="AI管理" and is_owner(user_id):
+        dlog("HANDLER", "→ AI 管理（開發中）")
         reply_text(event.reply_token,
             "🤖 AI 管理\n━━━━━━━━━━━━━━\n功能開發中 🚧\n\n後續版本將開放：\n　• AI 模型參數調整\n　• 推薦演算法設定\n　• 評分權重配置")
         return
@@ -1972,6 +2073,7 @@ def handle_message(event):
 
     # ══ AI 選股 ══
     if text in ["推薦股","今日推薦股"]:
+        dlog("HANDLER", "→ 推薦股（背景執行）")
         log_to_sheets(user_id,"查詢推薦股","","成功")
         reply_text(event.reply_token,
               "⭐ 推薦股分析中...\n━━━━━━━━━━━━━━\n"
@@ -2011,7 +2113,7 @@ def handle_message(event):
                 f"總筆數：{total}\n載入完成：{'✅' if NAME_CACHE_LOADED else '⏳載入中'}\n前5筆：\n{ss}"); return
         elif text.startswith("查快取 "):
             sid=text.replace("查快取 ","").strip()
-            cached=NAME_CACHE.get(sid,"(無)")
+            cached=NAME_CACHE.get(sid,"（無）")
             reply_text(event.reply_token,
                 f"🔍 快取查詢\n━━━━━━━━━━━━━━\n"
                 f"代號：{sid}\n快取名稱：{cached}\n"
@@ -2022,6 +2124,12 @@ def handle_message(event):
                 reply_text(event.reply_token,"🔄 開始重新載入名稱快取，約30秒後完成")
             else:
                 reply_text(event.reply_token,"⏳ 名稱快取載入中，請稍後")
+            return
+        elif text=="重設選單":
+            # Owner 專屬：手動重新建立 Rich Menu
+            dlog("HANDLER", "→ Owner 手動重設 Rich Menu")
+            reply_text(event.reply_token, "🔄 開始重新建立 Rich Menu，約 30 秒後完成...")
+            t=threading.Thread(target=setup_rich_menus); t.daemon=True; t.start()
             return
 
     # ══ 管理者共用指令 ══
@@ -2041,7 +2149,7 @@ def handle_message(event):
     # ══ 說明按鈕回應 ══
     if text=="封鎖說明": reply_text(event.reply_token,"格式：封鎖 姓名 原因\n例如：封鎖 王小明 違規"); return
     if text=="解除封鎖說明": reply_text(event.reply_token,"格式：解除封鎖 姓名\n例如：解除封鎖 王小明"); return
-    if text=="查使用者說明": reply_text(event.reply_token,"格式：查使用者 姓名\n例如：查使用者 王小明"); return
+    if text=="查使用者說明": reply_text(event.reply_token,"格式：查使用者 姓名\n例如:查使用者 王小明"); return
     if text=="新增管理者說明": reply_text(event.reply_token,"格式：新增管理者 user_id 姓名"); return
     if text=="移除管理者說明": reply_text(event.reply_token,"格式：移除管理者 姓名"); return
     if text=="新增持股說明": reply_text(event.reply_token,"格式：新增 代碼 股數 買入價\n例如：新增 2330 100 200"); return
@@ -2181,16 +2289,18 @@ def handle_message(event):
     # ══ 股票代號查詢 ══
     t=text.upper().replace("查","").strip()
     if t and (t.isdigit() or (t.isalpha() and len(t)>=1) or t.replace("-","").isalnum()):
+        dlog("HANDLER", f"→ 股票查詢 {t}")
         flex,err=get_stock_flex(t,user_id)
         if flex: reply_flex(event.reply_token,flex,f"{t} 股票資訊")
         else: reply_text(event.reply_token,err or "查詢失敗")
         return
 
+    dlog("HANDLER", "→ 無匹配，回 HELP_MSG")
     reply_text(event.reply_token, HELP_MSG)
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v11.0 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.21 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
