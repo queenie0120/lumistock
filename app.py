@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.31（色票更粉嫩：薰衣草粉/奶油杏粉/珊瑚粉）
+LINE Bot 模組 v10.9.32（台灣金價修復 + Dubai 原油 + 美債順序 + 殖利率 AI 解讀）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -1423,17 +1423,19 @@ def make_market_menu_flex() -> dict:
             ("🥇 台灣金價（每兩）","查台灣金價"),
             ("🥈 白銀","查白銀"),
         ]),
-        # 🛢️ 能源（v10.9.29 細分）
-        section_bubble("🛢️ 能源市場","WTI、Brent、天然氣","#D9B8A8",[
-            ("🛢️ WTI 原油","查WTI"),
-            ("🛢️ Brent 原油","查Brent"),
+        # 🛢️ 能源（v10.9.29 細分 / v10.9.32 加 Dubai）
+        section_bubble("🛢️ 能源市場","WTI、Brent、Dubai、天然氣","#D9B8A8",[
+            ("🛢️ WTI 原油（美國）","查WTI"),
+            ("🛢️ Brent 原油（北海）","查Brent"),
+            ("🛢️ Dubai/Oman（中東）","查Dubai"),
             ("⚡ 天然氣","查天然氣"),
         ]),
-        # 📉 債券
-        section_bubble("📉 美債殖利率","2 年 / 10 年 / 30 年","#5B8B6B",[
-            ("📉 10 年期殖利率","查美債"),
-            ("📊 2 年期殖利率","查美債2Y"),
-            ("📈 30 年期殖利率","查美債30Y"),
+        # 📉 債券（v10.9.32 調整順序：2Y → 10Y → 30Y）
+        section_bubble("📉 美債殖利率","利率預期 / 經濟風險 / 通膨","#C9B0DB",[
+            ("📊 2 年期（短期/Fed 預期）","查美債2Y"),
+            ("📉 10 年期（長期經濟）","查美債"),
+            ("📈 30 年期（通膨/財政）","查美債30Y"),
+            ("🧠 殖利率 AI 解讀","殖利率分析"),  # v10.9.32 新增
         ]),
     ]
     return {"type":"carousel","contents":bubbles}
@@ -1623,9 +1625,11 @@ MARKET_SYMBOLS = {
     "查黃金":     ("GC=F",   "🥇 黃金期貨 COMEX"),   # 別名相容
     "查白銀":     ("SI=F",   "🥈 白銀期貨"),
     "查台灣金價": ("__TWGOLD__", "🥇 台灣金價（每兩）"),  # 特殊處理
-    # 🛢️ 能源（v10.9.29 細分）
+    # 🛢️ 能源（v10.9.29 細分 / v10.9.32 加 Dubai）
     "查WTI":     ("CL=F",   "🛢️ WTI 原油（美國）"),
     "查Brent":   ("BZ=F",   "🛢️ Brent 原油（北海）"),
+    "查Dubai":   ("OQ=F",   "🛢️ Dubai/Oman 原油（中東）"),  # v10.9.32 新增
+    "查Oman":    ("OQ=F",   "🛢️ Dubai/Oman 原油（中東）"),  # 別名
     "查原油":    ("CL=F",   "🛢️ WTI 原油（美國）"),   # 別名相容
     "查天然氣":  ("NG=F",   "⚡ 天然氣期貨"),
     # 📉 債券
@@ -1636,43 +1640,96 @@ MARKET_SYMBOLS = {
 
 
 def get_taiwan_gold_price() -> dict:
-    """抓台灣黃金價格（每兩 = 37.5 公克），用台銀牌價。失敗時用 XAU/USD * 匯率估算"""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    # 嘗試 1：抓台銀牌價
+    """抓台灣黃金價格（每兩 = 37.5 公克）
+    v10.9.32 修正：用正確的台銀網址 + 多重備援
+    1. 台銀金鑽條塊（直接每兩價）→ 最準
+    2. 黃金存摺（每公克 × 37.5）
+    3. XAU/USD × 美元台幣匯率（估算）
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    import re as _re
+
+    # 嘗試 1：台銀牌價頁面（正確網址：/gold/quote/recent）
     try:
-        url = "https://rate.bot.com.tw/gold/passbook?Lang=zh-TW"
-        r = requests.get(url, headers=headers, timeout=8, verify=False)
+        url = "https://rate.bot.com.tw/gold/quote/recent"
+        r = requests.get(url, headers=headers, timeout=10, verify=False)
         if r.status_code == 200:
-            # 解析 HTML 找牌價
-            import re as _re
-            # 簡單抓「本行賣出 XXXX」格式
-            matches = _re.findall(r'本行賣出[^\d]*([\d,]+\.?\d*)', r.text)
-            if matches:
-                # 台銀是「每公克」價，要 × 37.5 換成「每兩」
-                gram_price = float(matches[0].replace(",",""))
-                price_per_tael = gram_price * 37.5
-                return {
-                    "price": price_per_tael,
-                    "gram_price": gram_price,
-                    "source": "台銀牌價",
-                    "currency": "TWD"
-                }
+            html = r.text
+            # 解析「掛牌時間」
+            time_match = _re.search(r'掛牌時間[：:\s]*([\d/:\s]+)', html)
+            quote_time = time_match.group(1).strip() if time_match else ""
+
+            # 策略 A：找「臺銀金鑽條塊」每台兩價（最準，直接每兩）
+            # 結構：「1 台兩」標題 + 本行賣出 XXX,XXX
+            tael_section = _re.search(
+                r'臺銀金鑽條塊.*?本行賣出[\s\S]*?([\d,]{5,})',
+                html, _re.DOTALL
+            )
+            if tael_section:
+                price_str = tael_section.group(1).replace(",", "").strip()
+                try:
+                    price_per_tael = float(price_str)
+                    # 合理性檢查：每兩應在 50,000 ~ 500,000 之間
+                    if 50000 <= price_per_tael <= 500000:
+                        gram_price = price_per_tael / 37.5
+                        dlog("GOLD", f"✅ 台銀金鑽條塊：{price_per_tael:,.0f}/兩")
+                        return {
+                            "price": price_per_tael,
+                            "gram_price": gram_price,
+                            "source": "台銀金鑽條塊牌價",
+                            "currency": "TWD",
+                            "quote_time": quote_time,
+                            "est": False
+                        }
+                except: pass
+
+            # 策略 B：找「黃金存摺」每公克價 × 37.5
+            # 結構：「1 公克」標題 + 黃金存摺 + 本行賣出 X,XXX
+            gram_section = _re.search(
+                r'黃金存摺.*?本行賣出[\s\S]*?([\d,]{3,7})',
+                html, _re.DOTALL
+            )
+            if gram_section:
+                price_str = gram_section.group(1).replace(",", "").strip()
+                try:
+                    gram_price = float(price_str)
+                    # 合理性檢查：每公克應在 1,000 ~ 10,000 之間
+                    if 1000 <= gram_price <= 10000:
+                        price_per_tael = gram_price * 37.5
+                        dlog("GOLD", f"✅ 台銀黃金存摺：{gram_price:,.0f}/克")
+                        return {
+                            "price": price_per_tael,
+                            "gram_price": gram_price,
+                            "source": "台銀黃金存摺牌價",
+                            "currency": "TWD",
+                            "quote_time": quote_time,
+                            "est": False
+                        }
+                except: pass
+
+            dlog("GOLD", "台銀頁面成功取得但解析失敗")
+        else:
+            dlog("GOLD", f"台銀牌價 HTTP {r.status_code}")
     except Exception as e:
         dlog("GOLD", f"台銀牌價失敗：{e}")
 
-    # 嘗試 2：用 XAU/USD * 美元台幣匯率估算
+    # 嘗試 2：用 XAU/USD * 美元台幣匯率估算（國際金價方式）
     try:
-        xau = get_yahoo_quote("XAUUSD=X")
+        xau = get_yahoo_quote("GC=F")  # 黃金期貨（比 XAU/USD 穩定）
+        if not xau:
+            xau = get_yahoo_quote("XAUUSD=X")
         usdtwd = get_yahoo_quote("TWD=X")
         if xau and usdtwd:
-            # XAU/USD 是每盎司美元，1盎司 ≈ 31.1035 公克，1台兩 = 37.5 公克
-            usd_per_gram = xau["price"] / 31.1035
+            # 黃金期貨是每盎司美元，1盎司 ≈ 31.1035 公克，1台兩 = 37.5 公克
+            usd_per_oz = xau["price"]
+            usd_per_gram = usd_per_oz / 31.1035
             twd_per_gram = usd_per_gram * usdtwd["price"]
             twd_per_tael = twd_per_gram * 37.5
+            dlog("GOLD", f"✅ XAU 估算：{twd_per_tael:,.0f}/兩")
             return {
                 "price": twd_per_tael,
                 "gram_price": twd_per_gram,
-                "source": "XAU/USD × 匯率",
+                "source": f"國際金價 ${usd_per_oz:.0f}/盎司 × USD/TWD {usdtwd['price']:.2f}",
                 "currency": "TWD",
                 "est": True
             }
@@ -1694,6 +1751,152 @@ def get_market_strength_label(pct: float) -> tuple:
         return ("↘️", "偏空", "#7AABBE")
     else:
         return ("📉", "弱勢", "#5B8DB8")
+
+
+def get_yield_analysis() -> dict:
+    """殖利率 AI 解讀（v10.9.32 新增，規則式判讀）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 抓 2Y、10Y、30Y
+    def get_yld(sym):
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
+            r = requests.get(url, headers=headers, timeout=8)
+            result = r.json()["chart"]["result"][0]
+            meta = result["meta"]
+            quotes = result.get("indicators",{}).get("quote",[{}])[0]
+            closes = [c for c in quotes.get("close",[]) if c is not None]
+            price = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
+            prev = closes[-2] if len(closes)>=2 else price
+            chg = price - prev
+            pct = chg / prev * 100 if prev else 0
+            return {"yield": price, "chg": chg, "pct": pct}
+        except Exception as e:
+            dlog("YIELD", f"{sym} 失敗：{e}")
+            return None
+
+    y2 = get_yld("^IRX")   # 2Y (用短期國庫券近似)
+    y10 = get_yld("^TNX")  # 10Y
+    y30 = get_yld("^TYX")  # 30Y
+
+    if not (y2 and y10):
+        return {}
+
+    # 判斷殖利率倒掛
+    spread_2_10 = y10["yield"] - y2["yield"]
+    inverted = spread_2_10 < 0
+
+    # AI 解讀邏輯
+    interpretations = []
+
+    # 殖利率方向
+    if y10["pct"] > 1:
+        interpretations.append("📉 10年期殖利率上升 → 科技股、成長股壓力增加")
+    elif y10["pct"] < -1:
+        interpretations.append("📈 10年期殖利率下降 → 成長股、AI 類股可能受惠")
+
+    # 倒掛警告
+    if inverted:
+        interpretations.append(f"⚠️ 殖利率倒掛 2Y > 10Y（差距 {abs(spread_2_10):.2f}％）→ 經濟衰退預警訊號")
+    elif spread_2_10 < 0.5:
+        interpretations.append(f"🟡 殖利率曲線平坦（差距僅 {spread_2_10:.2f}％）→ 市場對長期經濟保守")
+    else:
+        interpretations.append(f"🟢 殖利率曲線正常（10Y-2Y = {spread_2_10:.2f}％）→ 經濟結構健康")
+
+    # 2 年期解讀（Fed 政策）
+    if y2["pct"] > 2:
+        interpretations.append("🔴 2年期急升 → 市場預期 Fed 升息壓力增加")
+    elif y2["pct"] < -2:
+        interpretations.append("🟢 2年期急跌 → 市場預期 Fed 可能降息")
+
+    # 30 年期解讀（通膨）
+    if y30 and y30["pct"] > 1.5:
+        interpretations.append("📈 30年期上升 → 長期通膨與財政赤字疑慮")
+    elif y30 and y30["pct"] < -1.5:
+        interpretations.append("📉 30年期下降 → 長期通膨壓力舒緩")
+
+    return {
+        "y2": y2,
+        "y10": y10,
+        "y30": y30,
+        "spread": spread_2_10,
+        "inverted": inverted,
+        "interpretations": interpretations,
+    }
+
+
+def make_yield_analysis_flex(data: dict) -> dict:
+    """殖利率 AI 解讀 Flex 卡片（v10.9.32 新增）"""
+    if not data: return None
+    y2 = data.get("y2", {})
+    y10 = data.get("y10", {})
+    y30 = data.get("y30", {})
+    inverted = data.get("inverted", False)
+    spread = data.get("spread", 0)
+    interpretations = data.get("interpretations", [])
+
+    # 倒掛時用淺紅警示色
+    header_color = "#D49B9B" if inverted else "#C9B0DB"
+    title = "⚠️ 殖利率倒掛警示" if inverted else "📉 美債殖利率 AI 解讀"
+
+    def yield_row(label, yld_data, hint):
+        if not yld_data:
+            return {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":label,"size":"sm","color":"#A07560","flex":3},
+                {"type":"text","text":"--","size":"sm","color":"#888","flex":2,"align":"end"},
+            ]}
+        is_up = yld_data["chg"] >= 0
+        c = "#D97A5C" if is_up else "#7AABBE"
+        arrow = "▲" if is_up else "▼"
+        return {"type":"box","layout":"vertical","spacing":"none","contents":[
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":label,"size":"sm","color":"#A07560","weight":"bold","flex":3},
+                {"type":"text","text":f"{yld_data['yield']:.3f}%","size":"sm","color":c,"weight":"bold","flex":2,"align":"end"},
+                {"type":"text","text":f"{arrow}{abs(yld_data['pct']):.2f}%","size":"xxs","color":c,"flex":2,"align":"end"},
+            ]},
+            {"type":"text","text":hint,"size":"xxs","color":"#B89BC4","margin":"none"}
+        ]}
+
+    interp_contents = []
+    for line in interpretations[:6]:  # 最多 6 條解讀
+        interp_contents.append({
+            "type":"text","text":line,"size":"xs","color":"#5D3F75","wrap":True
+        })
+
+    return {
+        "type":"bubble","size":"mega",
+        "header":{
+            "type":"box","layout":"vertical","backgroundColor":header_color,"paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":title,"size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":now_taipei().strftime("%m/%d %H:%M"),"size":"xxs","color":"#FFFFFF"}
+            ]
+        },
+        "body":{
+            "type":"box","layout":"vertical","spacing":"md","paddingAll":"14px",
+            "contents":[
+                # 殖利率數值
+                yield_row("📊 2 年期", y2, "→ 短期利率/Fed 政策預期"),
+                {"type":"separator","color":"#F0D5C0"},
+                yield_row("📉 10 年期", y10, "→ 長期經濟/全球資金成本"),
+                {"type":"separator","color":"#F0D5C0"},
+                yield_row("📈 30 年期", y30, "→ 長期通膨/財政風險"),
+                {"type":"separator","color":"#F0D5C0"},
+                # 曲線狀態
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"曲線狀態","size":"xs","color":"#A07560","flex":1},
+                    {"type":"text","text":f"{'⚠️ 倒掛' if inverted else '✅ 正常'} ({spread:+.2f}％)",
+                     "size":"xs","color":("#D97A5C" if inverted else "#5D8B6B"),"weight":"bold","flex":2,"align":"end"}
+                ]},
+                {"type":"separator","color":"#F0D5C0"},
+                # AI 解讀
+                {"type":"text","text":"🧠 AI 市場解讀","size":"sm","color":"#A05A48","weight":"bold"},
+            ] + interp_contents + [
+                {"type":"separator","color":"#F0D5C0"},
+                {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#B89BC4"}
+            ]
+        }
+    }
 
 def get_yahoo_quote(symbol: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -1747,12 +1950,21 @@ def make_quote_flex(name: str, data: dict, color: str = "#5B8DB8") -> dict:
 
 
 def make_taiwan_gold_flex(data: dict) -> dict:
-    """台灣金價專用 Flex"""
+    """台灣金價專用 Flex（v10.9.32 加掛牌時間）"""
     if not data: return None
     price = data.get("price", 0)
     gram_price = data.get("gram_price", 0)
     source = data.get("source", "")
+    quote_time = data.get("quote_time", "")
     est = data.get("est", False)
+
+    # 來源說明
+    src_label = f"💡 {source}"
+    if est:
+        src_label += "（估算）"
+    if quote_time:
+        src_label += f"\n📅 掛牌：{quote_time}"
+
     return {
         "type":"bubble","size":"kilo",
         "header":{
@@ -1762,17 +1974,15 @@ def make_taiwan_gold_flex(data: dict) -> dict:
         "body":{
             "type":"box","layout":"vertical","paddingAll":"12px","spacing":"sm",
             "contents":[
-                {"type":"text","text":"每兩（37.5 克）","size":"xxs","color":"#9B6B5A"},
+                {"type":"text","text":"每兩（37.5 克）","size":"xxs","color":"#A07560"},
                 {"type":"text","text":f"NT$ {price:,.0f}","size":"xxl","weight":"bold","color":"#E89B82"},
-                {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":"每公克","size":"xxs","color":"#9B6B5A"},
+                {"type":"separator","color":"#F0D5C0"},
+                {"type":"text","text":"每公克","size":"xxs","color":"#A07560"},
                 {"type":"text","text":f"NT$ {gram_price:,.2f}","size":"md","color":"#E89B82","weight":"bold"},
-                {"type":"separator","color":"#E8C4B4"},
-                {"type":"box","layout":"horizontal","contents":[
-                    {"type":"text","text":f"💡 {source}{'（估算）' if est else ''}","size":"xxs","color":"#9B6B5A","flex":1},
-                    {"type":"text","text":now_taipei().strftime("%m/%d %H:%M"),
-                     "size":"xxs","color":"#AAAAAA","align":"end","flex":1}
-                ]}
+                {"type":"separator","color":"#F0D5C0"},
+                {"type":"text","text":src_label,"size":"xxs","color":"#A07560","wrap":True},
+                {"type":"text","text":f"⏰ 查詢：{now_taipei().strftime('%m/%d %H:%M')}",
+                 "size":"xxs","color":"#B8B8B8"}
             ]
         }
     }
@@ -2894,6 +3104,18 @@ def handle_message(event):
             [("查持股","持股"),("新增持股","新增持股說明"),("損益分析","損益分析")])
         return
 
+    # ══ 殖利率 AI 解讀（v10.9.32 新增）══
+    if text == "殖利率分析" or text == "殖利率 AI 解讀" or text == "殖利率AI解讀":
+        dlog("HANDLER", "→ 殖利率 AI 解讀")
+        data = get_yield_analysis()
+        if data:
+            flex = make_yield_analysis_flex(data)
+            if flex:
+                reply_flex(event.reply_token, flex, "美債殖利率 AI 解讀")
+                return
+        reply_text(event.reply_token, "⚠️ 殖利率資料取得失敗\n請稍後再試")
+        return
+
     # ══ 市場指數查詢 ══
     if text in MARKET_SYMBOLS:
         sym, name = MARKET_SYMBOLS[text]
@@ -3311,7 +3533,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.31 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.32 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
