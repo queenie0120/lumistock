@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.32（台灣金價修復 + Dubai 原油 + 美債順序 + 殖利率 AI 解讀）
+LINE Bot 模組 v10.9.33（外匯重構 3 區：台灣關鍵匯率 + 美元核心 + 國際貨幣對）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -1441,69 +1441,87 @@ def make_market_menu_flex() -> dict:
     return {"type":"carousel","contents":bubbles}
 
 def make_forex_menu_flex() -> dict:
-    """全球外匯（v10.9.29 擴充：USD/TWD 第一、DXY 第二、新增 KRW/HKD/CNH）"""
-    return {
-        "type":"bubble","size":"mega",
-        "header":{
-            "type":"box","layout":"vertical","backgroundColor":"#B89BC4","paddingAll":"14px",
-            "contents":[
-                {"type":"text","text":"💹 全球外匯與資金市場","size":"lg","color":"#FFFFFF","weight":"bold"},
-                {"type":"text","text":"匯率・市場分析・資金流向","size":"xs","color":"#FFFFFF"}
-            ]
-        },
-        "body":{
-            "type":"box","layout":"vertical","spacing":"sm","paddingAll":"12px",
-            "contents":[
-                # 🇹🇼 台股最重要 → 第一順位
-                {"type":"text","text":"🇹🇼 台股關鍵匯率","size":"sm","weight":"bold","color":"#B89BC4"},
-                {"type":"button","style":"primary","height":"sm","color":"#E89B82",
-                 "action":{"type":"message","label":"🇹🇼 USD/TWD 美元台幣","text":"查USDTWD"}},
-                # 💵 美元指數 → 第二順位（全球市場核心）
-                {"type":"text","text":"💵 美元指數（全球核心）","size":"sm","weight":"bold","color":"#B89BC4"},
-                {"type":"button","style":"primary","height":"sm","color":"#D9C5B3",
-                 "action":{"type":"message","label":"💵 DXY 美元指數","text":"查DXY"}},
-                {"type":"separator","color":"#E8D4F0"},
-                # 🌏 五大幣
-                {"type":"text","text":"🌏 五大主要貨幣","size":"sm","weight":"bold","color":"#B89BC4"},
-                {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"💴 USD/JPY","text":"查USDJPY"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"💶 EUR/USD","text":"查EURUSD"}},
-                ]},
-                {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"💷 GBP/USD","text":"查GBPUSD"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"🇨🇳 USD/CNY","text":"查USDCNY"}},
-                ]},
-                {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"🇨🇳 USD/CNH 離岸","text":"查USDCNH"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"🇰🇷 USD/KRW","text":"查USDKRW"}},
-                ]},
-                # 其他
-                {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"🇦🇺 AUD/USD","text":"查AUDUSD"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
-                     "action":{"type":"message","label":"🇭🇰 USD/HKD","text":"查USDHKD"}},
-                ]},
-                {"type":"separator","color":"#E8D4F0"},
-                # 市場分析
-                {"type":"text","text":"📊 市場分析","size":"sm","weight":"bold","color":"#B89BC4"},
-                {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
-                     "action":{"type":"message","label":"外匯市場分析","text":"外匯市場分析"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
-                     "action":{"type":"message","label":"市場連動分析","text":"市場連動分析"}},
-                ]},
-                {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
-                 "action":{"type":"message","label":"全球資金流向","text":"全球資金流向"}},
-            ]
+    """全球外匯（v10.9.33 重構：分 3 區 carousel - 台灣關鍵 / 美元核心 / 國際主要）"""
+
+    def section_bubble(title, subtitle, color, buttons, header_size="lg"):
+        """共用區塊樣式（每個 carousel 卡片）"""
+        btn_contents = []
+        for label, text in buttons:
+            btn_contents.append({
+                "type":"button","style":"primary","height":"sm","color":color,
+                "action":{"type":"message","label":label,"text":text}
+            })
+        return {
+            "type":"bubble","size":"mega",
+            "header":{
+                "type":"box","layout":"vertical","backgroundColor":color,"paddingAll":"14px",
+                "contents":[
+                    {"type":"text","text":title,"size":header_size,"color":"#FFFFFF","weight":"bold"},
+                    {"type":"text","text":subtitle,"size":"xs","color":"#FFFFFF","wrap":True}
+                ]
+            },
+            "body":{
+                "type":"box","layout":"vertical","spacing":"sm","paddingAll":"12px",
+                "contents": btn_contents
+            }
         }
-    }
+
+    bubbles = [
+        # 🇹🇼 台灣關鍵匯率（v10.9.33 新增區）
+        section_bubble(
+            "🇹🇼 台灣關鍵匯率",
+            "真正影響台股、外資、資金流",
+            "#E89B82",  # 珊瑚粉
+            [
+                ("🇹🇼 USD/TWD 美元台幣","查USDTWD"),
+                ("🇯🇵 JPY/TWD 日圓台幣","查JPYTWD"),
+                ("🇪🇺 EUR/TWD 歐元台幣","查EURTWD"),
+                ("🇬🇧 GBP/TWD 英鎊台幣","查GBPTWD"),
+                ("🇨🇳 CNY/TWD 人民幣台幣","查CNYTWD"),
+                ("🇭🇰 HKD/TWD 港幣台幣","查HKDTWD"),
+                ("🇰🇷 KRW/TWD 韓元台幣","查KRWTWD"),
+                ("🇦🇺 AUD/TWD 澳幣台幣","查AUDTWD"),
+            ]
+        ),
+        # 💵 美元核心（v10.9.33 新增區）
+        section_bubble(
+            "💵 美元核心",
+            "全球資金市場核心指標",
+            "#E8B8A8",  # 奶油杏粉
+            [
+                ("💵 DXY 美元指數","查DXY"),
+                ("📉 10 年期美債殖利率","查美債"),
+                ("📊 2 年期美債殖利率","查美債2Y"),
+                ("🧠 殖利率 AI 解讀","殖利率分析"),
+            ]
+        ),
+        # 🌏 國際主要貨幣對（保留）
+        section_bubble(
+            "🌏 國際主要貨幣對",
+            "全球資金方向・市場風險偏好",
+            "#C9B0DB",  # 薰衣草粉
+            [
+                ("💴 USD/JPY 美元日圓","查USDJPY"),
+                ("💶 EUR/USD 歐元美元","查EURUSD"),
+                ("💷 GBP/USD 英鎊美元","查GBPUSD"),
+                ("🇨🇳 USD/CNH 離岸人民幣","查USDCNH"),
+                ("🇰🇷 USD/KRW 美元韓元","查USDKRW"),
+                ("🇦🇺 AUD/USD 澳幣美元","查AUDUSD"),
+            ]
+        ),
+        # 📊 市場分析（保留，未來 AI 解讀區）
+        section_bubble(
+            "📊 市場分析",
+            "AI 多空判讀・資金流向",
+            "#B89BC4",  # 粉紫淺
+            [
+                ("📊 外匯市場分析","外匯市場分析"),
+                ("🔗 市場連動分析","市場連動分析"),
+                ("💸 全球資金流向","全球資金流向"),
+            ]
+        ),
+    ]
+    return {"type":"carousel","contents":bubbles}
 
 def make_ai_menu_flex() -> dict:
     return make_menu_flex(
@@ -1581,21 +1599,27 @@ def make_system_mgmt_flex() -> dict:
 #  外匯/商品資料
 # ══════════════════════════════════════════
 FOREX_SYMBOLS = {
-    # 🇹🇼 台股最重要匯率 - 放最前面
-    "查USDTWD": ("TWD=X",  "USD/TWD 美元台幣"),
-    # 💵 美元指數 - 全球市場核心
-    "查DXY":    ("DX-Y.NYB","DXY 美元指數"),
-    # 🌏 五大幣
-    "查USDJPY": ("JPY=X",  "USD/JPY 美元日圓"),
-    "查EURUSD": ("EURUSD=X","EUR/USD 歐元美元"),
-    "查GBPUSD": ("GBPUSD=X","GBP/USD 英鎊美元"),
-    "查USDCNY": ("CNY=X",  "USD/CNY 美元人民幣"),
-    "查USDCNH": ("CNH=X",  "USD/CNH 美元離岸人民幣"),
-    # 其他常用
-    "查AUDUSD": ("AUDUSD=X","AUD/USD 澳幣美元"),
-    "查USDCHF": ("CHFUSD=X","USD/CHF 美元瑞郎"),
-    "查USDKRW": ("KRW=X",  "USD/KRW 美元韓元"),
-    "查USDHKD": ("HKD=X",  "USD/HKD 美元港幣"),
+    # 🇹🇼 台灣關鍵匯率（v10.9.33 新增獨立區）— 真正影響台股、外資、資金流
+    "查USDTWD": ("TWD=X",    "🇹🇼 USD/TWD 美元台幣"),
+    "查JPYTWD": ("JPYTWD=X", "🇯🇵 JPY/TWD 日圓台幣"),
+    "查EURTWD": ("EURTWD=X", "🇪🇺 EUR/TWD 歐元台幣"),
+    "查GBPTWD": ("GBPTWD=X", "🇬🇧 GBP/TWD 英鎊台幣"),
+    "查CNYTWD": ("CNYTWD=X", "🇨🇳 CNY/TWD 人民幣台幣"),
+    "查HKDTWD": ("HKDTWD=X", "🇭🇰 HKD/TWD 港幣台幣"),
+    "查KRWTWD": ("KRWTWD=X", "🇰🇷 KRW/TWD 韓元台幣"),
+    "查AUDTWD": ("AUDTWD=X", "🇦🇺 AUD/TWD 澳幣台幣"),
+    # 💵 美元核心
+    "查DXY":    ("DX-Y.NYB", "💵 DXY 美元指數"),
+    # 🌏 國際主要貨幣對（保留，代表全球資金方向）
+    "查USDJPY": ("JPY=X",    "USD/JPY 美元日圓"),
+    "查EURUSD": ("EURUSD=X", "EUR/USD 歐元美元"),
+    "查GBPUSD": ("GBPUSD=X", "GBP/USD 英鎊美元"),
+    "查USDCNY": ("CNY=X",    "USD/CNY 美元人民幣"),
+    "查USDCNH": ("CNH=X",    "USD/CNH 美元離岸人民幣"),
+    "查AUDUSD": ("AUDUSD=X", "AUD/USD 澳幣美元"),
+    "查USDCHF": ("CHFUSD=X", "USD/CHF 美元瑞郎"),
+    "查USDKRW": ("KRW=X",    "USD/KRW 美元韓元"),
+    "查USDHKD": ("HKD=X",    "USD/HKD 美元港幣"),
 }
 
 MARKET_SYMBOLS = {
@@ -3158,7 +3182,20 @@ def handle_message(event):
         sym, name = FOREX_SYMBOLS[text]
         data = get_yahoo_quote(sym)
         if data:
-            flex = make_quote_flex(name, data, "#B89BC4")
+            # v10.9.33：根據幣對類型用不同顏色
+            if "TWD" in sym and sym != "TWD=X":
+                # XXX/TWD 外幣對台幣 → 珊瑚粉
+                color = "#E89B82"
+            elif sym == "TWD=X":
+                # USD/TWD 用台灣最重要的珊瑚粉
+                color = "#E89B82"
+            elif "DX-Y" in sym:
+                # DXY 美元指數 → 奶油杏
+                color = "#E8B8A8"
+            else:
+                # 國際貨幣對 → 薰衣草粉
+                color = "#C9B0DB"
+            flex = make_quote_flex(name, data, color)
             if flex: reply_flex(event.reply_token, flex, name)
             else: reply_text(event.reply_token, f"⚠️ {name} 資料取得失敗")
         else:
@@ -3533,7 +3570,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.32 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.33 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
