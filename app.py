@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.28（使用者列表改成文字總覽 + 點名字操作）
+LINE Bot 模組 v10.9.31（色票更粉嫩：薰衣草粉/奶油杏粉/珊瑚粉）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -721,7 +721,7 @@ def make_user_list_carousel(page: int = 0) -> dict:
             else:
                 buttons.append(("🟢 解除封鎖", f"action=unblock&name={name}"))
 
-            bubbles.append(make_action_card(f"👤 {name}", subtitle, "#C4907A", buttons))
+            bubbles.append(make_action_card(f"👤 {name}", subtitle, "#E8B8A8", buttons))
 
         # 加「載入更多」卡片
         if has_more:
@@ -729,7 +729,7 @@ def make_user_list_carousel(page: int = 0) -> dict:
             more_card = {
                 "type":"bubble","size":"kilo",
                 "header":{
-                    "type":"box","layout":"vertical","backgroundColor":"#9B7BAB","paddingAll":"10px",
+                    "type":"box","layout":"vertical","backgroundColor":"#C9B0DB","paddingAll":"10px",
                     "contents":[
                         {"type":"text","text":"📋 還有更多用戶","size":"md","color":"#FFFFFF","weight":"bold"},
                         {"type":"text","text":f"剩餘 {remaining} 位","size":"xxs","color":"#FFFFFF"}
@@ -738,7 +738,7 @@ def make_user_list_carousel(page: int = 0) -> dict:
                 "body":{
                     "type":"box","layout":"vertical","spacing":"sm","paddingAll":"10px",
                     "contents":[
-                        {"type":"button","style":"primary","height":"sm","color":"#9B7BAB",
+                        {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
                          "action":{"type":"postback","label":f"➡️ 載入下 {min(PER_PAGE, remaining)} 位",
                                    "data":f"action=user_list_page&page={page+1}",
                                    "displayText":"載入下一頁"}}
@@ -873,7 +873,7 @@ def make_single_user_action_flex(reg_name: str) -> dict:
             buttons.append(("🔴 封鎖此用戶", f"action=block_start&name={name}"))
             buttons.append(("👑 設為管理者", f"action=add_admin&name={name}"))
 
-        return make_action_card(f"👤 {name}", subtitle + f"\n最後互動：{last}", "#C4907A", buttons)
+        return make_action_card(f"👤 {name}", subtitle + f"\n最後互動：{last}", "#E8B8A8", buttons)
     except Exception as e:
         dlog("UI", f"make_single_user_action_flex 失敗：{e}")
         return None
@@ -896,7 +896,7 @@ def make_admin_list_carousel() -> dict:
             added = row.get("新增時間","")
             subtitle = f"🟢 正常　{added[:10]}"
             buttons = [("➖ 移除管理者", f"action=remove_admin&name={name}")]
-            bubbles.append(make_action_card(f"🛡️ {name}", subtitle, "#C4907A", buttons))
+            bubbles.append(make_action_card(f"🛡️ {name}", subtitle, "#E8B8A8", buttons))
         return {"type":"carousel","contents":bubbles}
     except Exception as e:
         dlog("UI", f"make_admin_list_carousel 失敗：{e}")
@@ -920,7 +920,7 @@ def make_blocked_list_carousel() -> dict:
             when = row.get("封鎖時間","")
             subtitle = f"🔴 {reason[:15]}　{when[:10]}"
             buttons = [("🟢 解除封鎖", f"action=unblock&name={name}")]
-            bubbles.append(make_action_card(f"⛔ {name}", subtitle, "#C4907A", buttons))
+            bubbles.append(make_action_card(f"⛔ {name}", subtitle, "#E8B8A8", buttons))
         return {"type":"carousel","contents":bubbles}
     except Exception as e:
         dlog("UI", f"make_blocked_list_carousel 失敗：{e}")
@@ -956,7 +956,7 @@ def make_portfolio_action_carousel(user_id: str) -> dict:
                 name = sid
                 subtitle = "查詢失敗"
             buttons = [("🗑️ 刪除持股", f"action=del_portfolio&symbol={symbol}")]
-            bubbles.append(make_action_card(f"📊 {symbol}｜{name}", subtitle, "#C4907A", buttons))
+            bubbles.append(make_action_card(f"📊 {symbol}｜{name}", subtitle, "#E8B8A8", buttons))
         return {"type":"carousel","contents":bubbles}
     except Exception as e:
         dlog("UI", f"make_portfolio_action_carousel 失敗：{e}")
@@ -1362,28 +1362,88 @@ def make_menu_flex(title: str, subtitle: str, color: str, buttons: list) -> dict
 
 def make_stock_menu_flex() -> dict:
     return make_menu_flex(
-        "🔍 查股票", "請選擇查詢類別", "#C47055",
+        "🔍 查股票", "請選擇查詢類別", "#E89B82",
         [("🇹🇼 台股","查台股"), ("🇺🇸 美股","查美股"),
          ("📊 ETF","查ETF"), ("🏪 興/上櫃","查興上櫃"),
          ("⭐ 自選股","查自選股")]
     )
 
 def make_market_menu_flex() -> dict:
-    return make_menu_flex(
-        "🌐 全球大盤", "請選擇指數或商品", "#5B8DB8",
-        [("🇹🇼 台股加權","查台股加權"), ("🏪 櫃買指數","查櫃買指數"),
-         ("🇺🇸 道瓊","查道瓊"), ("📊 Nasdaq","查Nasdaq"),
-         ("📈 S&P500","查SP500"), ("🔵 SOX半導體","查SOX"),
-         ("😱 VIX恐慌","查VIX"), ("🥇 黃金","查黃金"),
-         ("🛢️ 原油","查原油"), ("📉 美債殖利率","查美債"),
-         ("⚡ 天然氣","查天然氣"), ("📦 期貨","查期貨")]
-    )
+    """全球大盤選單（v10.9.29 重做：分區式儀表板 + 移除模糊的「期貨」按鈕）"""
+    # 共用 header 樣式
+    def section_bubble(title, subtitle, color, buttons):
+        btn_contents = []
+        for label, text in buttons:
+            btn_contents.append({
+                "type":"button","style":"primary","height":"sm","color": color,
+                "action":{"type":"message","label":label,"text":text}
+            })
+        return {
+            "type":"bubble","size":"mega",
+            "header":{
+                "type":"box","layout":"vertical","backgroundColor":color,"paddingAll":"14px",
+                "contents":[
+                    {"type":"text","text":title,"size":"lg","color":"#FFFFFF","weight":"bold"},
+                    {"type":"text","text":subtitle,"size":"xs","color":"#FFFFFF"}
+                ]
+            },
+            "body":{
+                "type":"box","layout":"vertical","spacing":"sm","paddingAll":"12px",
+                "contents": btn_contents
+            }
+        }
+
+    bubbles = [
+        # 🌐 概覽
+        section_bubble("🌐 全球市場儀表板","點任一指數查詢即時行情","#5B8DB8",[
+            ("🇹🇼 台股加權","查台股加權"), ("🏪 櫃買指數","查櫃買指數"),
+            ("🇺🇸 道瓊","查道瓊"), ("📊 Nasdaq","查Nasdaq"),
+            ("📈 S&P 500","查SP500"),
+        ]),
+        # 🇪🇺 歐洲 + 亞洲（v10.9.29 新增）
+        section_bubble("🌏 全球指數","歐洲、亞洲主要市場","#B89BC4",[
+            ("🇩🇪 德國 DAX","查DAX"),
+            ("🇫🇷 法國 CAC40","查CAC40"),
+            ("🇬🇧 英國 FTSE","查FTSE"),
+            ("🇯🇵 日經 225","查日經"),
+            ("🇭🇰 恆生指數","查恆生"),
+            ("🇨🇳 上證指數","查上證"),
+            ("🇰🇷 KOSPI","查KOSPI"),
+            ("🇺🇸 Russell 2000","查Russell"),
+        ]),
+        # 🧠 科技與情緒
+        section_bubble("🧠 科技 / 風險指標","半導體、恐慌、市場情緒","#D9C5B3",[
+            ("🔵 SOX 半導體","查SOX"),
+            ("😱 VIX 恐慌指數","查VIX"),
+        ]),
+        # 🥇 貴金屬（v10.9.29 細分）
+        section_bubble("🥇 貴金屬","黃金現貨 / 期貨 / 台灣金價","#E8C99B",[
+            ("🥇 現貨黃金 XAU/USD","查現貨黃金"),
+            ("🥇 黃金期貨 COMEX","查黃金期貨"),
+            ("🥇 台灣金價（每兩）","查台灣金價"),
+            ("🥈 白銀","查白銀"),
+        ]),
+        # 🛢️ 能源（v10.9.29 細分）
+        section_bubble("🛢️ 能源市場","WTI、Brent、天然氣","#D9B8A8",[
+            ("🛢️ WTI 原油","查WTI"),
+            ("🛢️ Brent 原油","查Brent"),
+            ("⚡ 天然氣","查天然氣"),
+        ]),
+        # 📉 債券
+        section_bubble("📉 美債殖利率","2 年 / 10 年 / 30 年","#5B8B6B",[
+            ("📉 10 年期殖利率","查美債"),
+            ("📊 2 年期殖利率","查美債2Y"),
+            ("📈 30 年期殖利率","查美債30Y"),
+        ]),
+    ]
+    return {"type":"carousel","contents":bubbles}
 
 def make_forex_menu_flex() -> dict:
+    """全球外匯（v10.9.29 擴充：USD/TWD 第一、DXY 第二、新增 KRW/HKD/CNH）"""
     return {
         "type":"bubble","size":"mega",
         "header":{
-            "type":"box","layout":"vertical","backgroundColor":"#8B6B9B","paddingAll":"14px",
+            "type":"box","layout":"vertical","backgroundColor":"#B89BC4","paddingAll":"14px",
             "contents":[
                 {"type":"text","text":"💹 全球外匯與資金市場","size":"lg","color":"#FFFFFF","weight":"bold"},
                 {"type":"text","text":"匯率・市場分析・資金流向","size":"xs","color":"#FFFFFF"}
@@ -1392,40 +1452,52 @@ def make_forex_menu_flex() -> dict:
         "body":{
             "type":"box","layout":"vertical","spacing":"sm","paddingAll":"12px",
             "contents":[
-                {"type":"text","text":"主要匯率","size":"sm","weight":"bold","color":"#8B6B9B"},
+                # 🇹🇼 台股最重要 → 第一順位
+                {"type":"text","text":"🇹🇼 台股關鍵匯率","size":"sm","weight":"bold","color":"#B89BC4"},
+                {"type":"button","style":"primary","height":"sm","color":"#E89B82",
+                 "action":{"type":"message","label":"🇹🇼 USD/TWD 美元台幣","text":"查USDTWD"}},
+                # 💵 美元指數 → 第二順位（全球市場核心）
+                {"type":"text","text":"💵 美元指數（全球核心）","size":"sm","weight":"bold","color":"#B89BC4"},
+                {"type":"button","style":"primary","height":"sm","color":"#D9C5B3",
+                 "action":{"type":"message","label":"💵 DXY 美元指數","text":"查DXY"}},
+                {"type":"separator","color":"#E8D4F0"},
+                # 🌏 五大幣
+                {"type":"text","text":"🌏 五大主要貨幣","size":"sm","weight":"bold","color":"#B89BC4"},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"USD/TWD","text":"查USDTWD"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"DXY","text":"查DXY"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"💴 USD/JPY","text":"查USDJPY"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"💶 EUR/USD","text":"查EURUSD"}},
                 ]},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"USD/JPY","text":"查USDJPY"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"EUR/USD","text":"查EURUSD"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"💷 GBP/USD","text":"查GBPUSD"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"🇨🇳 USD/CNY","text":"查USDCNY"}},
                 ]},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"GBP/USD","text":"查GBPUSD"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"USD/CNY","text":"查USDCNY"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"🇨🇳 USD/CNH 離岸","text":"查USDCNH"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"🇰🇷 USD/KRW","text":"查USDKRW"}},
                 ]},
+                # 其他
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"AUD/USD","text":"查AUDUSD"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#8B6B9B",
-                     "action":{"type":"message","label":"USD/CHF","text":"查USDCHF"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"🇦🇺 AUD/USD","text":"查AUDUSD"}},
+                    {"type":"button","style":"primary","height":"sm","color":"#B89BC4",
+                     "action":{"type":"message","label":"🇭🇰 USD/HKD","text":"查USDHKD"}},
                 ]},
                 {"type":"separator","color":"#E8D4F0"},
-                {"type":"text","text":"市場分析","size":"sm","weight":"bold","color":"#8B6B9B"},
+                # 市場分析
+                {"type":"text","text":"📊 市場分析","size":"sm","weight":"bold","color":"#B89BC4"},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
-                    {"type":"button","style":"primary","height":"sm","color":"#9B7BAB",
+                    {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
                      "action":{"type":"message","label":"外匯市場分析","text":"外匯市場分析"}},
-                    {"type":"button","style":"primary","height":"sm","color":"#9B7BAB",
+                    {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
                      "action":{"type":"message","label":"市場連動分析","text":"市場連動分析"}},
                 ]},
-                {"type":"button","style":"primary","height":"sm","color":"#9B7BAB",
+                {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
                  "action":{"type":"message","label":"全球資金流向","text":"全球資金流向"}},
             ]
         }
@@ -1433,7 +1505,7 @@ def make_forex_menu_flex() -> dict:
 
 def make_ai_menu_flex() -> dict:
     return make_menu_flex(
-        "🤖 AI 分析", "智慧選股・多維度評分", "#C47055",
+        "🤖 AI 分析", "智慧選股・多維度評分", "#E89B82",
         [("⭐ 推薦股","推薦股"), ("📈 趨勢股","趨勢股"),
          ("🌱 成長股","成長股"), ("💰 存股","存股"),
          ("🌊 波段股","波段股"), ("🤖 AI概念股","AI概念股")]
@@ -1441,7 +1513,7 @@ def make_ai_menu_flex() -> dict:
 
 def make_news_menu_flex() -> dict:
     return make_menu_flex(
-        "📰 財經新聞", "個股・台股・美股・國際", "#7A6B5A",
+        "📰 財經新聞", "個股・台股・美股・國際", "#D9C5B3",
         [("📊 個股新聞","個股新聞"), ("🇹🇼 台股新聞","台股新聞"),
          ("🇺🇸 美股新聞","美股新聞"), ("🌐 國際新聞","國際新聞"),
          ("🌏 地緣政治","地緣政治新聞")]
@@ -1459,7 +1531,7 @@ def make_portfolio_menu_flex() -> dict:
 def make_admin_menu_flex(user_id: str) -> dict:
     """打字「管理後台」時用的 Flex（粉白少女系）"""
     owner = is_owner(user_id)
-    color = "#C4907A"
+    color = "#E8B8A8"
     buttons = [
         ("👥 使用者管理","使用者管理選單"),
         ("⚙️ 系統管理","系統管理選單"),
@@ -1491,11 +1563,11 @@ def make_user_mgmt_flex(owner: bool) -> dict:
         buttons += [
             ("🛡️ 管理者名單","管理者名單"),  # 點進去可移除管理者
         ]
-    return make_menu_flex("👥 使用者管理","點清單即可操作 ✨","#C4907A", buttons)
+    return make_menu_flex("👥 使用者管理","點清單即可操作 ✨","#E8B8A8", buttons)
 
 def make_system_mgmt_flex() -> dict:
     return make_menu_flex(
-        "⚙️ 系統管理","點按鈕即可操作 ✨","#C4907A",
+        "⚙️ 系統管理","點按鈕即可操作 ✨","#E8B8A8",
         [("🔄 重新載入名稱快取","重載名稱"),    # 最常用，放第一個
          ("📊 查看快取狀態","快取狀態"),
          ("🔍 查詢個別代號","查快取說明"),
@@ -1507,30 +1579,121 @@ def make_system_mgmt_flex() -> dict:
 #  外匯/商品資料
 # ══════════════════════════════════════════
 FOREX_SYMBOLS = {
+    # 🇹🇼 台股最重要匯率 - 放最前面
     "查USDTWD": ("TWD=X",  "USD/TWD 美元台幣"),
+    # 💵 美元指數 - 全球市場核心
     "查DXY":    ("DX-Y.NYB","DXY 美元指數"),
+    # 🌏 五大幣
     "查USDJPY": ("JPY=X",  "USD/JPY 美元日圓"),
     "查EURUSD": ("EURUSD=X","EUR/USD 歐元美元"),
     "查GBPUSD": ("GBPUSD=X","GBP/USD 英鎊美元"),
     "查USDCNY": ("CNY=X",  "USD/CNY 美元人民幣"),
+    "查USDCNH": ("CNH=X",  "USD/CNH 美元離岸人民幣"),
+    # 其他常用
     "查AUDUSD": ("AUDUSD=X","AUD/USD 澳幣美元"),
     "查USDCHF": ("CHFUSD=X","USD/CHF 美元瑞郎"),
+    "查USDKRW": ("KRW=X",  "USD/KRW 美元韓元"),
+    "查USDHKD": ("HKD=X",  "USD/HKD 美元港幣"),
 }
 
 MARKET_SYMBOLS = {
+    # 🇹🇼 台股
     "查台股加權": ("^TWII",  "台股加權指數"),
     "查櫃買指數": ("^TWOII", "台灣櫃買指數"),
+    # 🇺🇸 美股
     "查道瓊":    ("^DJI",   "道瓊工業指數"),
     "查Nasdaq":  ("^IXIC",  "那斯達克指數"),
     "查SP500":   ("^GSPC",  "S&P 500"),
+    "查Russell": ("^RUT",   "Russell 2000"),
     "查SOX":     ("^SOX",   "費城半導體 SOX"),
     "查VIX":     ("^VIX",   "VIX 恐慌指數"),
-    "查黃金":    ("GC=F",   "黃金期貨"),
-    "查原油":    ("CL=F",   "WTI 原油期貨"),
+    # 🇪🇺 歐洲指數（v10.9.29 新增）
+    "查DAX":     ("^GDAXI", "🇩🇪 德國 DAX"),
+    "查CAC40":   ("^FCHI",  "🇫🇷 法國 CAC 40"),
+    "查FTSE":    ("^FTSE",  "🇬🇧 英國 FTSE 100"),
+    "查STOXX":   ("^STOXX50E", "🇪🇺 歐洲 STOXX 50"),
+    # 🌏 亞洲指數（v10.9.29 新增）
+    "查日經":    ("^N225",  "🇯🇵 日經 225"),
+    "查恆生":    ("^HSI",   "🇭🇰 恆生指數"),
+    "查上證":    ("000001.SS","🇨🇳 上證指數"),
+    "查KOSPI":   ("^KS11",  "🇰🇷 韓國 KOSPI"),
+    # 🥇 貴金屬（v10.9.29 細分）
+    "查現貨黃金": ("XAUUSD=X", "🥇 現貨黃金 XAU/USD"),
+    "查黃金期貨": ("GC=F",   "🥇 黃金期貨 COMEX"),
+    "查黃金":     ("GC=F",   "🥇 黃金期貨 COMEX"),   # 別名相容
+    "查白銀":     ("SI=F",   "🥈 白銀期貨"),
+    "查台灣金價": ("__TWGOLD__", "🥇 台灣金價（每兩）"),  # 特殊處理
+    # 🛢️ 能源（v10.9.29 細分）
+    "查WTI":     ("CL=F",   "🛢️ WTI 原油（美國）"),
+    "查Brent":   ("BZ=F",   "🛢️ Brent 原油（北海）"),
+    "查原油":    ("CL=F",   "🛢️ WTI 原油（美國）"),   # 別名相容
+    "查天然氣":  ("NG=F",   "⚡ 天然氣期貨"),
+    # 📉 債券
     "查美債":    ("^TNX",   "美國10年期公債殖利率"),
-    "查天然氣":  ("NG=F",   "天然氣期貨"),
-    "查期貨":    ("ES=F",   "S&P500 期貨"),
+    "查美債2Y":  ("^IRX",   "美國2年期公債殖利率"),
+    "查美債30Y": ("^TYX",   "美國30年期公債殖利率"),
 }
+
+
+def get_taiwan_gold_price() -> dict:
+    """抓台灣黃金價格（每兩 = 37.5 公克），用台銀牌價。失敗時用 XAU/USD * 匯率估算"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    # 嘗試 1：抓台銀牌價
+    try:
+        url = "https://rate.bot.com.tw/gold/passbook?Lang=zh-TW"
+        r = requests.get(url, headers=headers, timeout=8, verify=False)
+        if r.status_code == 200:
+            # 解析 HTML 找牌價
+            import re as _re
+            # 簡單抓「本行賣出 XXXX」格式
+            matches = _re.findall(r'本行賣出[^\d]*([\d,]+\.?\d*)', r.text)
+            if matches:
+                # 台銀是「每公克」價，要 × 37.5 換成「每兩」
+                gram_price = float(matches[0].replace(",",""))
+                price_per_tael = gram_price * 37.5
+                return {
+                    "price": price_per_tael,
+                    "gram_price": gram_price,
+                    "source": "台銀牌價",
+                    "currency": "TWD"
+                }
+    except Exception as e:
+        dlog("GOLD", f"台銀牌價失敗：{e}")
+
+    # 嘗試 2：用 XAU/USD * 美元台幣匯率估算
+    try:
+        xau = get_yahoo_quote("XAUUSD=X")
+        usdtwd = get_yahoo_quote("TWD=X")
+        if xau and usdtwd:
+            # XAU/USD 是每盎司美元，1盎司 ≈ 31.1035 公克，1台兩 = 37.5 公克
+            usd_per_gram = xau["price"] / 31.1035
+            twd_per_gram = usd_per_gram * usdtwd["price"]
+            twd_per_tael = twd_per_gram * 37.5
+            return {
+                "price": twd_per_tael,
+                "gram_price": twd_per_gram,
+                "source": "XAU/USD × 匯率",
+                "currency": "TWD",
+                "est": True
+            }
+    except Exception as e:
+        dlog("GOLD", f"估算失敗：{e}")
+
+    return {}
+
+
+def get_market_strength_label(pct: float) -> tuple:
+    """根據漲跌幅判斷強弱方向，回傳 (icon, label, color)"""
+    if pct >= 1.5:
+        return ("📈", "強勢", "#E89B82")
+    elif pct >= 0.3:
+        return ("↗️", "偏多", "#E8B8A8")
+    elif pct >= -0.3:
+        return ("➡️", "持平", "#888888")
+    elif pct >= -1.5:
+        return ("↘️", "偏空", "#7AABBE")
+    else:
+        return ("📉", "弱勢", "#5B8DB8")
 
 def get_yahoo_quote(symbol: str) -> dict:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -1555,9 +1718,11 @@ def make_quote_flex(name: str, data: dict, color: str = "#5B8DB8") -> dict:
     chg   = data.get("chg",0)
     pct   = data.get("pct",0)
     is_up = chg >= 0
-    c     = "#C47055" if is_up else "#5B8DB8"
+    c     = "#D97A5C" if is_up else "#7AABBE"
     arrow = "▲" if is_up else "▼"
     sign  = "+" if is_up else ""
+    # v10.9.29：加強弱方向標籤
+    str_icon, str_label, str_color = get_market_strength_label(pct)
     return {
         "type":"bubble","size":"kilo",
         "header":{
@@ -1571,8 +1736,43 @@ def make_quote_flex(name: str, data: dict, color: str = "#5B8DB8") -> dict:
                  "size":"xxl","weight":"bold","color":c},
                 {"type":"text","text":f"{arrow} {abs(chg):.4f}　{sign}{pct:.2f}%",
                  "size":"sm","color":c},
-                {"type":"text","text":now_taipei().strftime("%m/%d %H:%M"),
-                 "size":"xxs","color":"#AAAAAA"}
+                {"type":"box","layout":"horizontal","spacing":"xs","contents":[
+                    {"type":"text","text":f"{str_icon} {str_label}","size":"xs","color":str_color,"weight":"bold","flex":0},
+                    {"type":"text","text":now_taipei().strftime("%m/%d %H:%M"),
+                     "size":"xxs","color":"#AAAAAA","align":"end","flex":1,"gravity":"bottom"}
+                ]}
+            ]
+        }
+    }
+
+
+def make_taiwan_gold_flex(data: dict) -> dict:
+    """台灣金價專用 Flex"""
+    if not data: return None
+    price = data.get("price", 0)
+    gram_price = data.get("gram_price", 0)
+    source = data.get("source", "")
+    est = data.get("est", False)
+    return {
+        "type":"bubble","size":"kilo",
+        "header":{
+            "type":"box","layout":"vertical","backgroundColor":"#E8C99B","paddingAll":"10px",
+            "contents":[{"type":"text","text":"🥇 台灣金價","size":"sm","color":"#FFFFFF","weight":"bold"}]
+        },
+        "body":{
+            "type":"box","layout":"vertical","paddingAll":"12px","spacing":"sm",
+            "contents":[
+                {"type":"text","text":"每兩（37.5 克）","size":"xxs","color":"#9B6B5A"},
+                {"type":"text","text":f"NT$ {price:,.0f}","size":"xxl","weight":"bold","color":"#E89B82"},
+                {"type":"separator","color":"#E8C4B4"},
+                {"type":"text","text":"每公克","size":"xxs","color":"#9B6B5A"},
+                {"type":"text","text":f"NT$ {gram_price:,.2f}","size":"md","color":"#E89B82","weight":"bold"},
+                {"type":"separator","color":"#E8C4B4"},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":f"💡 {source}{'（估算）' if est else ''}","size":"xxs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":now_taipei().strftime("%m/%d %H:%M"),
+                     "size":"xxs","color":"#AAAAAA","align":"end","flex":1}
+                ]}
             ]
         }
     }
@@ -2110,14 +2310,14 @@ def get_market_summary()->str:
 #  推薦股 Flex
 # ══════════════════════════════════════════
 def make_rec_card(rank:int, s:dict)->dict:
-    is_up=s["pct"]>=0; color="#C47055" if is_up else "#5B8DB8"
+    is_up=s["pct"]>=0; color="#D97A5C" if is_up else "#7AABBE"
     arrow="▲" if is_up else "▼"; pct_str=f"{arrow} {abs(s['pct']):.2f}%"
     filled=s["score"]//10; bar="█"*filled+"░"*(10-filled)
     tech_sig="　".join(s.get("tech_signals",[])[:2]) or "--"
     chip_sig="　".join(s.get("chip_signals",[])[:2]) or "--"
     return {
         "type":"bubble","size":"mega",
-        "header":{"type":"box","layout":"horizontal","backgroundColor":"#C47055","paddingAll":"12px",
+        "header":{"type":"box","layout":"horizontal","backgroundColor":"#E89B82","paddingAll":"12px",
             "contents":[
                 {"type":"box","layout":"vertical","flex":0,
                  "contents":[{"type":"text","text":f"#{rank}","size":"xl","color":"#FFFFFF","weight":"bold"}]},
@@ -2149,7 +2349,7 @@ def make_rec_card(rank:int, s:dict)->dict:
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":"評分","size":"xxs","color":"#9B6B5A","flex":1},
-                    {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#7A3828","weight":"bold","flex":5}
+                    {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#E89B82","weight":"bold","flex":5}
                 ]}
             ]}
     }
@@ -2158,7 +2358,7 @@ def make_rec_flex(scored:list, mkt:dict, source_note:str)->dict:
     now_str=now_taipei().strftime("%m/%d %H:%M")
     overview={
         "type":"bubble","size":"mega",
-        "header":{"type":"box","layout":"vertical","backgroundColor":"#C47055","paddingAll":"14px",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#E89B82","paddingAll":"14px",
             "contents":[
                 {"type":"text","text":"⭐ 慧股推薦榜","size":"xl","color":"#FFFFFF","weight":"bold"},
                 {"type":"text","text":f"🇹🇼 台股　{now_str}","size":"xs","color":"#F0D0C0"}
@@ -2169,26 +2369,26 @@ def make_rec_flex(scored:list, mkt:dict, source_note:str)->dict:
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"text","text":source_note,"size":"xs","color":"#9B6B5A","wrap":True},
                 {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":"📊 評分維度","size":"sm","color":"#7A3828","weight":"bold"},
+                {"type":"text","text":"📊 評分維度","size":"sm","color":"#A05A48","weight":"bold"},
                 {"type":"box","layout":"vertical","spacing":"xs","contents":[
                     {"type":"box","layout":"horizontal","contents":[
                         {"type":"text","text":"技術面","size":"xs","color":"#9B6B5A","flex":2},
                         {"type":"text","text":"均線 RSI 漲幅","size":"xs","color":"#5B4040","flex":3},
-                        {"type":"text","text":"40分","size":"xs","color":"#C47055","flex":1,"align":"end"}
+                        {"type":"text","text":"40分","size":"xs","color":"#E89B82","flex":1,"align":"end"}
                     ]},
                     {"type":"box","layout":"horizontal","contents":[
                         {"type":"text","text":"籌碼面","size":"xs","color":"#9B6B5A","flex":2},
                         {"type":"text","text":"外資 投信 同買","size":"xs","color":"#5B4040","flex":3},
-                        {"type":"text","text":"30分","size":"xs","color":"#C47055","flex":1,"align":"end"}
+                        {"type":"text","text":"30分","size":"xs","color":"#E89B82","flex":1,"align":"end"}
                     ]},
                     {"type":"box","layout":"horizontal","contents":[
                         {"type":"text","text":"新聞情緒","size":"xs","color":"#9B6B5A","flex":2},
                         {"type":"text","text":"白名單財經媒體","size":"xs","color":"#5B4040","flex":3},
-                        {"type":"text","text":"30分","size":"xs","color":"#C47055","flex":1,"align":"end"}
+                        {"type":"text","text":"30分","size":"xs","color":"#E89B82","flex":1,"align":"end"}
                     ]},
                 ]},
                 {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#C4907A","wrap":True}
+                {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#E8B8A8","wrap":True}
             ]}
     }
     bubbles=[overview]+[make_rec_card(i+1,s) for i,s in enumerate(scored[:5])]
@@ -2259,7 +2459,7 @@ def get_portfolio_summary(user_id:str)->str:
 # ══════════════════════════════════════════
 def make_ma_row(label,value):
     vs=f"{value:.0f}" if value else "N/A"
-    color="#7A3828" if value else "#C4907A"
+    color="#E89B82" if value else "#E8B8A8"
     return {"type":"box","layout":"horizontal","contents":[
         {"type":"text","text":label,"size":"xs","color":"#9B6B5A","flex":4},
         {"type":"text","text":vs,"size":"xs","color":color,"flex":2,"weight":"bold","align":"end"},
@@ -2268,23 +2468,23 @@ def make_ma_row(label,value):
 def make_stock_flex(symbol,name,market_type,status,source,
                     price,chg,pct,open_p,high,low,vol,
                     kline,news_list,query_time):
-    is_up=chg>=0; color="#C47055" if is_up else "#5B8DB8"
+    is_up=chg>=0; color="#D97A5C" if is_up else "#7AABBE"
     arrow="▲" if is_up else "▼"; sign="+" if is_up else ""
     spark=kline.get("spark","▄▄▄▄▄▄▄▄▄▄"); trend=kline.get("trend","--")
     ma5=kline.get("ma5"); ma20=kline.get("ma20"); ma60=kline.get("ma60")
     ma120=kline.get("ma120"); ma240=kline.get("ma240")
     rsi=kline.get("rsi",0); rl=kline.get("rsi_label","--")
-    rc="#C47055" if rsi>70 else ("#5B8DB8" if rsi<30 else "#8B6B5A")
+    rc="#E89B82" if rsi>70 else ("#5B8DB8" if rsi<30 else "#8B6B5A")
     dn=f"{symbol} {name}" if name and name!=symbol else symbol
     nc=[]
     for t,u in news_list[:4]:
         if u: nc.append({"type":"button","style":"link","height":"sm",
             "action":{"type":"uri","label":f"📰 {t}","uri":u}})
         else: nc.append({"type":"text","text":f"📰 {t}","size":"xs","color":"#B06050","wrap":True})
-    if not nc: nc=[{"type":"text","text":"暫無相關新聞","size":"xs","color":"#C4907A"}]
+    if not nc: nc=[{"type":"text","text":"暫無相關新聞","size":"xs","color":"#E8B8A8"}]
     return {
         "type":"bubble","size":"mega",
-        "header":{"type":"box","layout":"vertical","backgroundColor":"#C47055","paddingAll":"16px","contents":[
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#E89B82","paddingAll":"16px","contents":[
             {"type":"box","layout":"horizontal","contents":[
                 {"type":"text","text":"✨ 慧股拾光 Lumistock","size":"xxs","color":"#F0D0C0","flex":1},
                 {"type":"text","text":market_type,"size":"xxs","color":"#F0D0C0","align":"end"}
@@ -2305,7 +2505,7 @@ def make_stock_flex(symbol,name,market_type,status,source,
                     ]},
                     {"type":"box","layout":"vertical","flex":1,"contents":[
                         {"type":"text","text":"最高","size":"xxs","color":"#9B6B5A"},
-                        {"type":"text","text":str(high),"size":"sm","color":"#C47055","weight":"bold"}
+                        {"type":"text","text":str(high),"size":"sm","color":"#E89B82","weight":"bold"}
                     ]},
                     {"type":"box","layout":"vertical","flex":1,"contents":[
                         {"type":"text","text":"最低","size":"xxs","color":"#9B6B5A"},
@@ -2317,9 +2517,9 @@ def make_stock_flex(symbol,name,market_type,status,source,
                     ]}
                 ]},
                 {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":"📊 技術分析","size":"sm","weight":"bold","color":"#7A3828"},
+                {"type":"text","text":"📊 技術分析","size":"sm","weight":"bold","color":"#A05A48"},
                 {"type":"text","text":spark,"size":"xl","color":color},
-                {"type":"text","text":f"趨勢　{trend}","size":"sm","color":"#7A3828"},
+                {"type":"text","text":f"趨勢　{trend}","size":"sm","color":"#A05A48"},
                 {"type":"box","layout":"vertical","spacing":"xs","contents":[
                     make_ma_row("MA5　　短線",ma5), make_ma_row("MA20　　月線",ma20),
                     make_ma_row("MA60　　季線",ma60), make_ma_row("MA120　半年線",ma120),
@@ -2331,11 +2531,11 @@ def make_stock_flex(symbol,name,market_type,status,source,
                     {"type":"text","text":rl,"size":"xs","color":rc,"flex":3}
                 ]},
                 {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":"📰 相關新聞","size":"sm","weight":"bold","color":"#7A3828"},
+                {"type":"text","text":"📰 相關新聞","size":"sm","weight":"bold","color":"#A05A48"},
             ]+nc+[
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"box","layout":"horizontal","contents":[
-                    {"type":"text","text":f"🕐 {query_time}　{status}","size":"xxs","color":"#C4907A","flex":1},
+                    {"type":"text","text":f"🕐 {query_time}　{status}","size":"xxs","color":"#E8B8A8","flex":1},
                     {"type":"text","text":source,"size":"xxs","color":"#D4B0A0","align":"end","flex":1}
                 ]}
             ]}
@@ -2624,7 +2824,8 @@ def handle_message(event):
         dlog("HANDLER", "→ 全球大盤選單")
         reply_flex_with_qr(event.reply_token, make_market_menu_flex(), "全球大盤",
             [("台股加權","查台股加權"),("Nasdaq","查Nasdaq"),("S&P500","查SP500"),
-             ("SOX","查SOX"),("VIX","查VIX"),("黃金","查黃金"),("原油","查原油")])
+             ("DAX","查DAX"),("日經","查日經"),("恆生","查恆生"),
+             ("WTI原油","查WTI"),("台灣金價","查台灣金價"),("VIX","查VIX")])
         return
 
     if text=="外匯資金":
@@ -2696,9 +2897,34 @@ def handle_message(event):
     # ══ 市場指數查詢 ══
     if text in MARKET_SYMBOLS:
         sym, name = MARKET_SYMBOLS[text]
+        # v10.9.29：台灣金價特殊處理
+        if sym == "__TWGOLD__":
+            dlog("HANDLER", "→ 查台灣金價")
+            gold_data = get_taiwan_gold_price()
+            if gold_data:
+                flex = make_taiwan_gold_flex(gold_data)
+                if flex:
+                    reply_flex(event.reply_token, flex, name)
+                    return
+            reply_text(event.reply_token, "⚠️ 台灣金價取得失敗\n請稍後再試")
+            return
+        # 一般指數
         data = get_yahoo_quote(sym)
         if data:
-            flex = make_quote_flex(name, data, "#5B8DB8")
+            # v10.9.29：根據商品類型用不同顏色
+            if "黃金" in name or "白銀" in name:
+                color = "#E8C99B"
+            elif "原油" in name or "天然氣" in name:
+                color = "#D9B8A8"
+            elif "VIX" in name:
+                color = "#D49B9B"
+            elif "DAX" in name or "CAC" in name or "FTSE" in name or "STOXX" in name:
+                color = "#B89BC4"
+            elif "日經" in name or "恆生" in name or "上證" in name or "KOSPI" in name:
+                color = "#E89B82"
+            else:
+                color = "#5B8DB8"
+            flex = make_quote_flex(name, data, color)
             if flex: reply_flex(event.reply_token, flex, name)
             else: reply_text(event.reply_token, f"⚠️ {name} 資料取得失敗")
         else:
@@ -2710,7 +2936,7 @@ def handle_message(event):
         sym, name = FOREX_SYMBOLS[text]
         data = get_yahoo_quote(sym)
         if data:
-            flex = make_quote_flex(name, data, "#8B6B9B")
+            flex = make_quote_flex(name, data, "#B89BC4")
             if flex: reply_flex(event.reply_token, flex, name)
             else: reply_text(event.reply_token, f"⚠️ {name} 資料取得失敗")
         else:
@@ -3085,7 +3311,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.28 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.31 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
