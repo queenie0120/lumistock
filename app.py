@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.23（管理 Flex 卡片改用粉白少女系 #C4907A）
+LINE Bot 模組 v10.9.25（互動清單按鈕：減少打字、Phase 1+2）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -21,9 +21,9 @@ from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage, PushMessageRequest,
     FlexMessage, FlexContainer, QuickReply, QuickReplyItem,
-    MessageAction
+    MessageAction, PostbackAction
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
 import requests
 import json, os, re, threading, time
 from datetime import datetime, timezone, timedelta
@@ -518,6 +518,199 @@ def make_quick_reply(items: list) -> QuickReply:
     ])
 
 
+# ══════════════════════════════════════════════════════════
+#  互動清單模組 v10.9.25（Phase 1 + Phase 2 - 點按鈕代替打字）
+#  ⭐ 新增功能：清單按鈕、Postback action、等待狀態管理
+# ══════════════════════════════════════════════════════════
+
+# 等待輸入封鎖原因的使用者狀態（key=user_id, value=要被封鎖的對象姓名）
+WAITING_BLOCK_REASON = {}
+
+
+def make_postback_quick_reply(items: list) -> QuickReply:
+    """items = [(label, data), ...]  data 格式：action=xxx&param=yyy"""
+    return QuickReply(items=[
+        QuickReplyItem(action=PostbackAction(label=label, data=data, display_text=label))
+        for label, data in items
+    ])
+
+
+def make_action_card(title: str, subtitle: str, color: str, action_buttons: list) -> dict:
+    """
+    產生一張帶 Postback 按鈕的卡片
+    action_buttons = [(label, postback_data), ...]
+    """
+    if not subtitle or not str(subtitle).strip():
+        subtitle = " "
+    btn_contents = []
+    for label, data in action_buttons:
+        btn_contents.append({
+            "type":"button","style":"primary","height":"sm","color": color,
+            "action":{"type":"postback","label":label,"data":data,"displayText":label}
+        })
+    return {
+        "type":"bubble","size":"kilo",
+        "header":{
+            "type":"box","layout":"vertical","backgroundColor":color,"paddingAll":"10px",
+            "contents":[
+                {"type":"text","text":title,"size":"md","color":"#FFFFFF","weight":"bold","wrap":True},
+                {"type":"text","text":subtitle,"size":"xxs","color":"#FFFFFF","wrap":True}
+            ]
+        },
+        "body":{
+            "type":"box","layout":"vertical","spacing":"xs","paddingAll":"10px",
+            "contents": btn_contents
+        }
+    }
+
+
+def make_user_list_carousel() -> dict:
+    """使用者列表（每個用戶一張卡片，有「查詳情」「封鎖」按鈕）"""
+    try:
+        sheet = get_sheet("使用者名單")
+        if not sheet:
+            return None
+        records = sheet.get_all_records()
+        if not records:
+            return None
+        bubbles = []
+        for row in records[:10]:  # LINE carousel 最多 10 張
+            name = row.get("註冊姓名","未註冊")
+            nick = row.get("LINE暱稱","")
+            status = row.get("狀態","")
+            uid = str(row.get("user_id",""))
+            icon = "🔴" if status=="封鎖" else ("⚪" if status=="未註冊" else "🟢")
+            subtitle = f"{icon} {status}　{nick[:10]}"
+
+            buttons = [("🔍 查詳情", f"action=user_detail&name={name}")]
+            if status != "封鎖":
+                buttons.append(("🔴 封鎖", f"action=block_start&name={name}"))
+                buttons.append(("👑 設為管理者", f"action=add_admin&name={name}"))
+            else:
+                buttons.append(("🟢 解除封鎖", f"action=unblock&name={name}"))
+
+            bubbles.append(make_action_card(f"👤 {name}", subtitle, "#C4907A", buttons))
+        return {"type":"carousel","contents":bubbles}
+    except Exception as e:
+        dlog("UI", f"make_user_list_carousel 失敗：{e}")
+        return None
+
+
+def make_admin_list_carousel() -> dict:
+    """管理者名單（每位旁邊「移除」按鈕）"""
+    try:
+        sheet = get_sheet("管理者名單")
+        if not sheet:
+            return None
+        records = sheet.get_all_records()
+        active = [r for r in records if str(r.get("狀態")) == "正常"]
+        if not active:
+            return None
+        bubbles = []
+        for row in active[:10]:
+            name = row.get("姓名","")
+            uid = str(row.get("user_id",""))
+            added = row.get("新增時間","")
+            subtitle = f"🟢 正常　{added[:10]}"
+            buttons = [("➖ 移除管理者", f"action=remove_admin&name={name}")]
+            bubbles.append(make_action_card(f"🛡️ {name}", subtitle, "#C4907A", buttons))
+        return {"type":"carousel","contents":bubbles}
+    except Exception as e:
+        dlog("UI", f"make_admin_list_carousel 失敗：{e}")
+        return None
+
+
+def make_blocked_list_carousel() -> dict:
+    """黑名單清單（每位旁邊「解除封鎖」按鈕）"""
+    try:
+        sheet = get_sheet("黑名單")
+        if not sheet:
+            return None
+        records = sheet.get_all_records()
+        active = [r for r in records if str(r.get("狀態")) == "封鎖"]
+        if not active:
+            return None
+        bubbles = []
+        for row in active[:10]:
+            name = row.get("註冊姓名","")
+            reason = row.get("封鎖原因","")
+            when = row.get("封鎖時間","")
+            subtitle = f"🔴 {reason[:15]}　{when[:10]}"
+            buttons = [("🟢 解除封鎖", f"action=unblock&name={name}")]
+            bubbles.append(make_action_card(f"⛔ {name}", subtitle, "#C4907A", buttons))
+        return {"type":"carousel","contents":bubbles}
+    except Exception as e:
+        dlog("UI", f"make_blocked_list_carousel 失敗：{e}")
+        return None
+
+
+def make_portfolio_action_carousel(user_id: str) -> dict:
+    """持股清單帶「刪除」按鈕"""
+    try:
+        portfolio = load_portfolio()
+        up = {k:v for k,v in portfolio.items() if v.get("user_id")==user_id}
+        if not up:
+            return None
+        bubbles = []
+        for symbol, data in list(up.items())[:10]:
+            sid = symbol.replace(".TW","")
+            try:
+                if sid.isdigit():
+                    tw = get_tw_stock(sid)
+                    price = tw["price"] if tw else 0
+                    name = tw["name"] if tw else sid
+                else:
+                    us = get_us_stock(symbol)
+                    price = us["price"] if us else 0
+                    name = us["name"] if us else symbol
+                shares = data["shares"]
+                bp = data["buy_price"]
+                profit = (price - bp) * shares
+                pct = (price - bp) / bp * 100 if bp else 0
+                icon = "🟢" if profit >= 0 else "🔴"
+                subtitle = f"{icon} {shares}股　損益 {profit:+,.0f}（{pct:+.1f}%）"
+            except:
+                name = sid
+                subtitle = "查詢失敗"
+            buttons = [("🗑️ 刪除持股", f"action=del_portfolio&symbol={symbol}")]
+            bubbles.append(make_action_card(f"📊 {symbol}｜{name}", subtitle, "#C4907A", buttons))
+        return {"type":"carousel","contents":bubbles}
+    except Exception as e:
+        dlog("UI", f"make_portfolio_action_carousel 失敗：{e}")
+        return None
+
+
+def get_addable_users_for_admin() -> list:
+    """列出可以設為管理者的人（已註冊、未封鎖、非現任管理者）"""
+    try:
+        user_sheet = get_sheet("使用者名單")
+        admin_sheet = get_sheet("管理者名單")
+        if not user_sheet or not admin_sheet:
+            return []
+        # 找出現任管理者的 user_id
+        current_admins = set()
+        for row in admin_sheet.get_all_records():
+            if str(row.get("狀態")) == "正常":
+                current_admins.add(str(row.get("user_id","")))
+        # 找出可選名單
+        candidates = []
+        for row in user_sheet.get_all_records():
+            uid = str(row.get("user_id",""))
+            name = str(row.get("註冊姓名",""))
+            status = str(row.get("狀態",""))
+            if name and status != "封鎖" and uid not in current_admins:
+                candidates.append((name, uid))
+        return candidates
+    except Exception as e:
+        dlog("UI", f"get_addable_users 失敗：{e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════
+#  ⬆️ 互動清單模組結束
+# ══════════════════════════════════════════════════════════
+
+
 # ══════════════════════════════════════════
 #  Google Sheets
 # ══════════════════════════════════════════
@@ -608,7 +801,49 @@ def is_admin(user_id: str) -> bool:
     except: pass
     return False
 
+def add_admin_by_name(reg_name: str) -> str:
+    """用註冊姓名新增管理者（自動從使用者名單找 user_id）"""
+    try:
+        user_sheet = get_sheet("使用者名單")
+        admin_sheet = get_sheet("管理者名單")
+        if not user_sheet or not admin_sheet:
+            return "❌ 無法讀取名單"
+
+        # Step 1：從使用者名單找到該姓名對應的 user_id
+        target_uid = None
+        for row in user_sheet.get_all_records():
+            if str(row.get("註冊姓名")) == reg_name:
+                target_uid = str(row.get("user_id", ""))
+                break
+
+        if not target_uid:
+            return f"❌ 找不到註冊姓名為「{reg_name}」的用戶\n請確認對方已完成註冊"
+
+        # Step 2：檢查是否已是管理者
+        for row in admin_sheet.get_all_records():
+            if str(row.get("user_id")) == target_uid:
+                if str(row.get("狀態")) == "正常":
+                    return f"⚠️ {reg_name} 已經是管理者了"
+                else:
+                    # 之前被停用過，重新啟用
+                    for i, r in enumerate(admin_sheet.get_all_records(), start=2):
+                        if str(r.get("user_id")) == target_uid:
+                            admin_sheet.update_cell(i, 5, "正常")
+                            assign_rich_menu(target_uid)
+                            return f"✅ 已重新啟用管理者：{reg_name}"
+
+        # Step 3：新增管理者
+        admin_sheet.append_row([target_uid, reg_name,
+                                now_taipei().strftime("%Y-%m-%d %H:%M"),
+                                "Owner", "正常"])
+        assign_rich_menu(target_uid)
+        return f"✅ 已新增管理者：{reg_name}"
+    except Exception as e:
+        return f"❌ 新增失敗：{e}"
+
+
 def add_admin(user_id: str, name: str) -> str:
+    """舊版：直接用 user_id 新增（向下相容，保留不刪）"""
     try:
         sheet = get_sheet("管理者名單")
         if not sheet: return "❌ 無法讀取管理者名單"
@@ -933,6 +1168,7 @@ def make_portfolio_menu_flex() -> dict:
     return make_menu_flex(
         "📋 持股管理", "新增・查詢・損益分析", "#5B8B6B",
         [("➕ 新增持股","新增持股說明"), ("📋 查持股","持股"),
+         ("🗑️ 我的持股（可刪除）","我的持股"),
          ("📊 損益分析","損益分析"), ("🔴 停損提醒","停損提醒說明"),
          ("🎯 目標價提醒","目標價提醒說明")]
     )
@@ -962,11 +1198,16 @@ def make_admin_menu_flex(user_id: str) -> dict:
     )
 
 def make_user_mgmt_flex(owner: bool) -> dict:
-    buttons = [("🔍 查詢用戶","查使用者說明"), ("👥 使用者列表","使用者列表"),
-               ("🔴 封鎖","封鎖說明"), ("🟢 解除封鎖","解除封鎖說明")]
+    # v10.9.25：點清單按鈕，不用打字
+    buttons = [
+        ("👥 使用者列表","使用者列表"),    # 點進去可選人封鎖/查詳情/設管理者
+        ("⛔ 黑名單","黑名單"),            # 點進去可選人解除封鎖
+    ]
     if owner:
-        buttons += [("➕ 新增管理者","新增管理者說明"), ("➖ 移除管理者","移除管理者說明")]
-    return make_menu_flex("👥 使用者管理","帳號 / 權限 / 黑名單","#C4907A", buttons)
+        buttons += [
+            ("🛡️ 管理者名單","管理者名單"),  # 點進去可移除管理者
+        ]
+    return make_menu_flex("👥 使用者管理","點清單即可操作 ✨","#C4907A", buttons)
 
 def make_system_mgmt_flex() -> dict:
     return make_menu_flex(
@@ -1913,6 +2154,119 @@ def callback():
     except InvalidSignatureError: abort(400)
     return "OK"
 
+
+# ══════════════════════════════════════════════════════════
+#  Postback Handler v10.9.25（接收按鈕點擊）
+# ══════════════════════════════════════════════════════════
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    """處理 Postback 按鈕點擊"""
+    user_id = event.source.user_id
+    data = event.postback.data
+    dlog("POSTBACK", f"user={user_id[:10]}... data='{data}'")
+
+    if is_blocked_user(user_id):
+        reply_text(event.reply_token, "⛔ 此帳號已停止使用權限")
+        return
+
+    # 解析 data: action=xxx&param=yyy
+    params = {}
+    for pair in data.split("&"):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            params[k] = v
+    action = params.get("action", "")
+
+    try:
+        # ── 查使用者詳情
+        if action == "user_detail":
+            name = params.get("name", "")
+            if name:
+                reply_text(event.reply_token, get_user_detail(name))
+            return
+
+        # ── 開始封鎖流程（Step 1：選原因）
+        if action == "block_start" and is_admin(user_id):
+            target_name = params.get("name", "")
+            if target_name:
+                WAITING_BLOCK_REASON[user_id] = target_name
+                dlog("POSTBACK", f"等待封鎖原因 user={user_id[:10]} target={target_name}")
+                qr_items = [
+                    ("⚠️ 違規", f"action=block_do&name={target_name}&reason=違規"),
+                    ("📢 廣告", f"action=block_do&name={target_name}&reason=廣告"),
+                    ("😡 騷擾", f"action=block_do&name={target_name}&reason=騷擾"),
+                    ("🤬 不當言論", f"action=block_do&name={target_name}&reason=不當言論"),
+                    ("❓ 其他", f"action=block_do&name={target_name}&reason=其他"),
+                    ("❌ 取消", f"action=block_cancel"),
+                ]
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=event.reply_token,
+                            messages=[TextMessage(
+                                text=f"⚠️ 確定要封鎖「{target_name}」嗎？\n請選擇原因：",
+                                quick_reply=make_postback_quick_reply(qr_items))]))
+            return
+
+        # ── 執行封鎖（Step 2）
+        if action == "block_do" and is_admin(user_id):
+            name = params.get("name", "")
+            reason = params.get("reason", "未說明")
+            WAITING_BLOCK_REASON.pop(user_id, None)
+            if name:
+                reply_text(event.reply_token, block_user_by_name(name, reason))
+            return
+
+        # ── 取消封鎖
+        if action == "block_cancel":
+            WAITING_BLOCK_REASON.pop(user_id, None)
+            reply_text(event.reply_token, "✅ 已取消封鎖操作")
+            return
+
+        # ── 解除封鎖
+        if action == "unblock" and is_admin(user_id):
+            name = params.get("name", "")
+            if name:
+                reply_text(event.reply_token, unblock_user_by_name(name))
+            return
+
+        # ── 移除管理者
+        if action == "remove_admin" and is_owner(user_id):
+            name = params.get("name", "")
+            if name:
+                reply_text(event.reply_token, remove_admin(name))
+            return
+
+        # ── 新增管理者
+        if action == "add_admin" and is_owner(user_id):
+            name = params.get("name", "")
+            if name:
+                reply_text(event.reply_token, add_admin_by_name(name))
+            return
+
+        # ── 刪除持股
+        if action == "del_portfolio":
+            symbol = params.get("symbol", "")
+            if symbol:
+                p = load_portfolio()
+                if symbol in p and p[symbol].get("user_id") == user_id:
+                    del p[symbol]
+                    save_portfolio(p)
+                    delete_portfolio_from_sheets(user_id, symbol)
+                    reply_text(event.reply_token, f"✅ 已刪除持股：{symbol}")
+                else:
+                    reply_text(event.reply_token, f"❌ 找不到持股或無權限")
+            return
+
+        # 未知 action
+        dlog("POSTBACK", f"未知 action：{action}")
+
+    except Exception as e:
+        dlog("POSTBACK", f"處理 postback 例外：{e}")
+        try:
+            reply_text(event.reply_token, f"❌ 操作失敗，請稍後再試")
+        except: pass
+
+
 @handler.add(MessageEvent,message=TextMessageContent)
 def handle_message(event):
     text=event.message.text.strip(); user_id=event.source.user_id
@@ -2094,18 +2448,27 @@ def handle_message(event):
     # ══ Owner 專屬指令 ══
     if is_owner(user_id):
         if text.startswith("新增管理者 "):
-            parts=text.split(" ",2)
-            if len(parts)==3:
-                _,uid,name=parts
-                reply_text(event.reply_token, add_admin(uid.strip(),name.strip()))
+            # 新版：「新增管理者 姓名」（用註冊姓名自動找 user_id）
+            reg_name = text.replace("新增管理者 ", "").strip()
+            if reg_name:
+                reply_text(event.reply_token, add_admin_by_name(reg_name))
             else:
-                reply_text(event.reply_token,"格式：新增管理者 user_id 姓名")
+                reply_text(event.reply_token, "格式：新增管理者 註冊姓名\n例如：新增管理者 王小明")
             return
         elif text.startswith("移除管理者 "):
             name=text.replace("移除管理者 ","").strip()
             if name: reply_text(event.reply_token, remove_admin(name))
             return
         elif text=="管理者名單":
+            # v10.9.25：改成可點選的 Flex carousel
+            dlog("HANDLER", "→ 管理者名單（互動清單）")
+            flex = make_admin_list_carousel()
+            if flex:
+                reply_flex(event.reply_token, flex, "管理者名單")
+            else:
+                reply_text(event.reply_token, get_admin_list())  # 退回文字版
+            return
+        elif text=="管理者名單文字":
             reply_text(event.reply_token, get_admin_list()); return
         elif text=="快取狀態":
             total=len(NAME_CACHE)
@@ -2144,16 +2507,47 @@ def handle_message(event):
             name=text.replace("解除封鎖 ","").strip()
             if name: reply_text(event.reply_token, unblock_user_by_name(name)); return
         elif text=="使用者列表":
+            # v10.9.25：改成可點選的 Flex carousel
+            dlog("HANDLER", "→ 使用者列表（互動清單）")
+            flex = make_user_list_carousel()
+            if flex:
+                reply_flex(event.reply_token, flex, "使用者列表")
+            else:
+                reply_text(event.reply_token, get_user_list())  # 退回文字版
+            return
+        elif text=="使用者列表文字":
             reply_text(event.reply_token, get_user_list()); return
         elif text.startswith("查使用者 "):
             name=text.replace("查使用者 ","").strip()
             if name: reply_text(event.reply_token, get_user_detail(name)); return
 
     # ══ 說明按鈕回應 ══
+    # 🌸 自己查自己的註冊資料
+    if text in ["我的名字", "我的資料", "我是誰"]:
+        record = get_user_record(user_id)
+        if record and record.get("註冊姓名"):
+            msg = (f"🌸 您的註冊資料\n━━━━━━━━━━━━━━\n"
+                   f"註冊姓名：{record.get('註冊姓名','')}\n"
+                   f"LINE暱稱：{record.get('LINE暱稱','')}\n"
+                   f"狀態：{record.get('狀態','正常')}\n"
+                   f"註冊時間：{record.get('註冊時間','')}\n")
+            if is_owner(user_id):
+                msg += "身份：👑 Owner"
+            elif is_admin(user_id):
+                msg += "身份：🛡️ 管理者"
+            else:
+                msg += "身份：✨ 一般用戶"
+            reply_text(event.reply_token, msg)
+        else:
+            reply_text(event.reply_token,
+                "🌱 您還沒註冊喔！\n━━━━━━━━━━━━━━\n"
+                "請輸入「註冊 您的姓名」完成註冊\n例如：註冊 王小明")
+        return
+
     if text=="封鎖說明": reply_text(event.reply_token,"格式：封鎖 姓名 原因\n例如：封鎖 王小明 違規"); return
     if text=="解除封鎖說明": reply_text(event.reply_token,"格式：解除封鎖 姓名\n例如：解除封鎖 王小明"); return
     if text=="查使用者說明": reply_text(event.reply_token,"格式：查使用者 姓名\n例如:查使用者 王小明"); return
-    if text=="新增管理者說明": reply_text(event.reply_token,"格式：新增管理者 user_id 姓名"); return
+    if text=="新增管理者說明": reply_text(event.reply_token,"格式：新增管理者 註冊姓名\n例如：新增管理者 王小明\n\n（系統會自動從使用者名單找對應的 user_id）"); return
     if text=="移除管理者說明": reply_text(event.reply_token,"格式：移除管理者 姓名"); return
     if text=="新增持股說明": reply_text(event.reply_token,"格式：新增 代碼 股數 買入價\n例如：新增 2330 100 200"); return
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
@@ -2245,6 +2639,26 @@ def handle_message(event):
     # ══ 持股管理指令 ══
     if text=="持股": reply_text(event.reply_token, get_portfolio_summary(user_id)); return
 
+    # v10.9.25：可點選刪除的持股清單
+    if text in ["我的持股", "持股清單"]:
+        dlog("HANDLER", "→ 持股清單（互動）")
+        flex = make_portfolio_action_carousel(user_id)
+        if flex:
+            reply_flex(event.reply_token, flex, "我的持股")
+        else:
+            reply_text(event.reply_token, get_portfolio_summary(user_id))
+        return
+
+    # v10.9.25：黑名單清單（管理者用）
+    if text == "黑名單" and is_admin(user_id):
+        dlog("HANDLER", "→ 黑名單清單")
+        flex = make_blocked_list_carousel()
+        if flex:
+            reply_flex(event.reply_token, flex, "黑名單")
+        else:
+            reply_text(event.reply_token, "📋 目前沒有被封鎖的用戶")
+        return
+
     if text.startswith("新增 "):
         parts=text.split()
         if len(parts)==4:
@@ -2303,7 +2717,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.23 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.25 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
