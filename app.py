@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.34（新聞去重升級 + 同媒體限制 + 來源權重排序）
+LINE Bot 模組 v10.9.35（Groq AI 整合：新聞語意去重 + 情緒分析 + AI 摘要）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -2272,6 +2272,174 @@ def get_tw_closes(stock_id: str) -> list:
 
 
 # ══════════════════════════════════════════
+#  Groq AI 模組（v10.9.35 新增）
+#  用途：新聞語意去重 + 情緒分析 + AI 摘要
+#  模型：Llama 3.3 70B Versatile（免費、夠強）
+# ══════════════════════════════════════════
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_AVAILABLE = bool(GROQ_API_KEY)
+
+# 新聞 AI 結果快取（key=normalized_title, value=(result, timestamp)）
+NEWS_AI_CACHE = {}
+NEWS_AI_CACHE_TTL = 3600  # 1 小時
+
+
+def groq_chat(messages: list, max_tokens: int = 1500, temperature: float = 0.2, timeout: int = 8) -> str:
+    """呼叫 Groq Chat API，回傳純文字。失敗時回傳空字串"""
+    if not GROQ_AVAILABLE:
+        return ""
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
+        elif r.status_code == 429:
+            dlog("GROQ", f"⏸️ 達到速率限制（429），暫時降級為規則式")
+            return ""
+        elif r.status_code == 413:
+            dlog("GROQ", f"📏 請求太大（413），可能批次太多新聞")
+            return ""
+        else:
+            dlog("GROQ", f"❌ API 錯誤 HTTP {r.status_code}: {r.text[:200]}")
+            return ""
+    except requests.Timeout:
+        dlog("GROQ", "⏱️ API 超時（>8s）")
+        return ""
+    except Exception as e:
+        dlog("GROQ", f"❌ 呼叫失敗：{e}")
+        return ""
+
+
+def ai_analyze_news_batch(news_list: list, stock_name: str = "", market_type: str = "tw") -> list:
+    """一次呼叫 Groq 處理整批新聞：語意去重 + 情緒 + 摘要（v10.9.35）
+
+    Args:
+        news_list: [(title, url), ...]
+        stock_name: 股票名稱（如「台積電」）幫助 AI 判斷上下文
+        market_type: "tw" / "us" / "global"
+
+    Returns:
+        [{"title": str, "url": str, "keep": bool, "sentiment": str,
+          "summary": str, "duplicate_of": int or None}, ...]
+        失敗時回傳原始 list（不影響 fallback）
+    """
+    if not news_list:
+        return []
+    if not GROQ_AVAILABLE:
+        # 沒 API key → 直接回傳原始結果
+        return [{"title": t, "url": u, "keep": True, "sentiment": "🟡中性",
+                 "summary": "", "duplicate_of": None} for t, u in news_list]
+
+    # 檢查快取：每則新聞獨立快取
+    now_ts = int(time.time())
+    cached_results = []
+    uncached_news = []
+    uncached_indices = []
+    for i, (t, u) in enumerate(news_list):
+        cache_key = normalize_title(t)
+        if cache_key in NEWS_AI_CACHE:
+            cached_result, cached_ts = NEWS_AI_CACHE[cache_key]
+            if now_ts - cached_ts < NEWS_AI_CACHE_TTL:
+                cached_results.append((i, cached_result))
+                continue
+        uncached_news.append((i, t, u))
+        uncached_indices.append(i)
+
+    if not uncached_news:
+        # 全部都有快取
+        results = [None] * len(news_list)
+        for i, r in cached_results: results[i] = r
+        return results
+
+    # 構造 prompt
+    market_hint = {
+        "tw": "台股市場",
+        "us": "美股市場",
+        "global": "全球市場",
+    }.get(market_type, "金融市場")
+    context = f"關於{stock_name}的" if stock_name else ""
+
+    news_text = "\n".join([f"{idx+1}. {t}" for idx, (_, t, _) in enumerate(uncached_news)])
+
+    system_prompt = f"""你是專業金融新聞分析師。請分析以下{context}{market_hint}新聞，輸出 JSON 陣列。
+
+對每則新聞回傳：
+- "keep": true/false（是否保留，重複的標 false）
+- "sentiment": 必須是 "🟢偏多" / "🟡中性" / "🔴偏空" 之一
+- "summary": 一句話 15 字以內精華（描述對市場/股價的影響，不要重複標題）
+- "duplicate_of": 如果是重複某則，填那則的編號（1-indexed），否則 null
+
+重複判斷標準：
+- 同一事件不同說法 → 重複
+- 不同事件、不同公司 → 不重複
+- 只要有任一面向不同（時間、人物、地點），就視為不重複
+
+只輸出 JSON 陣列，不要其他文字。"""
+
+    user_prompt = f"新聞列表：\n{news_text}"
+
+    response = groq_chat([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ], max_tokens=1500, temperature=0.2, timeout=8)
+
+    # 解析 JSON
+    try:
+        # 抓 JSON 陣列（容錯：有時 LLM 會加 ```json 包裝）
+        json_match = re.search(r'\[.*\]', response, re.DOTALL)
+        if not json_match:
+            raise ValueError("找不到 JSON 陣列")
+        ai_results = json.loads(json_match.group(0))
+        if not isinstance(ai_results, list) or len(ai_results) != len(uncached_news):
+            raise ValueError(f"AI 回傳數量不對：{len(ai_results)} vs {len(uncached_news)}")
+    except Exception as e:
+        dlog("GROQ", f"❌ JSON 解析失敗：{e} / response={response[:200]}")
+        # Fallback：全部保留、中性、無摘要
+        ai_results = [{"keep": True, "sentiment": "🟡中性", "summary": "", "duplicate_of": None}
+                     for _ in uncached_news]
+
+    # 組合完整結果並寫入快取
+    results = [None] * len(news_list)
+    for i, r in cached_results:
+        results[i] = r
+    for ai_idx, (orig_idx, title, url) in enumerate(uncached_news):
+        ai_item = ai_results[ai_idx] if ai_idx < len(ai_results) else {}
+        result = {
+            "title": title,
+            "url": url,
+            "keep": ai_item.get("keep", True),
+            "sentiment": ai_item.get("sentiment", "🟡中性"),
+            "summary": ai_item.get("summary", "")[:50],  # 限制 50 字防爆
+            "duplicate_of": ai_item.get("duplicate_of"),
+        }
+        results[orig_idx] = result
+        # 寫入快取
+        NEWS_AI_CACHE[normalize_title(title)] = (result, now_ts)
+
+    # 清理過期快取（順手做）
+    if len(NEWS_AI_CACHE) > 500:
+        expired = [k for k, (_, ts) in NEWS_AI_CACHE.items() if now_ts - ts >= NEWS_AI_CACHE_TTL]
+        for k in expired:
+            del NEWS_AI_CACHE[k]
+
+    kept = sum(1 for r in results if r and r.get("keep"))
+    dlog("GROQ", f"✅ 新聞 AI 分析：{len(news_list)} → 保留 {kept}（其中 {len(uncached_news)} 則新分析、{len(cached_results)} 則快取）")
+    return results
+
+
+# ══════════════════════════════════════════
 #  新聞
 # ══════════════════════════════════════════
 STRICT_TRUSTED=[
@@ -2460,6 +2628,38 @@ def get_tw_stock_news(stock_id:str, cn_name:str, count:int=4)->list:
     if not results:
         results=get_news(f"{stock_id} 台股",count=count,trusted_only=False)
     return results
+
+
+def get_news_with_ai(query: str, stock_name: str = "", count: int = 4,
+                    market_type: str = "tw", trusted_only: bool = True) -> list:
+    """取新聞並用 AI 分析（v10.9.35 新增）
+
+    Returns:
+        [{"title", "url", "keep", "sentiment", "summary", "duplicate_of"}, ...]
+        如果 Groq 沒設定，會回傳 keep=True、sentiment=🟡中性、summary="" 的結果（不影響使用）
+    """
+    # 抓比 count 多 50% 的新聞給 AI 篩
+    raw_results = get_news(query, count=int(count * 1.5) + 2, trusted_only=trusted_only)
+    if not raw_results:
+        return []
+
+    # AI 分析（已內含快取機制）
+    ai_results = ai_analyze_news_batch(raw_results, stock_name=stock_name, market_type=market_type)
+
+    # 篩掉 AI 標記為重複的、保留 keep=True
+    kept = [r for r in ai_results if r and r.get("keep")]
+    return kept[:count]
+
+
+def get_tw_stock_news_with_ai(stock_id: str, cn_name: str, count: int = 4) -> list:
+    """台股 AI 新聞分析（v10.9.35 新增）"""
+    raw_news = get_tw_stock_news(stock_id, cn_name, count=int(count * 1.5) + 2)
+    if not raw_news:
+        return []
+    stock_name = cn_name if has_chinese(cn_name) else stock_id
+    ai_results = ai_analyze_news_batch(raw_news, stock_name=stock_name, market_type="tw")
+    kept = [r for r in ai_results if r and r.get("keep")]
+    return kept[:count]
 
 def format_news_text(news_list: list, title: str) -> str:
     if not news_list: return f"📰 {title}\n━━━━━━━━━━━━━━\n　暫無可信新聞"
@@ -2835,10 +3035,35 @@ def make_stock_flex(symbol,name,market_type,status,source,
     rc="#E89B82" if rsi>70 else ("#5B8DB8" if rsi<30 else "#8B6B5A")
     dn=f"{symbol} {name}" if name and name!=symbol else symbol
     nc=[]
-    for t,u in news_list[:4]:
-        if u: nc.append({"type":"button","style":"link","height":"sm",
-            "action":{"type":"uri","label":f"📰 {t}","uri":u}})
-        else: nc.append({"type":"text","text":f"📰 {t}","size":"xs","color":"#B06050","wrap":True})
+    # v10.9.35：支援兩種格式 — 舊 (t, u) tuple、新 dict（含 sentiment+summary）
+    for item in news_list[:4]:
+        if isinstance(item, dict):
+            # AI 新聞格式
+            t = item.get("title", "")
+            u = item.get("url", "")
+            sentiment = item.get("sentiment", "")
+            summary = item.get("summary", "")
+            # 情緒顏色
+            sent_color = "#D97A5C" if "🟢" in sentiment else ("#7AABBE" if "🔴" in sentiment else "#8B6B9B")
+            if u:
+                nc.append({"type":"box","layout":"vertical","spacing":"xxs","contents":[
+                    {"type":"button","style":"link","height":"sm","action":{
+                        "type":"uri","label":f"📰 {t}","uri":u}},
+                    # 顯示 AI 摘要 + 情緒
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":sentiment,"size":"xxs","color":sent_color,"weight":"bold","flex":0},
+                        {"type":"text","text":f"  {summary}" if summary else "",
+                         "size":"xxs","color":"#A07560","wrap":True,"flex":1},
+                    ]},
+                ]})
+            else:
+                nc.append({"type":"text","text":f"📰 {t}","size":"xs","color":"#B06050","wrap":True})
+        else:
+            # 舊格式 (title, url) tuple
+            t, u = item
+            if u: nc.append({"type":"button","style":"link","height":"sm",
+                "action":{"type":"uri","label":f"📰 {t}","uri":u}})
+            else: nc.append({"type":"text","text":f"📰 {t}","size":"xs","color":"#B06050","wrap":True})
     if not nc: nc=[{"type":"text","text":"暫無相關新聞","size":"xs","color":"#E8B8A8"}]
     return {
         "type":"bubble","size":"mega",
@@ -2909,7 +3134,8 @@ def get_stock_flex(symbol:str, user_id:str="")->tuple:
         if not has_chinese(tw.get("name","")): tw["name"]=get_tw_stock_name_fallback(symbol)
         if not has_chinese(tw.get("name","")): tw["name"]=symbol
         closes=get_tw_closes(symbol); kline=get_kline_analysis(closes)
-        news=get_tw_stock_news(symbol,tw["name"],count=4)
+        # v10.9.35：用 AI 版本（如沒 GROQ_API_KEY 會自動降級為一般新聞）
+        news=get_tw_stock_news_with_ai(symbol,tw["name"],count=4)
         update_tw_data_to_sheets(symbol,tw)
         log_to_sheets(user_id,"查詢台股",symbol,"成功")
         return make_stock_flex(symbol,tw["name"],tw.get("market_type","台股"),
@@ -3694,7 +3920,11 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.34 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.35 啟動中...")
+    if GROQ_AVAILABLE:
+        print(f"🤖 Groq AI：已啟用（模型 {GROQ_MODEL}）")
+    else:
+        print("⚠️ Groq AI：未設定 GROQ_API_KEY，新聞 AI 功能會降級")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
