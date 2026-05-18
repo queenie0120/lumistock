@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.35（Groq AI 整合：新聞語意去重 + 情緒分析 + AI 摘要）
+LINE Bot 模組 v10.9.36（Groq AI 新聞 + 精簡名稱快取 + 修 ETF API 失敗 log）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -320,57 +320,43 @@ def _load_twse_securities_list() -> int:
 
 
 def init_name_cache():
+    """名稱快取載入（v10.9.36 重整：精簡來源、log 更清楚）"""
     global NAME_CACHE_LOADING, NAME_CACHE_LOADED
     if NAME_CACHE_LOADING: return
     NAME_CACHE_LOADING = True
 
-    # ── 第一輪：核心 API（上市/上櫃公司 + 報價）
-    _load_twse_stock_day_all()
+    dlog("CACHE", "🌟 開始載入名稱快取...")
+    initial_size = len(NAME_CACHE)
+
+    # ── 主要來源（穩定）
+    _load_tpex_quotes()              # TPEx 上櫃報價（含名稱）— 確認可用 1004 筆
+    _load_tpex_emerging()            # 興櫃 — 確認可用 347 筆
+    _load_twse_securities_list()     # TWSE ISIN 證券公告檔（含全部上市 ETF/股票）
+
+    # ── 嘗試 OpenData（容錯：失敗不影響整體）
     _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_L","上市公司")
     _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_O","上櫃公司")
     _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_R","興櫃公司")
-    _load_tpex_quotes()
 
-    # ── 第二輪：ETF（v10.9.27 新增）
-    _load_twse_etf()
-    _load_tpex_etf()
-
-    # ── 第三輪：興櫃股票（v10.9.27 新增）
-    _load_tpex_emerging()
-
-    # ── 第四輪：證券公告檔（最完整）（v10.9.27 新增）
-    _load_twse_securities_list()
-
-    # ── 第五輪：rwd 備援
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for attempt in range(2):
-        try:
-            r = requests.get("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json",
-                           headers=headers, timeout=20, verify=False)
-            count = 0
-            for item in r.json().get("data",[]):
-                if len(item) >= 2:
-                    code = str(item[0]).strip()
-                    name = str(item[1]).strip()
-                    if code and name and has_chinese(name):
-                        NAME_CACHE[code] = name
-                        count += 1
-            if count > 100:
-                dlog("CACHE", f"TWSE rwd備援：{count} 筆")
-                break
-        except Exception as e:
-            dlog("CACHE", f"TWSE rwd第{attempt+1}次失敗：{e}")
-            time.sleep(2)
+    # ── 嘗試 STOCK_DAY_ALL（每日成交資料含名稱）
+    _load_twse_stock_day_all()
 
     # ── 補保底
+    fallback_added = 0
     for code, name in FALLBACK_NAMES.items():
-        if not has_chinese(NAME_CACHE.get(code,"")): NAME_CACHE[code] = name
+        if not has_chinese(NAME_CACHE.get(code,"")):
+            NAME_CACHE[code] = name
+            fallback_added += 1
+    if fallback_added > 0:
+        dlog("CACHE", f"保底名稱補入：{fallback_added} 筆")
 
     NAME_CACHE_LOADING = False
     NAME_CACHE_LOADED  = True
-    dlog("CACHE", f"✅ 名稱快取完整載入：{len(NAME_CACHE)} 筆")
+    total = len(NAME_CACHE)
+    new_loaded = total - initial_size
+    dlog("CACHE", f"✅ 名稱快取完整載入：{total} 筆（本次新增 {new_loaded} 筆）")
     try:
-        push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{len(NAME_CACHE)} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
+        push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
     except: pass
 
 
@@ -527,7 +513,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.21 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.36 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -3920,7 +3906,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.35 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.36 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（模型 {GROQ_MODEL}）")
     else:
