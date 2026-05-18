@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.40（修 TWSE ISIN 載入：強化 HTTP headers + 失敗時印預覽）
+LINE Bot 模組 v10.9.41（新增內建名稱表 stock_names.py：2,352 筆，永久穩定）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -348,13 +348,25 @@ def _load_twse_securities_list() -> int:
 
 
 def init_name_cache():
-    """名稱快取載入（v10.9.37：還原全部來源、快速失敗、log 乾淨）"""
+    """名稱快取載入（v10.9.41：先載內建表 2,352 筆，再從 API 補新股）"""
     global NAME_CACHE_LOADING, NAME_CACHE_LOADED
     if NAME_CACHE_LOADING: return
     NAME_CACHE_LOADING = True
 
     dlog("CACHE", "🌟 開始載入名稱快取...")
     initial_size = len(NAME_CACHE)
+
+    # ── 內建名稱表（v10.9.41 新增：最穩定的保底，API 失敗也不怕）
+    try:
+        from stock_names import STATIC_STOCK_NAMES
+        static_added = 0
+        for code, name in STATIC_STOCK_NAMES.items():
+            if not has_chinese(NAME_CACHE.get(code, "")):
+                NAME_CACHE[code] = name
+                static_added += 1
+        dlog("CACHE", f"🌟 內建名稱表載入：{static_added} 筆")
+    except Exception as e:
+        dlog("CACHE", f"⚠️ 內建名稱表載入失敗：{e}（會 fallback 用 API）")
 
     # ── 主要來源（穩定）
     _load_tpex_quotes()              # TPEx 上櫃報價（含名稱）— 1004 筆
@@ -545,7 +557,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.40 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.41 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -4293,7 +4305,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.40 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.41 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
