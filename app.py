@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.39（修 TWSE ISIN 載入：處理 9MB 大檔案 + 詳細 log）
+LINE Bot 模組 v10.9.40（修 TWSE ISIN 載入：強化 HTTP headers + 失敗時印預覽）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -280,14 +280,19 @@ def _load_twse_etf() -> int:
 
 def _load_twse_securities_list() -> int:
     """證券基本資料（包含全部上市股票 + ETF，最完整）
-    v10.9.27 新增 / v10.9.39 修正：處理 9MB 大檔案 + 加詳細 log
+    v10.9.27 新增 / v10.9.39 修正：處理 9MB 大檔案
+    v10.9.40 修正：強化 HTTP headers（之前回傳 765 字元，是 headers 不夠完整）
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept-Language": "zh-TW,zh;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://isin.twse.com.tw/isin/single_main.jsp",
+        "Upgrade-Insecure-Requests": "1",
     }
     import re as _re
-    # 兩個 endpoint：上市 + 上櫃（雖然上櫃 quotes 已抓到大部分，這裡補 ETF）
     urls = [
         ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", "上市/ETF"),
         ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", "上櫃/ETF"),
@@ -295,15 +300,18 @@ def _load_twse_securities_list() -> int:
     total_added = 0
     for url, market_label in urls:
         try:
-            r = requests.get(url, headers=headers, timeout=30, verify=False, stream=False)
+            r = requests.get(url, headers=headers, timeout=30, verify=False)
             if r.status_code != 200:
                 dlog("CACHE", f"TWSE ISIN [{market_label}] HTTP {r.status_code}")
                 continue
             r.encoding = "big5"  # 重要：必須 big5（MS950）
             html_text = r.text
 
-            if len(html_text) < 1000:
-                dlog("CACHE", f"TWSE ISIN [{market_label}] 內容太短（{len(html_text)} 字元），跳過")
+            if len(html_text) < 5000:
+                # v10.9.40：失敗時印出實際內容前 200 字以便診斷
+                preview = html_text[:200].replace("\n"," ").replace("\r"," ")
+                dlog("CACHE", f"TWSE ISIN [{market_label}] 內容太短（{len(html_text)} 字元）")
+                dlog("CACHE", f"  └─ 預覽：{preview}")
                 continue
 
             count = 0
@@ -537,7 +545,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.39 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.40 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -4285,7 +4293,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.39 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.40 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
