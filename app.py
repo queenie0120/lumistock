@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.33（外匯重構 3 區：台灣關鍵匯率 + 美元核心 + 國際貨幣對）
+LINE Bot 模組 v10.9.34（新聞去重升級 + 同媒體限制 + 來源權重排序）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -2281,6 +2281,23 @@ STRICT_TRUSTED=[
     "reuters.com","bloomberg.com","marketwatch.com","finance.yahoo.com",
     "cnbc.com","wsj.com","barrons.com","investing.com",
 ]
+
+# v10.9.34 新增：來源權重（分數越高越優先顯示）
+SOURCE_WEIGHTS = {
+    # 🌟 頂級台股（鉅亨/MoneyDJ/工商/經濟日報/中央社/財訊）
+    "cnyes.com": 100, "anue.com": 100, "moneydj.com": 95,
+    "ctee.com.tw": 90, "money.udn.com": 90, "cna.com.tw": 90,
+    "wealth.com.tw": 85,
+    # 🌟 頂級美股
+    "reuters.com": 100, "bloomberg.com": 100, "cnbc.com": 95,
+    "marketwatch.com": 90, "wsj.com": 95, "barrons.com": 85,
+    "investing.com": 80,
+    # 🟡 一般可信
+    "udn.com": 70, "technews.tw": 65, "bnext.com.tw": 65,
+    "stockfeel.com.tw": 60, "tw.stock.yahoo.com": 60,
+    "finance.yahoo.com": 65,
+}
+
 NON_NEWS_KEYWORDS=[
     "股票價格","股價圖","圖表","K線圖","個股概覽","個股頁",
     "持倉","ETF持股","成分股","歷史資料","歷史股價","技術圖",
@@ -2291,12 +2308,119 @@ NON_NEWS_KEYWORDS=[
 def is_trusted_source(url:str)->bool: return any(s in url for s in STRICT_TRUSTED) if url else False
 def is_real_news(title:str)->bool: return not any(kw in title for kw in NON_NEWS_KEYWORDS)
 
-def deduplicate_news(nl:list)->list:
-    seen,result=[],[]
-    for t,u in nl:
-        key=re.sub(r'[^\u4e00-\u9fffa-zA-Z0-9]','',t)[:12]
-        if key not in seen: seen.append(key); result.append((t,u))
+
+def get_news_domain(url: str) -> str:
+    """從 URL 提取主網域（v10.9.34 新增）"""
+    if not url: return ""
+    try:
+        # 簡單匹配 - 抓 ://xxx.yyy.zz/
+        m = re.search(r'https?://(?:www\.|m\.)?([^/]+)', url)
+        if m:
+            domain = m.group(1).lower()
+            # 對應到白名單裡的主域名
+            for trusted in STRICT_TRUSTED:
+                if trusted in domain:
+                    return trusted
+            return domain
+    except: pass
+    return ""
+
+
+def get_source_weight(url: str) -> int:
+    """取得來源權重分數（v10.9.34 新增）"""
+    domain = get_news_domain(url)
+    return SOURCE_WEIGHTS.get(domain, 30 if is_trusted_source(url) else 10)
+
+
+def normalize_title(title: str) -> str:
+    """標準化標題用來比對相似度（v10.9.34 升級）
+    - 移除標點/空白/全形符號
+    - 移除新聞常見冗詞
+    - 轉小寫"""
+    t = title.lower()
+    # 移除常見冗詞
+    for word in ["獨家", "快訊", "即時", "更新", "突發", "重磅", "焦點",
+                 "重要", "盤前", "盤後", "盤中", "速報", "本日", "今日",
+                 "exclusive", "breaking", "update", "alert", "report"]:
+        t = t.replace(word, "")
+    # 只留中英數字
+    t = re.sub(r'[^\u4e00-\u9fffa-z0-9]', '', t)
+    return t
+
+
+def title_similarity(a: str, b: str) -> float:
+    """計算兩個標題的相似度 0~1（v10.9.34）
+    結合 char-bigram + 中文關鍵詞重疊度（更適合中文新聞）"""
+    a_norm, b_norm = normalize_title(a), normalize_title(b)
+    if not a_norm or not b_norm: return 0.0
+    if a_norm == b_norm: return 1.0
+    # 如果一個包含另一個（短的長度至少 6 字）
+    if len(a_norm) >= 6 and len(b_norm) >= 6:
+        if a_norm in b_norm or b_norm in a_norm: return 0.95
+
+    # 方法 1：char bigram Jaccard
+    def bigrams(s):
+        return set(s[i:i+2] for i in range(len(s)-1))
+    ba, bb = bigrams(a_norm), bigrams(b_norm)
+    bigram_sim = len(ba & bb) / len(ba | bb) if (ba | bb) else 0.0
+
+    # 方法 2：中文 trigram 重疊（抓「台積電」「法說會」「特斯拉」這類專有名詞）
+    def trigrams(s):
+        return set(s[i:i+3] for i in range(len(s)-2))
+    ta, tb = trigrams(a_norm), trigrams(b_norm)
+    if ta and tb:
+        overlap = len(ta & tb)
+        min_len = min(len(ta), len(tb))
+        trigram_sim = overlap / min_len if min_len else 0.0
+    else:
+        trigram_sim = 0.0
+
+    # 綜合分數：兩種方法取較高（讓任一強訊號就能判定重複）
+    return max(bigram_sim, trigram_sim * 0.85)
+
+
+def deduplicate_news(nl: list, similarity_threshold: float = 0.5, max_per_source: int = 2) -> list:
+    """新聞去重 + 同媒體限制（v10.9.34 完全升級）
+    nl: [(title, url), ...]
+    similarity_threshold: 標題相似度閾值（>= 此值視為重複）
+    max_per_source: 同一媒體最多顯示幾則
+    """
+    if not nl: return []
+    original_count = len(nl)
+
+    # 先按來源權重排序（高權重優先保留）
+    sorted_nl = sorted(nl, key=lambda x: -get_source_weight(x[1]))
+
+    result = []
+    source_count = {}  # {domain: count}
+    skipped_similar = 0
+    skipped_max_source = 0
+
+    for title, url in sorted_nl:
+        domain = get_news_domain(url)
+
+        # 同媒體限制
+        if source_count.get(domain, 0) >= max_per_source:
+            skipped_max_source += 1
+            continue
+
+        # 相似度去重 — 跟已收的每篇比對
+        is_duplicate = False
+        for existing_title, _ in result:
+            if title_similarity(title, existing_title) >= similarity_threshold:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            skipped_similar += 1
+            continue
+
+        result.append((title, url))
+        source_count[domain] = source_count.get(domain, 0) + 1
+
+    if original_count > len(result):
+        dlog("NEWS", f"去重 {original_count}→{len(result)}（過濾相似{skipped_similar} 同媒體{skipped_max_source}）")
     return result
+
 
 def clean_title(t:str)->str:
     t=t.split(" - ")[0].strip(); t=re.sub(r'\s+',' ',t)
@@ -3570,7 +3694,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.33 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.34 啟動中...")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
