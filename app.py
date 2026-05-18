@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.36（Groq AI 新聞 + 精簡名稱快取 + 修 ETF API 失敗 log）
+LINE Bot 模組 v10.9.38（新增 AI 新聞解讀獨立功能：翻譯+情緒+影響台股）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -214,25 +214,22 @@ def _load_tpex_quotes() -> int:
 
 
 def _load_tpex_etf() -> int:
-    """上櫃 ETF 名單（v10.9.27 新增）"""
+    """上櫃 ETF 名單（v10.9.27 新增，v10.9.37 改快速失敗）"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    for attempt in range(2):
-        try:
-            r = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_etf_summary_quotes",
-                           headers=headers, timeout=20, verify=False)
-            count = 0
-            for item in r.json():
-                code = (str(item.get("SecuritiesCompanyCode","")) or str(item.get("Code",""))).strip()
-                name = (str(item.get("CompanyName","")) or str(item.get("Name",""))).strip()
-                if code and name and has_chinese(name):
-                    NAME_CACHE[code] = name
-                    count += 1
-            if count > 0:
-                dlog("CACHE", f"TPEx ETF：{count} 筆")
-                return count
-        except Exception as e:
-            dlog("CACHE", f"TPEx ETF 第{attempt+1}次失敗：{e}")
-            time.sleep(2)
+    try:
+        r = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_etf_summary_quotes",
+                       headers=headers, timeout=5, verify=False)
+        count = 0
+        for item in r.json():
+            code = (str(item.get("SecuritiesCompanyCode","")) or str(item.get("Code",""))).strip()
+            name = (str(item.get("CompanyName","")) or str(item.get("Name",""))).strip()
+            if code and name and has_chinese(name):
+                NAME_CACHE[code] = name
+                count += 1
+        if count > 0:
+            dlog("CACHE", f"TPEx ETF：{count} 筆")
+            return count
+    except: pass  # 安靜失敗
     return 0
 
 
@@ -260,28 +257,24 @@ def _load_tpex_emerging() -> int:
 
 
 def _load_twse_etf() -> int:
-    """上市 ETF 名單（v10.9.27 新增）"""
+    """上市 ETF 名單（v10.9.27 新增，v10.9.37 改快速失敗）"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    for attempt in range(2):
-        try:
-            # ETF e添富 JSON
-            r = requests.get("https://www.twse.com.tw/rwd/zh/ETFortune/ETFRanking?response=json",
-                           headers=headers, timeout=20, verify=False)
-            data = r.json()
-            count = 0
-            for row in data.get("data", []):
-                if len(row) >= 2:
-                    code = str(row[0]).strip()
-                    name = str(row[1]).strip()
-                    if code and name and has_chinese(name):
-                        NAME_CACHE[code] = name
-                        count += 1
-            if count > 0:
-                dlog("CACHE", f"TWSE ETF：{count} 筆")
-                return count
-        except Exception as e:
-            dlog("CACHE", f"TWSE ETF 第{attempt+1}次失敗：{e}")
-            time.sleep(2)
+    try:
+        r = requests.get("https://www.twse.com.tw/rwd/zh/ETFortune/ETFRanking?response=json",
+                       headers=headers, timeout=5, verify=False)
+        data = r.json()
+        count = 0
+        for row in data.get("data", []):
+            if len(row) >= 2:
+                code = str(row[0]).strip()
+                name = str(row[1]).strip()
+                if code and name and has_chinese(name):
+                    NAME_CACHE[code] = name
+                    count += 1
+        if count > 0:
+            dlog("CACHE", f"TWSE ETF：{count} 筆")
+            return count
+    except: pass  # 安靜失敗
     return 0
 
 
@@ -320,7 +313,7 @@ def _load_twse_securities_list() -> int:
 
 
 def init_name_cache():
-    """名稱快取載入（v10.9.36 重整：精簡來源、log 更清楚）"""
+    """名稱快取載入（v10.9.37：還原全部來源、快速失敗、log 乾淨）"""
     global NAME_CACHE_LOADING, NAME_CACHE_LOADED
     if NAME_CACHE_LOADING: return
     NAME_CACHE_LOADING = True
@@ -329,9 +322,13 @@ def init_name_cache():
     initial_size = len(NAME_CACHE)
 
     # ── 主要來源（穩定）
-    _load_tpex_quotes()              # TPEx 上櫃報價（含名稱）— 確認可用 1004 筆
-    _load_tpex_emerging()            # 興櫃 — 確認可用 347 筆
-    _load_twse_securities_list()     # TWSE ISIN 證券公告檔（含全部上市 ETF/股票）
+    _load_tpex_quotes()              # TPEx 上櫃報價（含名稱）— 1004 筆
+    _load_tpex_emerging()            # 興櫃 — 347 筆
+    _load_twse_securities_list()     # TWSE ISIN 證券公告檔
+
+    # ── ETF 補充（v10.9.37 還原，快速失敗模式）
+    _load_twse_etf()                 # 失敗會安靜略過
+    _load_tpex_etf()                 # 失敗會安靜略過
 
     # ── 嘗試 OpenData（容錯：失敗不影響整體）
     _load_opendata("https://openapi.twse.com.tw/v1/opendata/t187ap03_L","上市公司")
@@ -513,7 +510,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.36 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.38 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -1519,8 +1516,9 @@ def make_ai_menu_flex() -> dict:
 
 def make_news_menu_flex() -> dict:
     return make_menu_flex(
-        "📰 財經新聞", "個股・台股・美股・國際", "#D9C5B3",
-        [("📊 個股新聞","個股新聞"), ("🇹🇼 台股新聞","台股新聞"),
+        "📰 財經新聞", "AI 解讀・台股・美股・國際", "#D9C5B3",
+        [("🤖 AI 新聞解讀","AI新聞"),
+         ("📊 個股新聞","個股新聞"), ("🇹🇼 台股新聞","台股新聞"),
          ("🇺🇸 美股新聞","美股新聞"), ("🌐 國際新聞","國際新聞"),
          ("🌏 地緣政治","地緣政治新聞")]
     )
@@ -2647,6 +2645,318 @@ def get_tw_stock_news_with_ai(stock_id: str, cn_name: str, count: int = 4) -> li
     kept = [r for r in ai_results if r and r.get("keep")]
     return kept[:count]
 
+
+# ══════════════════════════════════════════
+#  AI 新聞解讀模組（v10.9.38 新增）
+#  獨立模組，不影響主流程查詢
+#  特色：原文 + 中文翻譯（美股）+ 情緒分析 + 影響台股
+# ══════════════════════════════════════════
+
+def get_us_news_english(count: int = 8) -> list:
+    """抓美股英文新聞（規格書要求：Reuters/CNBC/Bloomberg/MarketWatch/Benzinga）"""
+    queries = [
+        "US stock market today",
+        "S&P 500 Nasdaq Dow",
+        "Fed interest rate news",
+        "AI semiconductor earnings",
+    ]
+    all_results = []
+    seen_titles = set()
+    for q in queries[:2]:  # 抓 2 個 query
+        results = get_news(q, count=count, trusted_only=False)
+        for t, u in results:
+            # 篩選只留英文新聞來源
+            if any(s in u for s in ["reuters.com", "cnbc.com", "bloomberg.com",
+                                     "marketwatch.com", "wsj.com", "barrons.com",
+                                     "investing.com", "benzinga.com", "seekingalpha.com",
+                                     "finance.yahoo.com", "ft.com"]):
+                key = normalize_title(t)[:20]
+                if key and key not in seen_titles:
+                    seen_titles.add(key)
+                    all_results.append((t, u))
+    return all_results[:count]
+
+
+def ai_translate_and_analyze(news_list: list, market_type: str = "us") -> list:
+    """美股新聞：翻譯+摘要+情緒+影響台股，一次 Groq 呼叫做 4 件事
+
+    Args:
+        news_list: [(title, url), ...]
+        market_type: "us" (有翻譯) / "tw" (純中文) / "global"
+
+    Returns:
+        [{"title": str, "url": str, "translation": str, "summary": str,
+          "sentiment": str, "impact": str, "keep": bool}, ...]
+    """
+    if not news_list:
+        return []
+    if not GROQ_AVAILABLE:
+        # 沒 API key → 退回普通結果
+        return [{"title": t, "url": u, "translation": "",
+                 "summary": "", "sentiment": "🟡中性", "impact": "", "keep": True}
+                for t, u in news_list]
+
+    # 檢查快取
+    now_ts = int(time.time())
+    cached_results = []
+    uncached_news = []
+    for i, (t, u) in enumerate(news_list):
+        cache_key = f"trans_{normalize_title(t)}"
+        if cache_key in NEWS_AI_CACHE:
+            cached_result, cached_ts = NEWS_AI_CACHE[cache_key]
+            if now_ts - cached_ts < NEWS_AI_CACHE_TTL:
+                cached_results.append((i, cached_result))
+                continue
+        uncached_news.append((i, t, u))
+
+    if not uncached_news:
+        results = [None] * len(news_list)
+        for i, r in cached_results: results[i] = r
+        return results
+
+    # 構造 prompt
+    news_text = "\n".join([f"{idx+1}. {t}" for idx, (_, t, _) in enumerate(uncached_news)])
+
+    if market_type == "us":
+        system_prompt = """你是專業金融新聞分析師。請分析美股新聞，輸出 JSON 陣列。
+
+對每則新聞回傳：
+- "translation": 中文翻譯（保留專有名詞英文，例如 NVIDIA、Fed、CPI）
+- "summary": 20 字內精華摘要（描述對市場的影響，不重複標題）
+- "sentiment": 必須是 "🟢偏多" / "🟡中性" / "🔴偏空" 之一
+- "impact": 影響哪些台股族群（例如「台積電供應鏈/AI 概念股」），10 字內
+- "keep": true/false（是否保留，重複的標 false）
+
+只輸出 JSON 陣列，不要其他文字。"""
+    else:
+        # 台股/國際：純中文，不需翻譯
+        system_prompt = """你是專業金融新聞分析師。請分析新聞，輸出 JSON 陣列。
+
+對每則新聞回傳：
+- "translation": 空字串
+- "summary": 20 字內精華摘要（描述對市場的影響）
+- "sentiment": 必須是 "🟢偏多" / "🟡中性" / "🔴偏空" 之一
+- "impact": 影響哪些族群（10 字內）
+- "keep": true/false（是否保留，重複的標 false）
+
+只輸出 JSON 陣列，不要其他文字。"""
+
+    response = groq_chat([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"新聞列表：\n{news_text}"}
+    ], max_tokens=2000, temperature=0.2, timeout=15)  # AI 新聞給長一點 timeout
+
+    # 解析
+    try:
+        json_match = re.search(r'\[.*\]', response, re.DOTALL)
+        if not json_match:
+            raise ValueError("找不到 JSON 陣列")
+        ai_results = json.loads(json_match.group(0))
+        if not isinstance(ai_results, list):
+            raise ValueError("不是陣列")
+    except Exception as e:
+        dlog("GROQ", f"❌ AI 新聞解析失敗：{e} / response={response[:200]}")
+        ai_results = [{"translation": "", "summary": "", "sentiment": "🟡中性",
+                       "impact": "", "keep": True} for _ in uncached_news]
+
+    # 組合結果
+    results = [None] * len(news_list)
+    for i, r in cached_results:
+        results[i] = r
+    for ai_idx, (orig_idx, title, url) in enumerate(uncached_news):
+        ai_item = ai_results[ai_idx] if ai_idx < len(ai_results) else {}
+        result = {
+            "title": title,
+            "url": url,
+            "translation": ai_item.get("translation", "")[:100],
+            "summary": ai_item.get("summary", "")[:50],
+            "sentiment": ai_item.get("sentiment", "🟡中性"),
+            "impact": ai_item.get("impact", "")[:30],
+            "keep": ai_item.get("keep", True),
+        }
+        results[orig_idx] = result
+        NEWS_AI_CACHE[f"trans_{normalize_title(title)}"] = (result, now_ts)
+
+    kept = sum(1 for r in results if r and r.get("keep"))
+    dlog("GROQ", f"✅ AI 新聞解讀：{len(news_list)} → 保留 {kept}（{len(uncached_news)} 新分析 + {len(cached_results)} 快取）")
+    return results
+
+
+def make_ai_news_carousel(news_results: list, title: str, header_color: str = "#C9B0DB") -> dict:
+    """AI 新聞 carousel（v10.9.38 新增）
+    每則新聞一張卡片：原文標題 + 中文翻譯 + 摘要 + 情緒 + 影響台股
+    """
+    if not news_results:
+        return None
+
+    bubbles = []
+    for item in news_results[:8]:  # carousel 最多 10 張，留 2 張給「未來功能」
+        if not item or not item.get("keep"):
+            continue
+        t = item.get("title", "")
+        u = item.get("url", "")
+        translation = item.get("translation", "")
+        summary = item.get("summary", "")
+        sentiment = item.get("sentiment", "🟡中性")
+        impact = item.get("impact", "")
+
+        # 情緒色
+        if "🟢" in sentiment:
+            sent_color = "#D97A5C"
+            sent_bg = "#FAE6DE"
+        elif "🔴" in sentiment:
+            sent_color = "#7AABBE"
+            sent_bg = "#DEE8FA"
+        else:
+            sent_color = "#B89BC4"
+            sent_bg = "#EFE5F5"
+
+        body_contents = [
+            # 原文標題
+            {"type":"text","text":t,"size":"sm","weight":"bold","color":"#5D3F75","wrap":True},
+        ]
+
+        # 中文翻譯（美股才有）
+        if translation:
+            body_contents.append({"type":"separator","color":"#F0D5C0","margin":"sm"})
+            body_contents.append({"type":"text","text":"🇹🇼 中文翻譯","size":"xxs","color":"#A07560","margin":"sm"})
+            body_contents.append({"type":"text","text":translation,"size":"xs","color":"#7A5040","wrap":True})
+
+        # AI 摘要
+        if summary:
+            body_contents.append({"type":"separator","color":"#F0D5C0","margin":"sm"})
+            body_contents.append({"type":"text","text":"💡 AI 摘要","size":"xxs","color":"#A07560","margin":"sm"})
+            body_contents.append({"type":"text","text":summary,"size":"xs","color":"#7A5040","wrap":True})
+
+        # 情緒 + 影響
+        body_contents.append({"type":"separator","color":"#F0D5C0","margin":"sm"})
+        body_contents.append({"type":"box","layout":"horizontal","spacing":"sm","margin":"sm","contents":[
+            {"type":"box","layout":"vertical","backgroundColor":sent_bg,"cornerRadius":"6px","paddingAll":"6px","contents":[
+                {"type":"text","text":sentiment,"size":"xs","color":sent_color,"weight":"bold","align":"center"}
+            ], "flex":0}
+        ]})
+
+        if impact:
+            body_contents.append({"type":"text","text":f"🎯 {impact}","size":"xxs","color":"#A05A48","margin":"xs","wrap":True})
+
+        # URL 按鈕
+        footer = None
+        if u:
+            footer = {
+                "type":"box","layout":"vertical","paddingAll":"8px","contents":[
+                    {"type":"button","style":"link","height":"sm","action":{
+                        "type":"uri","label":"📖 看原文","uri":u}}
+                ]
+            }
+
+        bubble = {
+            "type":"bubble","size":"kilo",
+            "header":{
+                "type":"box","layout":"vertical","backgroundColor":header_color,"paddingAll":"10px",
+                "contents":[
+                    {"type":"text","text":title,"size":"xs","color":"#FFFFFF","weight":"bold"}
+                ]
+            },
+            "body":{
+                "type":"box","layout":"vertical","spacing":"none","paddingAll":"12px",
+                "contents": body_contents
+            }
+        }
+        if footer:
+            bubble["footer"] = footer
+        bubbles.append(bubble)
+
+    if not bubbles:
+        return None
+    return {"type":"carousel","contents":bubbles}
+
+
+def build_and_push_ai_news(user_id: str, news_type: str):
+    """背景執行 AI 新聞分析並推送（v10.9.38 新增）
+    news_type: "tw" / "us" / "global"
+    """
+    try:
+        if news_type == "tw":
+            # 抓台股一般新聞
+            news = get_news("台股 大盤 加權", count=8, trusted_only=True)
+            title = "🇹🇼 台股 AI 新聞解讀"
+            header_color = "#E89B82"  # 珊瑚粉
+            market_type = "tw"
+        elif news_type == "us":
+            # 抓英文美股新聞
+            news = get_us_news_english(count=8)
+            title = "🇺🇸 美股 AI 新聞解讀"
+            header_color = "#C9B0DB"  # 薰衣草粉
+            market_type = "us"
+        elif news_type == "global":
+            # 抓國際新聞
+            news = get_news("global market geopolitics", count=8, trusted_only=True)
+            if not news:
+                news = get_news("國際財經 全球市場", count=8, trusted_only=True)
+            title = "🌍 國際 AI 新聞解讀"
+            header_color = "#E8B8A8"  # 奶油杏粉
+            market_type = "global"
+        else:
+            push_message(user_id, "⚠️ 未知的新聞類型")
+            return
+
+        if not news:
+            push_message(user_id, f"⚠️ {title}\n暫無相關新聞，請稍後再試")
+            return
+
+        # 用 Groq 分析
+        ai_results = ai_translate_and_analyze(news, market_type=market_type)
+
+        # 構造 carousel
+        flex = make_ai_news_carousel(ai_results, title, header_color)
+        if not flex:
+            push_message(user_id, f"⚠️ {title}\nAI 分析失敗，請稍後再試")
+            return
+
+        # 推送
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=user_id, messages=[
+                    FlexMessage(alt_text=title, contents=FlexContainer.from_dict(flex))
+                ])
+            )
+        dlog("AI_NEWS", f"✅ 已推送 {title} 給 {user_id[:8]}...")
+    except Exception as e:
+        dlog("AI_NEWS", f"❌ 推送失敗：{e}")
+        try:
+            push_message(user_id, f"⚠️ AI 新聞分析失敗：{e}")
+        except: pass
+
+
+def make_ai_news_menu_flex() -> dict:
+    """AI 新聞解讀子選單（v10.9.38 新增）"""
+    return {
+        "type":"bubble","size":"mega",
+        "header":{
+            "type":"box","layout":"vertical","backgroundColor":"#C9B0DB","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"🤖 AI 新聞解讀","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":"Groq AI 即時情緒分析・影響台股","size":"xs","color":"#FFFFFF"}
+            ]
+        },
+        "body":{
+            "type":"box","layout":"vertical","spacing":"sm","paddingAll":"12px",
+            "contents":[
+                {"type":"text","text":"⏱️ 分析約需 5-10 秒\n結果會自動推送到聊天","size":"xxs","color":"#A07560","wrap":True},
+                {"type":"separator","color":"#F0D5C0","margin":"sm"},
+                {"type":"button","style":"primary","height":"sm","color":"#E89B82",
+                 "action":{"type":"message","label":"🇹🇼 台股 AI 分析","text":"AI台股新聞"}},
+                {"type":"button","style":"primary","height":"sm","color":"#C9B0DB",
+                 "action":{"type":"message","label":"🇺🇸 美股 AI 分析（含中文翻譯）","text":"AI美股新聞"}},
+                {"type":"button","style":"primary","height":"sm","color":"#E8B8A8",
+                 "action":{"type":"message","label":"🌍 國際 AI 分析","text":"AI國際新聞"}},
+                {"type":"separator","color":"#F0D5C0","margin":"sm"},
+                {"type":"text","text":"💡 由 Groq Llama 3.3 70B 提供","size":"xxs","color":"#B89BC4","align":"center"}
+            ]
+        }
+    }
+
+
 def format_news_text(news_list: list, title: str) -> str:
     if not news_list: return f"📰 {title}\n━━━━━━━━━━━━━━\n　暫無可信新聞"
     msg = f"📰 {title}\n━━━━━━━━━━━━━━\n"
@@ -3120,8 +3430,9 @@ def get_stock_flex(symbol:str, user_id:str="")->tuple:
         if not has_chinese(tw.get("name","")): tw["name"]=get_tw_stock_name_fallback(symbol)
         if not has_chinese(tw.get("name","")): tw["name"]=symbol
         closes=get_tw_closes(symbol); kline=get_kline_analysis(closes)
-        # v10.9.35：用 AI 版本（如沒 GROQ_API_KEY 會自動降級為一般新聞）
-        news=get_tw_stock_news_with_ai(symbol,tw["name"],count=4)
+        # v10.9.37 修：用一般新聞（規則式去重），避免 Groq API 卡住 LINE webhook
+        # AI 新聞改為獨立指令未來使用
+        news=get_tw_stock_news(symbol,tw["name"],count=4)
         update_tw_data_to_sheets(symbol,tw)
         log_to_sheets(user_id,"查詢台股",symbol,"成功")
         return make_stock_flex(symbol,tw["name"],tw.get("market_type","台股"),
@@ -3413,8 +3724,49 @@ def handle_message(event):
     if text=="財經新聞":
         dlog("HANDLER", "→ 財經新聞選單")
         reply_flex_with_qr(event.reply_token, make_news_menu_flex(), "財經新聞",
-            [("台股新聞","台股新聞"),("美股新聞","美股新聞"),
+            [("AI 新聞","AI新聞"),("台股新聞","台股新聞"),("美股新聞","美股新聞"),
              ("個股新聞","個股新聞"),("國際新聞","國際新聞"),("地緣政治","地緣政治新聞")])
+        return
+
+    # ══ AI 新聞解讀（v10.9.38 新增，獨立功能） ══
+    if text in ["AI新聞", "AI 新聞", "AI新聞解讀"]:
+        dlog("HANDLER", "→ AI 新聞解讀選單")
+        reply_flex(event.reply_token, make_ai_news_menu_flex(), "🤖 AI 新聞解讀")
+        return
+
+    if text == "AI台股新聞":
+        dlog("HANDLER", "→ AI 台股新聞（背景執行）")
+        reply_text(event.reply_token,
+            "⏳ AI 正在分析台股新聞...\n━━━━━━━━━━━━━━\n"
+            "🤖 Groq AI 正在進行：\n"
+            "  • 新聞去重\n  • 情緒分析（多空判讀）\n  • 影響族群分析\n\n"
+            "約 5-10 秒後將推送結果 🌸")
+        t = threading.Thread(target=build_and_push_ai_news, args=(user_id, "tw"))
+        t.daemon = True; t.start()
+        return
+
+    if text == "AI美股新聞":
+        dlog("HANDLER", "→ AI 美股新聞（背景執行）")
+        reply_text(event.reply_token,
+            "⏳ AI 正在分析美股新聞...\n━━━━━━━━━━━━━━\n"
+            "🤖 Groq AI 正在進行：\n"
+            "  • 抓取 Reuters/CNBC/Bloomberg 英文新聞\n"
+            "  • 翻譯成中文\n"
+            "  • 情緒分析（多空判讀）\n"
+            "  • 分析對台股影響\n\n"
+            "約 5-10 秒後將推送結果 🌸")
+        t = threading.Thread(target=build_and_push_ai_news, args=(user_id, "us"))
+        t.daemon = True; t.start()
+        return
+
+    if text == "AI國際新聞":
+        dlog("HANDLER", "→ AI 國際新聞（背景執行）")
+        reply_text(event.reply_token,
+            "⏳ AI 正在分析國際新聞...\n━━━━━━━━━━━━━━\n"
+            "🤖 Groq AI 正在進行新聞分析\n"
+            "約 5-10 秒後將推送結果 🌸")
+        t = threading.Thread(target=build_and_push_ai_news, args=(user_id, "global"))
+        t.daemon = True; t.start()
         return
 
     if text=="持股管理":
@@ -3906,11 +4258,11 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.36 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.38 啟動中...")
     if GROQ_AVAILABLE:
-        print(f"🤖 Groq AI：已啟用（模型 {GROQ_MODEL}）")
+        print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
-        print("⚠️ Groq AI：未設定 GROQ_API_KEY，新聞 AI 功能會降級")
+        print("⚠️ Groq AI：未設定 GROQ_API_KEY，AI 新聞功能會降級")
     for code,name in FALLBACK_NAMES.items():
         NAME_CACHE[code]=name
     t=threading.Thread(target=_bg_init); t.daemon=True; t.start()
