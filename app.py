@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.38（新增 AI 新聞解讀獨立功能：翻譯+情緒+影響台股）
+LINE Bot 模組 v10.9.39（修 TWSE ISIN 載入：處理 9MB 大檔案 + 詳細 log）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -279,37 +279,64 @@ def _load_twse_etf() -> int:
 
 
 def _load_twse_securities_list() -> int:
-    """證券基本資料（包含全部上市股票，最完整）（v10.9.27 新增）"""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for attempt in range(2):
+    """證券基本資料（包含全部上市股票 + ETF，最完整）
+    v10.9.27 新增 / v10.9.39 修正：處理 9MB 大檔案 + 加詳細 log
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9",
+    }
+    import re as _re
+    # 兩個 endpoint：上市 + 上櫃（雖然上櫃 quotes 已抓到大部分，這裡補 ETF）
+    urls = [
+        ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", "上市/ETF"),
+        ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", "上櫃/ETF"),
+    ]
+    total_added = 0
+    for url, market_label in urls:
         try:
-            # 證券編碼公告檔
-            r = requests.get("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
-                           headers=headers, timeout=20, verify=False)
-            r.encoding = "big5"
+            r = requests.get(url, headers=headers, timeout=30, verify=False, stream=False)
+            if r.status_code != 200:
+                dlog("CACHE", f"TWSE ISIN [{market_label}] HTTP {r.status_code}")
+                continue
+            r.encoding = "big5"  # 重要：必須 big5（MS950）
+            html_text = r.text
+
+            if len(html_text) < 1000:
+                dlog("CACHE", f"TWSE ISIN [{market_label}] 內容太短（{len(html_text)} 字元），跳過")
+                continue
+
             count = 0
-            # 解析 HTML 表格（簡單版）
-            import re as _re
-            rows = _re.findall(r"<tr[^>]*>(.*?)</tr>", r.text, _re.DOTALL)
+            # 抓取 <table class='h4'> 中的 <tr>
+            # 結構：<td>2330　台積電</td><td>ISIN</td><td>日期</td><td>市場別</td>...
+            rows = _re.findall(r"<tr[^>]*>(.*?)</tr>", html_text, _re.DOTALL)
             for row in rows:
                 cells = _re.findall(r"<td[^>]*>(.*?)</td>", row, _re.DOTALL)
-                if len(cells) >= 2:
-                    first = _re.sub(r"<[^>]+>","",cells[0]).strip()
-                    # 格式像「2330　台積電」或「0050　元大台灣50」
-                    parts = first.replace("\u3000", " ").split()
-                    if len(parts) >= 2:
-                        code = parts[0].strip()
-                        name = parts[1].strip()
-                        if code and name and has_chinese(name) and (code.isdigit() or code[:1].isdigit()):
-                            NAME_CACHE[code] = name
-                            count += 1
-            if count > 100:
-                dlog("CACHE", f"TWSE ISIN 證券公告：{count} 筆")
-                return count
+                if len(cells) < 2:
+                    continue
+                # 第 0 格是「2330　台積電」（全形空格 \u3000 分隔）
+                first = _re.sub(r"<[^>]+>", "", cells[0]).strip()
+                # 全形空格 + 半形空格都試
+                parts = first.replace("\u3000", " ").split()
+                if len(parts) < 2:
+                    continue
+                code = parts[0].strip()
+                name = " ".join(parts[1:]).strip()  # 名字可能含空格
+                # 條件：code 是數字 + name 包含中文
+                if code and name and has_chinese(name) and code[:1].isdigit():
+                    NAME_CACHE[code] = name
+                    count += 1
+
+            if count > 0:
+                dlog("CACHE", f"TWSE ISIN [{market_label}]：{count} 筆")
+                total_added += count
+            else:
+                dlog("CACHE", f"TWSE ISIN [{market_label}] 解析後 0 筆（HTML 結構可能改變）")
+        except requests.Timeout:
+            dlog("CACHE", f"TWSE ISIN [{market_label}] 超時（30秒）")
         except Exception as e:
-            dlog("CACHE", f"TWSE ISIN 第{attempt+1}次失敗：{e}")
-            time.sleep(2)
-    return 0
+            dlog("CACHE", f"TWSE ISIN [{market_label}] 失敗：{type(e).__name__}: {e}")
+    return total_added
 
 
 def init_name_cache():
@@ -510,7 +537,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.38 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.39 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -4258,7 +4285,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.38 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.39 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
