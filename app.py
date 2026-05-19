@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.43（除權息日曆改用 TWSE OpenAPI：解決 Render IP 被擋問題）
+LINE Bot 模組 v10.9.44（除權息日曆 headers 改簡單版：解決 JSONDecodeError）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -289,21 +289,27 @@ EX_DIVIDEND_TTL = 12 * 3600  # 12 小時更新一次
 
 
 def load_ex_dividend_calendar() -> int:
-    """載入除權息預告表（v10.9.42 新增 / v10.9.43 改用 OpenAPI）
+    """載入除權息預告表（v10.9.42 新增 / v10.9.43 改用 OpenAPI
+    / v10.9.44 修正 headers：移除 gzip 避免 Render 解壓問題）
     資料來源：TWSE OpenAPI（openapi.twse.com.tw，對 Render 友善）
     回傳載入筆數。失敗回 0，不影響其他功能。
     """
     global EX_DIVIDEND_LAST_UPDATE
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}  # v10.9.44：跟 _load_opendata 一樣的簡單 UA，避開 gzip 解壓問題
     try:
         # v10.9.43：改用 OpenAPI 版本，回傳 JSON 陣列
         url = "https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL"
         r = requests.get(url, headers=headers, timeout=15, verify=False)
         if r.status_code != 200:
             dlog("EXDIV", f"❌ OpenAPI HTTP {r.status_code}")
+            return 0
+        # v10.9.44：先看回傳內容前 200 字以便診斷（若失敗）
+        text = r.text
+        if not text or len(text) < 10:
+            dlog("EXDIV", f"❌ OpenAPI 回傳過短（{len(text)} 字元）：{text[:100]}")
+            return 0
+        if not text.strip().startswith("["):
+            dlog("EXDIV", f"❌ OpenAPI 回傳非 JSON 陣列：{text[:200]}")
             return 0
         data = r.json()
         if not isinstance(data, list):
@@ -652,7 +658,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.43 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.44 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -4420,7 +4426,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.43 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.44 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
