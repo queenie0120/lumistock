@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.44（除權息日曆 headers 改簡單版：解決 JSONDecodeError）
+LINE Bot 模組 v10.9.45（除權息 Phase 1 多層備援架構 + Phase 2 欄位預留）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -279,87 +279,237 @@ def _load_twse_etf() -> int:
 
 
 # ══════════════════════════════════════════
-#  除權息日曆（v10.9.42 新增）
-#  解決：除權息日當天 MIS 的 y 沒扣股利，導致漲跌計算錯誤
-#  資料來源：TWSE TWT48U_ALL（公開 API，不需認證）
+#  除權息日曆系統（v10.9.45 重構為多層備援架構）
+#
+#  設計理念：
+#    Lumistock 在除權息日不能誤判。
+#    不卡死在單一 API，採多層 fallback。
+#
+#  資料來源層級（後寫不覆蓋先寫）：
+#    Layer 1：TWSE OpenAPI opendata 路徑（最權威）
+#    Layer 2：TPEx OpenAPI（補上櫃股）
+#    Layer 4：EX_DIVIDEND_FALLBACK 內建表（保底）
+#    Layer 3（Phase 2 預留）：Yahoo Finance 隱含偵測
+#
+#  資料結構（含 Phase 2 預留欄位）：
+#    EX_DIVIDEND_CALENDAR[code] = {
+#        "date": "20260519",              # 除權息日（YYYYMMDD）
+#        "cash": 0.66,                    # 現金股利
+#        "stock": 0.0,                    # 股票股利（Phase 2 用）
+#        "adjusted_reference_price": None,# 除權息參考價（Phase 2 用）
+#        "source": "fallback",            # 資料來源（除錯用）
+#        "note": "",                      # 註記（如「ETF 季配息」）
+#    }
 # ══════════════════════════════════════════
-EX_DIVIDEND_CALENDAR = {}  # {stock_id: {"date": "20260519", "cash": 0.66, "stock": 0.0}}
+
+EX_DIVIDEND_CALENDAR = {}
 EX_DIVIDEND_LAST_UPDATE = 0
 EX_DIVIDEND_TTL = 12 * 3600  # 12 小時更新一次
 
 
+# ── 內建保底表（Layer 4）
+# 維護規則：
+#   1. 每月底維護一次，更新未來 30-60 天的已知除權息
+#   2. 資料來源：TWSE 公開資料 / 公司公告
+#   3. 欄位完整，含 Phase 2 預留
+#   4. 維護紀錄寫在表格上方註解
+#
+# 維護紀錄：
+#   2026/05/19 - Queenie 初始建立（v10.9.45）
+#   下次更新建議：2026/06/01（補 6 月除權息）
+EX_DIVIDEND_FALLBACK = {
+    # ─────── 2026/05 ───────
+    "00878": {"date": "20260519", "cash": 0.66, "stock": 0.0,
+              "adjusted_reference_price": None, "source": "fallback",
+              "note": "ETF 季配息"},
+    "00904": {"date": "20260519", "cash": 0.20, "stock": 0.0,
+              "adjusted_reference_price": None, "source": "fallback",
+              "note": "ETF 季配息"},
+    # TODO: 未來 30 天其他除權息（每月初手動更新）
+
+    # ─────── 2026/06 ───────（預留位置）
+    # 待 2026/06/01 從 TWSE 公開資料補入
+}
+
+
+def _load_exdiv_twse_opendata() -> int:
+    """Layer 1：TWSE OpenAPI（opendata 路徑試找除權息資料）
+
+    嘗試多個可能 endpoint：
+    - exchangeReport/TWT48U_ALL（已知會被 Render IP 擋）
+    - opendata/t187ap37 系列（待測試）
+
+    Render 環境多半失敗，所以這層失敗不影響其他層。
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    added = 0
+    endpoints = [
+        ("https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL", "TWT48U_ALL"),
+    ]
+    for url, label in endpoints:
+        try:
+            r = requests.get(url, headers=headers, timeout=10, verify=False)
+            if r.status_code != 200:
+                dlog("EXDIV", f"  [TWSE OpenAPI] {label} HTTP {r.status_code}")
+                continue
+            text = r.text
+            if not text.strip().startswith("["):
+                if "SECURITY" in text.upper():
+                    dlog("EXDIV", f"  [TWSE OpenAPI] {label} 被 IP 安全阻擋")
+                else:
+                    dlog("EXDIV", f"  [TWSE OpenAPI] {label} 回傳非 JSON：{text[:80]}")
+                continue
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                try:
+                    date_str = str(item.get("Date", "")).strip()
+                    code = str(item.get("Code", "")).strip()
+                    cash_str = str(item.get("CashDividend", "0")).replace(",", "").strip()
+                    stock_str = str(item.get("StockDividend", "0")).replace(",", "").strip()
+                    cash = float(cash_str) if cash_str and cash_str not in ("-", "") else 0.0
+                    stock = float(stock_str) if stock_str and stock_str not in ("-", "") else 0.0
+                    if len(date_str) == 7 and date_str.isdigit():
+                        yr = int(date_str[:3]) + 1911
+                        date_norm = f"{yr}{date_str[3:]}"
+                    elif len(date_str) == 8 and date_str.isdigit():
+                        date_norm = date_str
+                    else:
+                        continue
+                    if not (code and date_norm):
+                        continue
+                    if code not in EX_DIVIDEND_CALENDAR:
+                        EX_DIVIDEND_CALENDAR[code] = {
+                            "date": date_norm,
+                            "cash": cash,
+                            "stock": stock,
+                            "adjusted_reference_price": None,
+                            "source": "twse_opendata",
+                            "note": "",
+                        }
+                        added += 1
+                except: continue
+        except Exception as e:
+            dlog("EXDIV", f"  [TWSE OpenAPI] {label} 例外：{type(e).__name__}")
+    return added
+
+
+def _load_exdiv_tpex() -> int:
+    """Layer 2：TPEx OpenAPI（補上櫃股）
+
+    嘗試 endpoint：
+    - tpex_ex_dividend_announcement（除權息公告）
+
+    TPEx 對 Render 比較友善，但 endpoint 名稱要確認，所以可能失敗。
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    added = 0
+    endpoints = [
+        ("https://www.tpex.org.tw/openapi/v1/tpex_ex_dividend_announcement", "tpex_exdiv"),
+    ]
+    for url, label in endpoints:
+        try:
+            r = requests.get(url, headers=headers, timeout=10, verify=False)
+            if r.status_code != 200:
+                dlog("EXDIV", f"  [TPEx OpenAPI] {label} HTTP {r.status_code}")
+                continue
+            text = r.text
+            if not text.strip().startswith("["):
+                dlog("EXDIV", f"  [TPEx OpenAPI] {label} 回傳非 JSON：{text[:80]}")
+                continue
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                try:
+                    date_str = str(item.get("Date") or item.get("ExDate") or "").strip()
+                    code = str(item.get("Code") or item.get("StockCode") or "").strip()
+                    cash_str = str(item.get("CashDividend") or item.get("Cash") or "0").replace(",", "").strip()
+                    cash = float(cash_str) if cash_str and cash_str not in ("-", "") else 0.0
+                    date_norm = re.sub(r"[^\d]", "", date_str)
+                    if len(date_norm) == 7:
+                        yr = int(date_norm[:3]) + 1911
+                        date_norm = f"{yr}{date_norm[3:]}"
+                    if len(date_norm) != 8:
+                        continue
+                    if not (code and date_norm):
+                        continue
+                    if code not in EX_DIVIDEND_CALENDAR:
+                        EX_DIVIDEND_CALENDAR[code] = {
+                            "date": date_norm,
+                            "cash": cash,
+                            "stock": 0.0,
+                            "adjusted_reference_price": None,
+                            "source": "tpex_openapi",
+                            "note": "",
+                        }
+                        added += 1
+                except: continue
+        except Exception as e:
+            dlog("EXDIV", f"  [TPEx OpenAPI] {label} 例外：{type(e).__name__}")
+    return added
+
+
+def _load_exdiv_fallback() -> int:
+    """Layer 4：內建保底表（最穩定的最後一道防線）
+    從 EX_DIVIDEND_FALLBACK 字典載入，後寫不覆蓋前面層。
+    """
+    added = 0
+    for code, info in EX_DIVIDEND_FALLBACK.items():
+        if code not in EX_DIVIDEND_CALENDAR:
+            EX_DIVIDEND_CALENDAR[code] = dict(info)
+            added += 1
+    return added
+
+
 def load_ex_dividend_calendar() -> int:
-    """載入除權息預告表（v10.9.42 新增 / v10.9.43 改用 OpenAPI
-    / v10.9.44 修正 headers：移除 gzip 避免 Render 解壓問題）
-    資料來源：TWSE OpenAPI（openapi.twse.com.tw，對 Render 友善）
-    回傳載入筆數。失敗回 0，不影響其他功能。
+    """除權息日曆載入協調器（v10.9.45 重構）
+
+    多層備援架構：
+      Layer 1 TWSE OpenAPI    → Render 多半被擋
+      Layer 2 TPEx OpenAPI    → 補上櫃
+      Layer 4 內建保底表      → 最終防線
+
+    每層獨立執行，失敗不影響其他層。
+    後寫不覆蓋先寫（官方資料優先）。
+
+    回傳總筆數。即使所有官方層失敗，至少還有內建表保底。
     """
     global EX_DIVIDEND_LAST_UPDATE
-    headers = {"User-Agent": "Mozilla/5.0"}  # v10.9.44：跟 _load_opendata 一樣的簡單 UA，避開 gzip 解壓問題
-    try:
-        # v10.9.43：改用 OpenAPI 版本，回傳 JSON 陣列
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL"
-        r = requests.get(url, headers=headers, timeout=15, verify=False)
-        if r.status_code != 200:
-            dlog("EXDIV", f"❌ OpenAPI HTTP {r.status_code}")
-            return 0
-        # v10.9.44：先看回傳內容前 200 字以便診斷（若失敗）
-        text = r.text
-        if not text or len(text) < 10:
-            dlog("EXDIV", f"❌ OpenAPI 回傳過短（{len(text)} 字元）：{text[:100]}")
-            return 0
-        if not text.strip().startswith("["):
-            dlog("EXDIV", f"❌ OpenAPI 回傳非 JSON 陣列：{text[:200]}")
-            return 0
-        data = r.json()
-        if not isinstance(data, list):
-            dlog("EXDIV", f"❌ OpenAPI 回傳非陣列：{type(data).__name__}")
-            return 0
+    EX_DIVIDEND_CALENDAR.clear()
 
-        # OpenAPI 欄位（依官方文件）：
-        # Date（民國年月日，如 "1150519"）
-        # Code（股票代號）
-        # Name（公司名稱）
-        # Exdividend（"息"/"權"/"權息"）
-        # CashDividend（現金股利，字串）
-        # ...
-        count = 0
-        EX_DIVIDEND_CALENDAR.clear()
-        for item in data:
-            try:
-                date_str = str(item.get("Date", "")).strip()
-                code = str(item.get("Code", "")).strip()
-                cash_str = str(item.get("CashDividend", "0")).replace(",", "").strip()
-                cash = float(cash_str) if cash_str and cash_str not in ("-", "") else 0.0
-                # 民國年（7 位數）轉成西元
-                if len(date_str) == 7 and date_str.isdigit():
-                    yr = int(date_str[:3]) + 1911
-                    date_norm = f"{yr}{date_str[3:]}"
-                elif len(date_str) == 8 and date_str.isdigit():
-                    date_norm = date_str
-                else:
-                    continue
-                if not (code and date_norm):
-                    continue
-                EX_DIVIDEND_CALENDAR[code] = {
-                    "date": date_norm,
-                    "cash": cash,
-                }
-                count += 1
-            except: continue
+    dlog("EXDIV", "🌟 開始載入除權息日曆（多層備援架構）")
 
-        EX_DIVIDEND_LAST_UPDATE = int(time.time())
-        dlog("EXDIV", f"✅ 除權息日曆載入：{count} 筆")
-        return count
-    except Exception as e:
-        dlog("EXDIV", f"❌ 載入失敗：{type(e).__name__}: {e}")
-        return 0
+    l1 = _load_exdiv_twse_opendata()
+    dlog("EXDIV", f"  Layer 1 TWSE OpenAPI：{l1} 筆")
+
+    l2 = _load_exdiv_tpex()
+    dlog("EXDIV", f"  Layer 2 TPEx OpenAPI：{l2} 筆")
+
+    l4 = _load_exdiv_fallback()
+    dlog("EXDIV", f"  Layer 4 內建保底：{l4} 筆")
+
+    today = now_taipei().strftime("%Y%m%d")
+    today_count = sum(1 for info in EX_DIVIDEND_CALENDAR.values()
+                      if info.get("date") == today and info.get("cash", 0) > 0)
+
+    EX_DIVIDEND_LAST_UPDATE = int(time.time())
+    total = len(EX_DIVIDEND_CALENDAR)
+
+    if l1 == 0 and l2 == 0:
+        dlog("EXDIV", f"⚠️ 官方來源全失敗，僅用內建保底表（{total} 筆，今日 {today_count} 檔）")
+    else:
+        dlog("EXDIV", f"✅ 合併總計：{total} 筆（今日除權息：{today_count} 檔）")
+
+    return total
 
 
 def get_ex_dividend_info(stock_id: str) -> dict:
-    """查某檔股票是否「今天」是除權息日，回傳股利資訊
+    """查某檔股票是否「今天」是除權息日（v10.9.45 擴充：回傳 Phase 2 欄位）
+
     回傳 None = 今天不是除權息日
-    回傳 dict = {"cash": 0.66}（今天是除權息日）
+    回傳 dict = 完整除權息資訊（含 Phase 2 預留欄位）
     """
     if not EX_DIVIDEND_CALENDAR:
         return None
@@ -367,9 +517,21 @@ def get_ex_dividend_info(stock_id: str) -> dict:
     if not info:
         return None
     today = now_taipei().strftime("%Y%m%d")
-    if info.get("date") == today and info.get("cash", 0) > 0:
-        return {"cash": info["cash"]}
-    return None
+    if info.get("date") != today:
+        return None
+    cash = info.get("cash", 0)
+    stock = info.get("stock", 0)
+    if cash <= 0 and stock <= 0:
+        return None
+    return {
+        "cash": cash,
+        "stock": stock,
+        "adjusted_reference_price": info.get("adjusted_reference_price"),
+        "source": info.get("source", "unknown"),
+        "note": info.get("note", ""),
+        "date": info.get("date"),
+    }
+
 
 
 def _load_twse_securities_list() -> int:
@@ -658,7 +820,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.44 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.45 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -4426,7 +4588,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.44 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.45 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
