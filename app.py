@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.45（除權息 Phase 1 多層備援架構 + Phase 2 欄位預留）
+LINE Bot 模組 v10.9.46（新增除權息自動更新排程器：每天 06:00 自動更新）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -533,6 +533,64 @@ def get_ex_dividend_info(stock_id: str) -> dict:
     }
 
 
+# ══════════════════════════════════════════
+#  除權息自動更新排程器（v10.9.46 新增）
+#
+#  設計：
+#    每天台北時間 06:00 自動執行 load_ex_dividend_calendar()
+#    使用 Python 內建 threading.Timer（不需新增依賴）
+#    daemon=True：主程式結束時自動清理
+#
+#  失敗保護：
+#    一次失敗不影響下次（finally 一定排下次）
+#    Render 睡眠時排程暫停，醒來時繼續
+# ══════════════════════════════════════════
+
+_EXDIV_SCHEDULER_STARTED = False  # 防止重複啟動
+
+
+def _run_exdiv_update():
+    """執行除權息更新 + 排下一次"""
+    dlog("EXDIV-AUTO", "🔄 排程自動更新除權息日曆")
+    try:
+        load_ex_dividend_calendar()
+    except Exception as e:
+        dlog("EXDIV-AUTO", f"❌ 自動更新例外：{type(e).__name__}: {e}")
+    finally:
+        # 不管成功失敗，都排下一次（持續運作）
+        _schedule_next_exdiv_update()
+
+
+def _schedule_next_exdiv_update():
+    """計算到下一個台北時間 06:00 的秒數，設定 Timer"""
+    try:
+        now = now_taipei()
+        # 下一個 06:00（如果現在過 06:00，就是明天的 06:00）
+        next_run = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        delay_seconds = (next_run - now).total_seconds()
+        
+        timer = threading.Timer(delay_seconds, _run_exdiv_update)
+        timer.daemon = True  # 主程式結束時自動清掉
+        timer.start()
+        hours = delay_seconds / 3600
+        dlog("EXDIV-AUTO", f"⏰ 下次自動更新：{next_run.strftime('%m/%d %H:%M')}（{hours:.1f} 小時後）")
+    except Exception as e:
+        dlog("EXDIV-AUTO", f"❌ 排程設定失敗：{type(e).__name__}: {e}")
+
+
+def start_ex_dividend_scheduler():
+    """啟動除權息自動更新排程器（每天 06:00 執行一次）
+    多次呼叫只會啟動一次（防止重複）
+    """
+    global _EXDIV_SCHEDULER_STARTED
+    if _EXDIV_SCHEDULER_STARTED:
+        return
+    _EXDIV_SCHEDULER_STARTED = True
+    _schedule_next_exdiv_update()
+    dlog("EXDIV-AUTO", "✅ 除權息自動更新排程器已啟動")
+
 
 def _load_twse_securities_list() -> int:
     """證券基本資料（包含全部上市股票 + ETF，最完整）
@@ -661,6 +719,12 @@ def init_name_cache():
         load_ex_dividend_calendar()
     except Exception as e:
         dlog("EXDIV", f"❌ 啟動載入失敗：{e}")
+
+    # v10.9.46：啟動除權息自動更新排程器（每天台北時間 06:00 自動更新）
+    try:
+        start_ex_dividend_scheduler()
+    except Exception as e:
+        dlog("EXDIV-AUTO", f"❌ 排程器啟動失敗：{e}")
 
     try:
         push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
@@ -820,7 +884,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.45 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.46 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -4588,7 +4652,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.45 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.46 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
