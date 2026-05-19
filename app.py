@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.42（除權息日漲跌修正：載入 TWSE 除權息預告表 + 自動扣股利）
+LINE Bot 模組 v10.9.43（除權息日曆改用 TWSE OpenAPI：解決 Render IP 被擋問題）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -289,46 +289,51 @@ EX_DIVIDEND_TTL = 12 * 3600  # 12 小時更新一次
 
 
 def load_ex_dividend_calendar() -> int:
-    """載入除權息預告表（v10.9.42 新增）
+    """載入除權息預告表（v10.9.42 新增 / v10.9.43 改用 OpenAPI）
+    資料來源：TWSE OpenAPI（openapi.twse.com.tw，對 Render 友善）
     回傳載入筆數。失敗回 0，不影響其他功能。
     """
     global EX_DIVIDEND_LAST_UPDATE
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept": "application/json",
     }
     try:
-        url = "https://www.twse.com.tw/exchangeReport/TWT48U_ALL?response=json"
-        r = requests.get(url, headers=headers, timeout=10, verify=False)
+        # v10.9.43：改用 OpenAPI 版本，回傳 JSON 陣列
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/TWT48U_ALL"
+        r = requests.get(url, headers=headers, timeout=15, verify=False)
         if r.status_code != 200:
-            dlog("EXDIV", f"❌ TWT48U_ALL HTTP {r.status_code}")
+            dlog("EXDIV", f"❌ OpenAPI HTTP {r.status_code}")
             return 0
         data = r.json()
-        if data.get("stat") != "OK":
-            dlog("EXDIV", f"❌ TWT48U_ALL stat={data.get('stat')}")
+        if not isinstance(data, list):
+            dlog("EXDIV", f"❌ OpenAPI 回傳非陣列：{type(data).__name__}")
             return 0
 
-        # TWSE TWT48U_ALL 欄位順序（依官方文件）：
-        # 0=除權息日期, 1=股票代號, 2=名稱, 3=除權息,
-        # 4=無償配股率, 5=現金增資配股率, 6=現金增資認購價,
-        # 7=現金股利, 8=參考價, ...
+        # OpenAPI 欄位（依官方文件）：
+        # Date（民國年月日，如 "1150519"）
+        # Code（股票代號）
+        # Name（公司名稱）
+        # Exdividend（"息"/"權"/"權息"）
+        # CashDividend（現金股利，字串）
+        # ...
         count = 0
         EX_DIVIDEND_CALENDAR.clear()
-        for row in data.get("data", []):
-            if len(row) < 8:
-                continue
+        for item in data:
             try:
-                date_str = str(row[0]).strip()  # 例如「115年05月19日」或「2026/05/19」
-                code = str(row[1]).strip()
-                cash_str = str(row[7]).replace(",", "").strip()
-                cash = float(cash_str) if cash_str and cash_str != "-" else 0.0
-                # 規範化日期格式：去掉斜線、空格
-                date_norm = re.sub(r"[^\d]", "", date_str)
-                # 若是民國年（7 位數），轉成西元
-                if len(date_norm) == 7:  # 1150519
-                    yr = int(date_norm[:3]) + 1911
-                    date_norm = f"{yr}{date_norm[3:]}"
-                if not (code and date_norm and len(date_norm) == 8):
+                date_str = str(item.get("Date", "")).strip()
+                code = str(item.get("Code", "")).strip()
+                cash_str = str(item.get("CashDividend", "0")).replace(",", "").strip()
+                cash = float(cash_str) if cash_str and cash_str not in ("-", "") else 0.0
+                # 民國年（7 位數）轉成西元
+                if len(date_str) == 7 and date_str.isdigit():
+                    yr = int(date_str[:3]) + 1911
+                    date_norm = f"{yr}{date_str[3:]}"
+                elif len(date_str) == 8 and date_str.isdigit():
+                    date_norm = date_str
+                else:
+                    continue
+                if not (code and date_norm):
                     continue
                 EX_DIVIDEND_CALENDAR[code] = {
                     "date": date_norm,
@@ -647,7 +652,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.42 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.43 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -4415,7 +4420,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.42 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.43 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
