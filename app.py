@@ -1,8 +1,15 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.47（新增 FinMind 名稱來源，解決 Render 海外 IP 被 TWSE ISIN 擋的問題）
+LINE Bot 模組 v10.9.48（合規用詞改版：推薦股 → 觀察清單，強化免責聲明）
 
-【v10.9.47 更新】
+【v10.9.48 更新】
+1. 合規用詞：所有使用者可見的「推薦股 / 慧股推薦榜 / 智慧選股推薦」改為「觀察清單 / 慧股觀察榜 / 智慧選股觀察」
+2. Quick Reply 按鈕用詞同步調整（趨勢觀察 / 成長觀察 / 存股觀察 / 波段觀察 / AI概念觀察）
+3. 訊息匹配保留向後相容：舊指令「推薦股 / 趨勢股 / 成長股」等仍可觸發
+4. 每張個股卡片底部加入「⚠ 僅供參考，非投資建議」免責提示
+5. 內部 log / Sheets 紀錄同步調整，方便後續分析
+
+【v10.9.47】
 1. 新增 _load_finmind_taiwan_stock_info()：用 FinMind TaiwanStockInfo 取代被擋的 TWSE ISIN
 2. 新增環境變數 FINMIND_TOKEN（FinMind API token，可選但建議設定以提高額度）
 3. init_name_cache 載入順序：內建表 → FinMind → TPEx → TWSE ISIN（備援）→ ETF → OpenData
@@ -17,7 +24,7 @@ LINE Bot 模組 v10.9.47（新增 FinMind 名稱來源，解決 Render 海外 IP
    - richmenu_admin_mgmt.png  管理者管理頁
 2. 圖片路徑改為 static/richmenu/
 3. 新增 debug log：每筆訊息、每個 handler 都會記錄
-4. 完整保留 v10.9.20 所有功能（查股票/推薦股/新聞/權限/Sheets/Flex/Quick Reply）
+4. 完整保留 v10.9.20 所有功能（查股票/觀察清單/新聞/權限/Sheets/Flex/Quick Reply）
 """
 
 from flask import Flask, request, abort
@@ -1728,7 +1735,7 @@ def push_message(user_id: str, text: str):
                 PushMessageRequest(to=user_id, messages=[TextMessage(text=text)]))
     except: pass
 
-def push_flex(user_id: str, flex_content: dict, alt_text: str = "推薦股"):
+def push_flex(user_id: str, flex_content: dict, alt_text: str = "觀察清單"):
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(
@@ -1932,9 +1939,9 @@ def make_forex_menu_flex() -> dict:
 def make_ai_menu_flex() -> dict:
     return make_menu_flex(
         "🤖 AI 分析", "智慧選股・多維度評分", "#E89B82",
-        [("⭐ 推薦股","推薦股"), ("📈 趨勢股","趨勢股"),
-         ("🌱 成長股","成長股"), ("💰 存股","存股"),
-         ("🌊 波段股","波段股"), ("🤖 AI概念股","AI概念股")]
+        [("⭐ 觀察清單","觀察清單"), ("📈 趨勢觀察","趨勢觀察"),
+         ("🌱 成長觀察","成長觀察"), ("💰 存股觀察","存股觀察"),
+         ("🌊 波段觀察","波段觀察"), ("🤖 AI概念觀察","AI概念觀察")]
     )
 
 def make_news_menu_flex() -> dict:
@@ -3427,7 +3434,7 @@ def analyze_news_sentiment(nl:list)->dict:
 
 
 # ══════════════════════════════════════════
-#  推薦股評分
+#  觀察清單評分
 # ══════════════════════════════════════════
 def score_technical(closes:list, pct:float)->dict:
     score,signals=0,[]
@@ -3599,7 +3606,7 @@ def get_market_summary()->str:
 
 
 # ══════════════════════════════════════════
-#  推薦股 Flex
+#  觀察清單 Flex
 # ══════════════════════════════════════════
 def make_rec_card(rank:int, s:dict)->dict:
     is_up=s["pct"]>=0; color="#D97A5C" if is_up else "#7AABBE"
@@ -3642,7 +3649,8 @@ def make_rec_card(rank:int, s:dict)->dict:
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":"評分","size":"xxs","color":"#9B6B5A","flex":1},
                     {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#E89B82","weight":"bold","flex":5}
-                ]}
+                ]},
+                {"type":"text","text":"⚠ 僅供參考，非投資建議","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"}
             ]}
     }
 
@@ -3652,7 +3660,7 @@ def make_rec_flex(scored:list, mkt:dict, source_note:str)->dict:
         "type":"bubble","size":"mega",
         "header":{"type":"box","layout":"vertical","backgroundColor":"#E89B82","paddingAll":"14px",
             "contents":[
-                {"type":"text","text":"⭐ 慧股推薦榜","size":"xl","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":"⭐ 慧股觀察榜","size":"xl","color":"#FFFFFF","weight":"bold"},
                 {"type":"text","text":f"🇹🇼 台股　{now_str}","size":"xs","color":"#F0D0C0"}
             ]},
         "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"md",
@@ -3696,7 +3704,7 @@ def build_and_push_recommendation(user_id:str):
             source_note="⚠️ 法人資料不足，暫以技術面與新聞面評估"
             candidates=get_dynamic_watchlist()
         if not candidates:
-            push_message(user_id,"⭐ 推薦股\n━━━━━━━━━━━━━━\n　目前無法取得資料\n　請稍後再試"); return
+            push_message(user_id,"⭐ 觀察清單\n━━━━━━━━━━━━━━\n　目前無法取得資料\n　請稍後再試"); return
         candidates.sort(key=lambda x:x[2],reverse=True)
         scored=[]
         for sid,name,tl,fl,il in candidates[:15]:
@@ -3714,11 +3722,11 @@ def build_and_push_recommendation(user_id:str):
         scored.sort(key=lambda x:x["score"],reverse=True)
         top5=scored[:5]
         if not top5:
-            push_message(user_id,"⭐ 推薦股\n━━━━━━━━━━━━━━\n　目前無符合條件個股"); return
-        push_flex(user_id,make_rec_flex(top5,mkt,source_note),"慧股推薦榜")
+            push_message(user_id,"⭐ 觀察清單\n━━━━━━━━━━━━━━\n　目前無符合條件個股"); return
+        push_flex(user_id,make_rec_flex(top5,mkt,source_note),"慧股觀察榜")
     except Exception as e:
-        dlog("REC", f"推薦股運算失敗：{e}")
-        push_message(user_id,"⭐ 推薦股\n━━━━━━━━━━━━━━\n　系統處理中發生錯誤\n　請稍後再試")
+        dlog("REC", f"觀察清單運算失敗：{e}")
+        push_message(user_id,"⭐ 觀察清單\n━━━━━━━━━━━━━━\n　系統處理中發生錯誤\n　請稍後再試")
 
 
 # ══════════════════════════════════════════
@@ -3909,7 +3917,7 @@ HELP_MSG="""✨ 慧股拾光 Lumistock
 
 💹 外匯資金　匯率與市場分析
 
-🤖 AI分析　智慧選股推薦
+🤖 AI分析　智慧選股觀察
 
 📰 財經新聞　台股美股國際
 
@@ -4160,8 +4168,8 @@ def handle_message(event):
     if text=="AI分析":
         dlog("HANDLER", "→ AI分析選單")
         reply_flex_with_qr(event.reply_token, make_ai_menu_flex(), "AI分析",
-            [("推薦股","推薦股"),("趨勢股","趨勢股"),("成長股","成長股"),
-             ("存股","存股"),("波段股","波段股"),("AI概念股","AI概念股")])
+            [("觀察清單","觀察清單"),("趨勢觀察","趨勢觀察"),("成長觀察","成長觀察"),
+             ("存股觀察","存股觀察"),("波段觀察","波段觀察"),("AI概念觀察","AI概念觀察")])
         return
 
     if text=="財經新聞":
@@ -4242,7 +4250,7 @@ def handle_message(event):
     if text=="AI管理" and is_owner(user_id):
         dlog("HANDLER", "→ AI 管理（開發中）")
         reply_text(event.reply_token,
-            "🤖 AI 管理\n━━━━━━━━━━━━━━\n功能開發中 🚧\n\n後續版本將開放：\n　• AI 模型參數調整\n　• 推薦演算法設定\n　• 評分權重配置")
+            "🤖 AI 管理\n━━━━━━━━━━━━━━\n功能開發中 🚧\n\n後續版本將開放：\n　• AI 模型參數調整\n　• 觀察演算法設定\n　• 評分權重配置")
         return
 
     # ══ 子選單 ══
@@ -4377,21 +4385,22 @@ def handle_message(event):
             [("台積電","2330"),("聯發科","2454"),("鴻海","2317"),("廣達","2382")])
         return
 
-    # ══ AI 選股 ══
-    if text in ["推薦股","今日推薦股"]:
-        dlog("HANDLER", "→ 推薦股（背景執行）")
-        log_to_sheets(user_id,"查詢推薦股","","成功")
+    # ══ AI 選股（v10.9.48：新詞優先，舊詞保留向後相容） ══
+    if text in ["觀察清單","今日觀察","推薦股","今日推薦股"]:
+        dlog("HANDLER", "→ 觀察清單（背景執行）")
+        log_to_sheets(user_id,"查詢觀察清單","","成功")
         reply_text(event.reply_token,
-              "⭐ 推薦股分析中...\n━━━━━━━━━━━━━━\n"
-              "正在整合法人籌碼、技術面、新聞情緒\n約 15～30 秒後將推送結果 📊")
+              "⭐ 觀察清單分析中...\n━━━━━━━━━━━━━━\n"
+              "正在整合法人籌碼、技術面、新聞情緒\n約 15～30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議")
         t=threading.Thread(target=build_and_push_recommendation,args=(user_id,))
         t.daemon=True; t.start()
         return
 
-    if text in ["趨勢股","成長股","存股","波段股","AI概念股"]:
+    if text in ["趨勢觀察","成長觀察","存股觀察","波段觀察","AI概念觀察",
+                "趨勢股","成長股","存股","波段股","AI概念股"]:
         reply_text(event.reply_token,
             f"🤖 {text} 分析功能開發中...\n━━━━━━━━━━━━━━\n"
-            f"目前請使用「推薦股」功能\n後續版本將加入更多 AI 分析類別 🚀")
+            f"目前請使用「觀察清單」功能\n後續版本將加入更多 AI 分析類別 🚀")
         return
 
     # ══ Owner 專屬指令 ══
