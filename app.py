@@ -1,6 +1,6 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.41（新增內建名稱表 stock_names.py：2,352 筆，永久穩定）
+LINE Bot 模組 v10.9.42（除權息日漲跌修正：載入 TWSE 除權息預告表 + 自動扣股利）
 
 【本次更新】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
@@ -278,6 +278,89 @@ def _load_twse_etf() -> int:
     return 0
 
 
+# ══════════════════════════════════════════
+#  除權息日曆（v10.9.42 新增）
+#  解決：除權息日當天 MIS 的 y 沒扣股利，導致漲跌計算錯誤
+#  資料來源：TWSE TWT48U_ALL（公開 API，不需認證）
+# ══════════════════════════════════════════
+EX_DIVIDEND_CALENDAR = {}  # {stock_id: {"date": "20260519", "cash": 0.66, "stock": 0.0}}
+EX_DIVIDEND_LAST_UPDATE = 0
+EX_DIVIDEND_TTL = 12 * 3600  # 12 小時更新一次
+
+
+def load_ex_dividend_calendar() -> int:
+    """載入除權息預告表（v10.9.42 新增）
+    回傳載入筆數。失敗回 0，不影響其他功能。
+    """
+    global EX_DIVIDEND_LAST_UPDATE
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    try:
+        url = "https://www.twse.com.tw/exchangeReport/TWT48U_ALL?response=json"
+        r = requests.get(url, headers=headers, timeout=10, verify=False)
+        if r.status_code != 200:
+            dlog("EXDIV", f"❌ TWT48U_ALL HTTP {r.status_code}")
+            return 0
+        data = r.json()
+        if data.get("stat") != "OK":
+            dlog("EXDIV", f"❌ TWT48U_ALL stat={data.get('stat')}")
+            return 0
+
+        # TWSE TWT48U_ALL 欄位順序（依官方文件）：
+        # 0=除權息日期, 1=股票代號, 2=名稱, 3=除權息,
+        # 4=無償配股率, 5=現金增資配股率, 6=現金增資認購價,
+        # 7=現金股利, 8=參考價, ...
+        count = 0
+        EX_DIVIDEND_CALENDAR.clear()
+        for row in data.get("data", []):
+            if len(row) < 8:
+                continue
+            try:
+                date_str = str(row[0]).strip()  # 例如「115年05月19日」或「2026/05/19」
+                code = str(row[1]).strip()
+                cash_str = str(row[7]).replace(",", "").strip()
+                cash = float(cash_str) if cash_str and cash_str != "-" else 0.0
+                # 規範化日期格式：去掉斜線、空格
+                date_norm = re.sub(r"[^\d]", "", date_str)
+                # 若是民國年（7 位數），轉成西元
+                if len(date_norm) == 7:  # 1150519
+                    yr = int(date_norm[:3]) + 1911
+                    date_norm = f"{yr}{date_norm[3:]}"
+                if not (code and date_norm and len(date_norm) == 8):
+                    continue
+                EX_DIVIDEND_CALENDAR[code] = {
+                    "date": date_norm,
+                    "cash": cash,
+                }
+                count += 1
+            except: continue
+
+        EX_DIVIDEND_LAST_UPDATE = int(time.time())
+        dlog("EXDIV", f"✅ 除權息日曆載入：{count} 筆")
+        return count
+    except Exception as e:
+        dlog("EXDIV", f"❌ 載入失敗：{type(e).__name__}: {e}")
+        return 0
+
+
+def get_ex_dividend_info(stock_id: str) -> dict:
+    """查某檔股票是否「今天」是除權息日，回傳股利資訊
+    回傳 None = 今天不是除權息日
+    回傳 dict = {"cash": 0.66}（今天是除權息日）
+    """
+    if not EX_DIVIDEND_CALENDAR:
+        return None
+    info = EX_DIVIDEND_CALENDAR.get(stock_id)
+    if not info:
+        return None
+    today = now_taipei().strftime("%Y%m%d")
+    if info.get("date") == today and info.get("cash", 0) > 0:
+        return {"cash": info["cash"]}
+    return None
+
+
 def _load_twse_securities_list() -> int:
     """證券基本資料（包含全部上市股票 + ETF，最完整）
     v10.9.27 新增 / v10.9.39 修正：處理 9MB 大檔案
@@ -399,6 +482,13 @@ def init_name_cache():
     total = len(NAME_CACHE)
     new_loaded = total - initial_size
     dlog("CACHE", f"✅ 名稱快取完整載入：{total} 筆（本次新增 {new_loaded} 筆）")
+
+    # v10.9.42：順便載入除權息日曆（失敗不影響其他功能）
+    try:
+        load_ex_dividend_calendar()
+    except Exception as e:
+        dlog("EXDIV", f"❌ 啟動載入失敗：{e}")
+
     try:
         push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
     except: pass
@@ -557,7 +647,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.41 - 5張圖 Alias)")
+    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.42 - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -2104,6 +2194,17 @@ def get_tw_stock(stock_id: str) -> dict:
             if z not in ["-","","0",None]: price=float(z); is_rt=True
             else: price=prev; is_rt=False
             chg=price-prev; pct=chg/prev*100 if prev else 0
+
+            # v10.9.42：除權息日當天，MIS 的 y（昨收）沒扣股利，需修正
+            ex_div = get_ex_dividend_info(stock_id)
+            if ex_div:
+                cash = ex_div["cash"]
+                # 除息參考價 = 昨收 - 現金股利
+                ref_price = prev - cash
+                chg = price - ref_price
+                pct = chg/ref_price*100 if ref_price else 0
+                dlog("EXDIV", f"{stock_id} 今日除息 {cash} 元，修正漲跌：{price}-{ref_price:.2f}={chg:+.2f}({pct:+.2f}%)")
+
             if has_chinese(raw_name): NAME_CACHE[stock_id]=raw_name; name=raw_name
             else:
                 name=NAME_CACHE.get(stock_id,"")
@@ -2121,9 +2222,13 @@ def get_tw_stock(stock_id: str) -> dict:
             open_v="N/A" if open_v in ["-","","0"] else open_v
             high_v="N/A" if high_v in ["-","","0"] else high_v
             low_v ="N/A" if low_v  in ["-","","0"] else low_v
-            return {"name":name,"price":price,"chg":chg,"pct":pct,
+            result = {"name":name,"price":price,"chg":chg,"pct":pct,
                     "open":open_v,"high":high_v,"low":low_v,"vol":vol_str,
                     "market_type":"台股","status":"盤中" if is_rt else "試撮","source":"TWSE 即時"}
+            # v10.9.42：除權息日，傳遞給 UI 顯示
+            if ex_div:  # ex_div 在上方計算 chg 時已賦值（None 或 dict）
+                result["ex_dividend"] = ex_div["cash"]
+            return result
         except: pass
 
     try:
@@ -3368,7 +3473,7 @@ def make_ma_row(label,value):
 
 def make_stock_flex(symbol,name,market_type,status,source,
                     price,chg,pct,open_p,high,low,vol,
-                    kline,news_list,query_time):
+                    kline,news_list,query_time,ex_dividend=None):
     is_up=chg>=0; color="#D97A5C" if is_up else "#7AABBE"
     arrow="▲" if is_up else "▼"; sign="+" if is_up else ""
     spark=kline.get("spark","▄▄▄▄▄▄▄▄▄▄"); trend=kline.get("trend","--")
@@ -3423,6 +3528,10 @@ def make_stock_flex(symbol,name,market_type,status,source,
                     {"type":"text","text":f"{price:.2f}","size":"3xl","weight":"bold","color":color},
                     {"type":"text","text":f"{arrow} {abs(chg):.2f}　{sign}{pct:.2f}%","size":"sm","color":color}
                 ]},
+                # v10.9.42：除權息日提醒
+                *([{"type":"box","layout":"horizontal","backgroundColor":"#FAE6DE","cornerRadius":"6px","paddingAll":"8px","contents":[
+                    {"type":"text","text":f"💰 今日除息 {ex_dividend} 元（漲跌已修正）","size":"xs","color":"#A05A48","weight":"bold","wrap":True}
+                ]}] if ex_dividend else []),
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"box","layout":"vertical","flex":1,"contents":[
@@ -3486,7 +3595,8 @@ def get_stock_flex(symbol:str, user_id:str="")->tuple:
                                tw.get("status",""),tw.get("source",""),
                                tw["price"],tw["chg"],tw["pct"],
                                tw.get("open","N/A"),tw["high"],tw["low"],tw["vol"],
-                               kline,news,query_time),None
+                               kline,news,query_time,
+                               ex_dividend=tw.get("ex_dividend")),None
     else:
         us=get_us_stock(symbol)
         if not us: return None,f"查無此股票：{symbol}\n請確認代碼是否正確"
@@ -4305,7 +4415,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.41 啟動中...")
+    print("慧股拾光 Lumistock LINE Bot v10.9.42 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
