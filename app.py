@@ -1,8 +1,14 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.46（新增除權息自動更新排程器：每天 06:00 自動更新）
+LINE Bot 模組 v10.9.47（新增 FinMind 名稱來源，解決 Render 海外 IP 被 TWSE ISIN 擋的問題）
 
-【本次更新】
+【v10.9.47 更新】
+1. 新增 _load_finmind_taiwan_stock_info()：用 FinMind TaiwanStockInfo 取代被擋的 TWSE ISIN
+2. 新增環境變數 FINMIND_TOKEN（FinMind API token，可選但建議設定以提高額度）
+3. init_name_cache 載入順序：內建表 → FinMind → TPEx → TWSE ISIN（備援）→ ETF → OpenData
+4. TWSE ISIN 保留為備援（海外 IP 通常會回 "FOR SECURITY REASONS..."）
+
+【v10.9.46】
 1. Rich Menu 從 3 張圖升級為 5 張圖 Alias 切換
    - richmenu_user.png      一般用戶（玫瑰金）
    - richmenu_owner_main.png  Owner 主頁（粉白少女）
@@ -39,6 +45,7 @@ CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
 SHEETS_ID            = os.environ.get("GOOGLE_SHEETS_ID")
+FINMIND_TOKEN        = os.environ.get("FINMIND_TOKEN", "")
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(CHANNEL_SECRET)
@@ -592,6 +599,47 @@ def start_ex_dividend_scheduler():
     dlog("EXDIV-AUTO", "✅ 除權息自動更新排程器已啟動")
 
 
+def _load_finmind_taiwan_stock_info() -> int:
+    """FinMind TaiwanStockInfo：全市場股票名稱對照（上市+上櫃，約 4100 筆）
+    解決 Render 海外 IP 被 TWSE ISIN 擋住的問題。
+    免費版即可用；無 token 也能呼叫（但有額度限制，建議設環境變數 FINMIND_TOKEN）。
+    """
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {"dataset": "TaiwanStockInfo"}
+    if FINMIND_TOKEN:
+        params["token"] = FINMIND_TOKEN
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code != 200:
+            dlog("CACHE", f"FinMind StockInfo HTTP {r.status_code}")
+            return 0
+        payload = r.json()
+        if payload.get("status") != 200:
+            dlog("CACHE", f"FinMind StockInfo 回應錯誤：{payload.get('msg','')[:120]}")
+            return 0
+        data = payload.get("data") or []
+        added = 0
+        for row in data:
+            code = (row.get("stock_id") or "").strip()
+            name = (row.get("stock_name") or "").strip()
+            if not code or not name:
+                continue
+            if not code[:1].isdigit():
+                continue
+            if not has_chinese(name):
+                continue
+            if not has_chinese(NAME_CACHE.get(code, "")):
+                NAME_CACHE[code] = name
+                added += 1
+        dlog("CACHE", f"FinMind StockInfo：{len(data)} 筆原始 / 新增 {added} 筆")
+        return added
+    except requests.Timeout:
+        dlog("CACHE", "FinMind StockInfo 超時（30秒）")
+    except Exception as e:
+        dlog("CACHE", f"FinMind StockInfo 失敗：{type(e).__name__}: {e}")
+    return 0
+
+
 def _load_twse_securities_list() -> int:
     """證券基本資料（包含全部上市股票 + ETF，最完整）
     v10.9.27 新增 / v10.9.39 修正：處理 9MB 大檔案
@@ -682,10 +730,11 @@ def init_name_cache():
     except Exception as e:
         dlog("CACHE", f"⚠️ 內建名稱表載入失敗：{e}（會 fallback 用 API）")
 
-    # ── 主要來源（穩定）
+    # ── 主要來源（v10.9.47：FinMind 取代被 IP 擋住的 TWSE ISIN）
+    _load_finmind_taiwan_stock_info()  # FinMind 全市場 ~4100 筆（海外 IP 可用）
     _load_tpex_quotes()              # TPEx 上櫃報價（含名稱）— 1004 筆
     _load_tpex_emerging()            # 興櫃 — 347 筆
-    _load_twse_securities_list()     # TWSE ISIN 證券公告檔
+    _load_twse_securities_list()     # TWSE ISIN（海外 IP 通常被擋，保留為備援）
 
     # ── ETF 補充（v10.9.37 還原，快速失敗模式）
     _load_twse_etf()                 # 失敗會安靜略過
