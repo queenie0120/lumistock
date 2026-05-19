@@ -1,8 +1,15 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.48（合規用詞改版：推薦股 → 觀察清單，強化免責聲明）
+LINE Bot 模組 v10.9.49（資料來源 metadata 系統 PR #2A：台股查詢）
 
-【v10.9.48 更新】
+【v10.9.49 更新】
+1. 新增 VERSION 常數，啟動 log 不再寫死版號
+2. 新增 build_data_meta() / fmt_data_meta() 統一資料來源描述格式
+3. get_tw_stock() 各層回傳 meta 欄位（source / is_realtime / is_fallback / delay_min / fetched_at）
+4. make_stock_flex() 卡片底部加 metadata 行：主來源/備援標示、即時/延遲標示
+5. 解決使用者願景紅線之一：資料抓不到要誠實顯示，資料來源/時間/延遲要透明
+
+【v10.9.48】
 1. 合規用詞：所有使用者可見的「推薦股 / 慧股推薦榜 / 智慧選股推薦」改為「觀察清單 / 慧股觀察榜 / 智慧選股觀察」
 2. Quick Reply 按鈕用詞同步調整（趨勢觀察 / 成長觀察 / 存股觀察 / 波段觀察 / AI概念觀察）
 3. 訊息匹配保留向後相容：舊指令「推薦股 / 趨勢股 / 成長股」等仍可觸發
@@ -48,6 +55,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
+VERSION              = "10.9.49"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -86,6 +94,40 @@ def is_after_close() -> bool:
     if now.weekday() >= 5:
         return True
     return now.hour * 60 + now.minute >= 930
+
+
+# ══════════════════════════════════════════
+#  資料來源 metadata 系統（v10.9.49）
+#  讓每筆給使用者看到的資料都帶來源 / 時間 / 延遲 / 是否備援
+# ══════════════════════════════════════════
+def build_data_meta(source: str, is_realtime: bool = False,
+                    is_fallback: bool = False, delay_min: int = 0) -> dict:
+    """建立統一的資料來源 metadata。所有對外資料來源回傳值都帶這個欄位。"""
+    return {
+        "source": source,
+        "is_realtime": is_realtime,
+        "is_fallback": is_fallback,
+        "delay_min": delay_min,
+        "fetched_at": now_taipei().strftime("%m/%d %H:%M"),
+    }
+
+def fmt_data_meta(meta: dict) -> str:
+    """格式化 metadata 成單行文字，用於 UI 顯示。
+    範例：
+        ✓ 主來源 ‧ 即時資料
+        ✓ 主來源 ‧ 收盤資料
+        ⚠ 備援來源 ‧ 延遲約 15 分
+    """
+    if not isinstance(meta, dict):
+        return ""
+    tag = "⚠ 備援來源" if meta.get("is_fallback") else "✓ 主來源"
+    if meta.get("is_realtime"):
+        state = "即時資料"
+    elif meta.get("delay_min", 0) > 0:
+        state = f"延遲約 {meta['delay_min']} 分"
+    else:
+        state = "收盤資料"
+    return f"{tag} ‧ {state}"
 
 def format_us_volume(v) -> str:
     if v in ["-", "", None, "N/A", 0]: return "N/A"
@@ -940,7 +982,7 @@ RICH_MENU_IDS = {}
 
 def setup_rich_menus():
     global RICH_MENU_IDS
-    dlog("RICHMENU", "🌸 開始建立 Rich Menu (v10.9.46 - 5張圖 Alias)")
+    dlog("RICHMENU", f"🌸 開始建立 Rich Menu (v{VERSION} - 5張圖 Alias)")
     _delete_all_aliases()
     _delete_all_rich_menus()
     base_url = "https://raw.githubusercontent.com/queenie0120/lumistock/main/static/richmenu"
@@ -2517,7 +2559,8 @@ def get_tw_stock(stock_id: str) -> dict:
             low_v ="N/A" if low_v  in ["-","","0"] else low_v
             result = {"name":name,"price":price,"chg":chg,"pct":pct,
                     "open":open_v,"high":high_v,"low":low_v,"vol":vol_str,
-                    "market_type":"台股","status":"盤中" if is_rt else "試撮","source":"TWSE 即時"}
+                    "market_type":"台股","status":"盤中" if is_rt else "試撮","source":"TWSE 即時",
+                    "meta": build_data_meta("TWSE MIS", is_realtime=is_rt, is_fallback=False, delay_min=0)}
             # v10.9.42：除權息日，傳遞給 UI 顯示
             if ex_div:  # ex_div 在上方計算 chg 時已賦值（None 或 dict）
                 result["ex_dividend"] = ex_div["cash"]
@@ -2540,7 +2583,8 @@ def get_tw_stock(stock_id: str) -> dict:
             return {"name":name,"price":price,"chg":chg,"pct":pct,
                     "open":last[3].replace(",",""),"high":last[4].replace(",",""),
                     "low":last[5].replace(",",""),"vol":vol_str,
-                    "market_type":"台股","status":"收盤","source":"TWSE"}
+                    "market_type":"台股","status":"收盤","source":"TWSE",
+                    "meta": build_data_meta("TWSE 日線", is_realtime=False, is_fallback=True, delay_min=0)}
     except: pass
 
     try:
@@ -2562,7 +2606,8 @@ def get_tw_stock(stock_id: str) -> dict:
                     "open":last[5].replace(",","") if len(last)>5 else "N/A",
                     "high":last[6].replace(",","") if len(last)>6 else "N/A",
                     "low":last[7].replace(",","") if len(last)>7 else "N/A","vol":vol_str,
-                    "market_type":"台股","status":"收盤","source":"TPEx"}
+                    "market_type":"台股","status":"收盤","source":"TPEx",
+                    "meta": build_data_meta("TPEx 日線", is_realtime=False, is_fallback=True, delay_min=0)}
     except: pass
 
     for suffix in [".TW",".TWO"]:
@@ -2587,7 +2632,8 @@ def get_tw_stock(stock_id: str) -> dict:
                     "open":f"{opens[-1]:.2f}" if opens else "N/A",
                     "high":f"{highs[-1]:.2f}" if highs else "N/A",
                     "low":f"{lows[-1]:.2f}" if lows else "N/A","vol":vol_str,
-                    "market_type":"台股","status":"收盤","source":"Yahoo Finance"}
+                    "market_type":"台股","status":"收盤","source":"Yahoo Finance",
+                    "meta": build_data_meta("Yahoo Finance", is_realtime=False, is_fallback=True, delay_min=15)}
         except: pass
     return None
 
@@ -3767,7 +3813,7 @@ def make_ma_row(label,value):
 
 def make_stock_flex(symbol,name,market_type,status,source,
                     price,chg,pct,open_p,high,low,vol,
-                    kline,news_list,query_time,ex_dividend=None):
+                    kline,news_list,query_time,ex_dividend=None,meta=None):
     is_up=chg>=0; color="#D97A5C" if is_up else "#7AABBE"
     arrow="▲" if is_up else "▼"; sign="+" if is_up else ""
     spark=kline.get("spark","▄▄▄▄▄▄▄▄▄▄"); trend=kline.get("trend","--")
@@ -3866,7 +3912,13 @@ def make_stock_flex(symbol,name,market_type,status,source,
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":f"🕐 {query_time}　{status}","size":"xxs","color":"#E8B8A8","flex":1},
                     {"type":"text","text":source,"size":"xxs","color":"#D4B0A0","align":"end","flex":1}
-                ]}
+                ]},
+                # v10.9.49：資料來源 metadata（主來源/備援、即時/延遲）
+                *([{"type":"text",
+                    "text":f"📡 {fmt_data_meta(meta)}",
+                    "size":"xxs",
+                    "color":"#B89BC4" if meta.get("is_fallback") else "#C9A89A",
+                    "align":"start","margin":"xs"}] if isinstance(meta, dict) else [])
             ]}
     }
 
@@ -3890,7 +3942,8 @@ def get_stock_flex(symbol:str, user_id:str="")->tuple:
                                tw["price"],tw["chg"],tw["pct"],
                                tw.get("open","N/A"),tw["high"],tw["low"],tw["vol"],
                                kline,news,query_time,
-                               ex_dividend=tw.get("ex_dividend")),None
+                               ex_dividend=tw.get("ex_dividend"),
+                               meta=tw.get("meta")),None
     else:
         us=get_us_stock(symbol)
         if not us: return None,f"查無此股票：{symbol}\n請確認代碼是否正確"
@@ -4710,7 +4763,7 @@ def handle_message(event):
 
 
 if __name__=="__main__":
-    print("慧股拾光 Lumistock LINE Bot v10.9.46 啟動中...")
+    print(f"慧股拾光 Lumistock LINE Bot v{VERSION} 啟動中...")
     if GROQ_AVAILABLE:
         print(f"🤖 Groq AI：已啟用（AI 新聞解讀功能可用）")
     else:
