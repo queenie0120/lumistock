@@ -1,8 +1,17 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.49（資料來源 metadata 系統 PR #2A：台股查詢）
+LINE Bot 模組 v10.9.50（修：櫃買指數等 Yahoo 指數報價錯誤）
 
-【v10.9.49 更新】
+【v10.9.50 更新】
+1. 修正 get_yahoo_quote：偵測 regularMarketPrice 過時或異常時改用日線 close
+   - 觸發：櫃買指數 ^TWOII 的 regularMarketPrice 卡在 2024-10-12 舊值 269.45，
+     但實際近日收盤是 400+，導致漲跌幅出現 -34% 等荒謬數字
+   - 修法：rmp 與 latest_close 差 > 5% 或時間 > 24hr 前 → 改用 close 並標記為備援
+   - 影響所有 Yahoo 指數/商品/外匯查詢，但僅在 Yahoo 給出異常資料時生效
+2. get_yahoo_quote 回傳值同步加入 meta 欄位
+3. 加 dlog 警告，方便日後追蹤類似問題
+
+【v10.9.49】
 1. 新增 VERSION 常數，啟動 log 不再寫死版號
 2. 新增 build_data_meta() / fmt_data_meta() 統一資料來源描述格式
 3. get_tw_stock() 各層回傳 meta 欄位（source / is_realtime / is_fallback / delay_min / fetched_at）
@@ -55,7 +64,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.49"
+VERSION              = "10.9.50"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2379,21 +2388,66 @@ def make_yield_analysis_flex(data: dict) -> dict:
     }
 
 def get_yahoo_quote(symbol: str) -> dict:
+    """抓 Yahoo Finance 指數/商品/外匯報價。
+    v10.9.50：加入自我防禦——某些指數（例如 ^TWOII 櫃買指數）的 regularMarketPrice
+    Yahoo 會卡在過期的舊值（甚至 1 年以上前），導致漲跌幅算出 -34% 等荒謬數字。
+    防禦策略：當 regularMarketPrice 跟最近日線收盤偏離 > 5% 或時間 > 24 小時前，
+    視為過時資料，改用 close 陣列的最新值。
+    """
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=10d"
         r   = requests.get(url, headers=headers, timeout=10)
         result = r.json()["chart"]["result"][0]
         meta   = result["meta"]
         quotes = result.get("indicators",{}).get("quote",[{}])[0]
         closes = [c for c in quotes.get("close",[]) if c is not None]
         ms     = meta.get("marketState","")
-        price  = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
-        prev   = closes[-2] if len(closes)>=2 else price
+
+        rmp = meta.get("regularMarketPrice")
+        rmt = meta.get("regularMarketTime", 0)
+        latest_close = closes[-1] if closes else 0
+
+        # 偵測 regularMarketPrice 是否過時或異常
+        is_stale  = False
+        is_outlier = False
+        try:
+            if rmt:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                is_stale = (now_ts - float(rmt)) > 86400  # 超過 24 小時
+            if rmp and latest_close:
+                is_outlier = abs(float(rmp) - latest_close) / latest_close > 0.05
+        except: pass
+
+        meta_source = "Yahoo Finance"
+        meta_is_realtime = False
+        meta_is_fallback = False
+        meta_delay_min = 15
+
+        if rmp and not is_stale and not is_outlier:
+            price = float(rmp)
+            meta_is_realtime = (ms == "REGULAR")
+            meta_delay_min = 0 if meta_is_realtime else 15
+        else:
+            price = latest_close
+            meta_is_fallback = True
+            meta_source = "Yahoo Finance（日線備援）"
+            if rmp and (is_stale or is_outlier):
+                dlog("YAHOO", f"⚠️ {symbol} regularMarketPrice 異常（rmp={rmp}, latest_close={latest_close}, stale={is_stale}, outlier={is_outlier}）→ 改用日線 close")
+
+        prev   = closes[-2] if len(closes) >= 2 else price
         chg    = price - prev
         pct    = chg / prev * 100 if prev else 0
-        return {"price":price,"chg":chg,"pct":pct,"ms":ms}
-    except: return {}
+        return {
+            "price":price, "chg":chg, "pct":pct, "ms":ms,
+            "meta": build_data_meta(meta_source,
+                                    is_realtime=meta_is_realtime,
+                                    is_fallback=meta_is_fallback,
+                                    delay_min=meta_delay_min),
+        }
+    except Exception as e:
+        dlog("YAHOO", f"get_yahoo_quote({symbol}) 失敗：{type(e).__name__}: {e}")
+        return {}
 
 def make_quote_flex(name: str, data: dict, color: str = "#5B8DB8") -> dict:
     if not data: return None
