@@ -1,6 +1,26 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.58（個股新聞 carousel — 從財經新聞→個股新聞→輸入代號 → 10 則新聞）
+LINE Bot 模組 v10.9.59（A 計畫：除權息 + 三大法人 + 還原股價 全部接 FinMind）
+
+【v10.9.59 三大改動】
+
+1. 除權息 → FinMind 主來源（_load_exdiv_finmind）
+   - 抓近 180 天公告，篩「除息/除權日 ≥ 今天-1」的資料
+   - 之前 4 層 fallback（TWSE OpenAPI / TPEx / 內建 2 筆）降為備援
+   - 觸及願景紅線：除權息日防誤判
+
+2. 三大法人 → FinMind 主來源（_fetch_finmind_institution）
+   - 聚合 Foreign_Investor + Foreign_Dealer_Self → 外資
+   - Investment_Trust → 投信
+   - 之前 TWSE T86 endpoint（海外 IP 可能被擋）降為備援
+   - 觀察清單評分立刻變更穩
+
+3. K 線收盤序列 → FinMind 還原股價（_load_finmind_closes_adj）
+   - TaiwanStockPriceAdj 已扣除權息影響
+   - 之前 Yahoo（未還原，除權息日會跳水）降為備援
+   - 觸及願景紅線：K 線防誤判
+
+【v10.9.58】個股新聞 carousel
 
 【v10.9.58 更新】
 1. 新增 get_finmind_news_enriched()：回傳完整 dict（含 date / source / link / title），近 14 天
@@ -156,7 +176,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.58"
+VERSION              = "10.9.59"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -690,6 +710,80 @@ EX_DIVIDEND_FALLBACK = {
 }
 
 
+def _load_exdiv_finmind() -> int:
+    """Layer 0：FinMind TaiwanStockDividend（v10.9.59 新增主來源）
+    付費 Backer tier 已包含此 dataset。
+    抓近 180 天的公告，挑「除息/除權交易日 ≥ 今天-1 天」的資料，
+    涵蓋今日 + 未來 60-90 天的除權息。
+    """
+    if not FINMIND_TOKEN:
+        return 0
+    now = now_taipei()
+    start_date = (now - timedelta(days=180)).strftime("%Y-%m-%d")
+    end_date   = (now + timedelta(days=60)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockDividend",
+        "start_date": start_date,
+        "end_date": end_date,
+        "token": FINMIND_TOKEN,
+    }
+    added = 0
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code != 200:
+            dlog("EXDIV", f"  [FinMind] HTTP {r.status_code}")
+            record_health("FinMind", False, f"Dividend HTTP {r.status_code}")
+            return 0
+        payload = r.json()
+        if payload.get("status") != 200:
+            dlog("EXDIV", f"  [FinMind] {payload.get('msg','')[:80]}")
+            record_health("FinMind", False, f"Dividend {payload.get('msg','')[:80]}")
+            return 0
+        rows = payload.get("data") or []
+        record_health("FinMind", True)
+        today_dt = now.replace(hour=0,minute=0,second=0,microsecond=0) - timedelta(days=1)
+        for row in rows:
+            try:
+                code = str(row.get("stock_id","")).strip()
+                if not code:
+                    continue
+                cash  = float(row.get("CashEarningsDistribution", 0) or 0)
+                stock = float(row.get("StockEarningsDistribution", 0) or 0)
+                if cash <= 0 and stock <= 0:
+                    continue
+                # 優先用現金除息日；無則用股票除權日
+                date_str = (row.get("CashExDividendTradingDate") or row.get("StockExDividendTradingDate") or "").strip()
+                if not date_str or "-" not in date_str:
+                    continue
+                # 「2025-04-18」→「20250418」
+                try:
+                    parts = date_str.split("-")
+                    yr, mo, dy = int(parts[0]), int(parts[1]), int(parts[2])
+                    ex_dt = datetime(yr, mo, dy, tzinfo=TZ_TAIPEI)
+                except: continue
+                # 只保留「今天 -1 天」以後的（過時的不要）
+                if ex_dt < today_dt:
+                    continue
+                date_norm = f"{yr:04d}{mo:02d}{dy:02d}"
+                if code not in EX_DIVIDEND_CALENDAR:
+                    EX_DIVIDEND_CALENDAR[code] = {
+                        "date": date_norm,
+                        "cash": cash,
+                        "stock": stock,
+                        "adjusted_reference_price": None,
+                        "source": "finmind",
+                        "note": f"年度 {row.get('year','')}",
+                    }
+                    added += 1
+            except: continue
+        return added
+    except Exception as e:
+        dlog("EXDIV", f"  [FinMind] 例外：{type(e).__name__}: {e}")
+        record_health("FinMind", False, f"Dividend {type(e).__name__}")
+        return 0
+
+
 def _load_exdiv_twse_opendata() -> int:
     """Layer 1：TWSE OpenAPI（opendata 路徑試找除權息資料）
 
@@ -837,7 +931,11 @@ def load_ex_dividend_calendar() -> int:
     global EX_DIVIDEND_LAST_UPDATE
     EX_DIVIDEND_CALENDAR.clear()
 
-    dlog("EXDIV", "🌟 開始載入除權息日曆（多層備援架構）")
+    dlog("EXDIV", "🌟 開始載入除權息日曆（多層備援架構 v10.9.59）")
+
+    # v10.9.59：Layer 0 FinMind 變成主來源（你已付費 Backer tier）
+    l0 = _load_exdiv_finmind()
+    dlog("EXDIV", f"  Layer 0 FinMind：{l0} 筆")
 
     l1 = _load_exdiv_twse_opendata()
     dlog("EXDIV", f"  Layer 1 TWSE OpenAPI：{l1} 筆")
@@ -855,8 +953,8 @@ def load_ex_dividend_calendar() -> int:
     EX_DIVIDEND_LAST_UPDATE = int(time.time())
     total = len(EX_DIVIDEND_CALENDAR)
 
-    if l1 == 0 and l2 == 0:
-        dlog("EXDIV", f"⚠️ 官方來源全失敗，僅用內建保底表（{total} 筆，今日 {today_count} 檔）")
+    if l0 == 0 and l1 == 0 and l2 == 0:
+        dlog("EXDIV", f"⚠️ 所有官方來源全失敗，僅用內建保底表（{total} 筆，今日 {today_count} 檔）")
     else:
         dlog("EXDIV", f"✅ 合併總計：{total} 筆（今日除權息：{today_count} 檔）")
 
@@ -3325,8 +3423,53 @@ def get_kline_analysis(closes: list) -> dict:
             "ma5":ma5,"ma20":ma20,"ma60":ma60,"ma120":ma120,"ma240":ma240,
             "rsi":rsi,"rsi_label":rl}
 
+def _load_finmind_closes_adj(stock_id: str) -> list:
+    """v10.9.59：用 FinMind TaiwanStockPriceAdj 抓還原股價收盤序列（近 1 年）。
+    還原股價已扣除權息影響，K 線分析（均線/RSI）不會因除權息日出現大幅跳水誤判。
+    """
+    if not FINMIND_TOKEN:
+        return []
+    end_date   = now_taipei().strftime("%Y-%m-%d")
+    start_date = (now_taipei() - timedelta(days=400)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockPriceAdj",
+        "data_id": stock_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            record_health("FinMind", False, f"PriceAdj HTTP {r.status_code}")
+            return []
+        payload = r.json()
+        if payload.get("status") != 200:
+            return []
+        rows = payload.get("data") or []
+        if not rows:
+            return []
+        record_health("FinMind", True)
+        rows.sort(key=lambda x: x.get("date",""))  # asc
+        closes = [float(r.get("close", 0)) for r in rows if r.get("close") is not None]
+        return closes
+    except Exception as e:
+        record_health("FinMind", False, f"PriceAdj {type(e).__name__}")
+        return []
+
+
 def get_tw_closes(stock_id: str) -> list:
+    """個股近 1 年收盤序列（v10.9.59：FinMind 還原股價主來源 → Yahoo → TWSE 備援）。
+    Layer 0 FinMind 還原股價：除權息日不會誤判暴跌（K 線、均線、RSI 都更準確）。
+    """
+    # Layer 0：FinMind 還原股價（v10.9.59 新增主來源）
+    closes = _load_finmind_closes_adj(stock_id)
+    if len(closes) >= 20:
+        return closes
+
     headers={"User-Agent":"Mozilla/5.0"}
+    # Layer 1：Yahoo Finance（未還原，除權息日會跳水）
     for suffix in [".TW",".TWO"]:
         try:
             url=f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=1y"
@@ -3335,6 +3478,7 @@ def get_tw_closes(stock_id: str) -> list:
             closes=[c for c in closes if c is not None]
             if len(closes)>=20: return closes
         except: pass
+    # Layer 2：TWSE STOCK_DAY 備援
     try:
         url=f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
         r=requests.get(url,headers=headers,timeout=8, verify=False)
@@ -4354,8 +4498,66 @@ def get_dynamic_watchlist()->list:
         if not any(w[0]==sid for w in wl): wl.append((sid,nm,0,0,0))
     return wl[:20]
 
+def _fetch_finmind_institution(target_date) -> list:
+    """v10.9.59：用 FinMind 抓特定日期的三大法人。
+    回傳 [(stock_id, name, total_lots, foreign_lots, trust_lots), ...]，過濾 total > 500。
+    target_date: datetime 物件（用台北時區）。
+    """
+    if not FINMIND_TOKEN:
+        return []
+    ds = target_date.strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "start_date": ds,
+        "end_date": ds,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            record_health("FinMind", False, f"Institution HTTP {r.status_code}")
+            return []
+        payload = r.json()
+        if payload.get("status") != 200:
+            return []
+        rows = payload.get("data") or []
+        if not rows:
+            return []
+        record_health("FinMind", True)
+        # 聚合：每檔股票 → foreign_net, trust_net（張數 = 股數 // 1000）
+        agg = {}  # stock_id -> {"foreign_net": int, "trust_net": int}
+        for row in rows:
+            sid  = (row.get("stock_id") or "").strip()
+            name = (row.get("name") or "")
+            buy  = int(row.get("buy", 0) or 0)
+            sell = int(row.get("sell", 0) or 0)
+            net  = buy - sell  # 股數
+            if not sid: continue
+            d = agg.setdefault(sid, {"foreign_net":0, "trust_net":0})
+            if name.startswith("Foreign_"):
+                d["foreign_net"] += net
+            elif name == "Investment_Trust":
+                d["trust_net"] += net
+        candidates = []
+        for sid, d in agg.items():
+            fl = d["foreign_net"] // 1000  # 張
+            il = d["trust_net"]   // 1000
+            tl = fl + il
+            if tl > 500:
+                cname = NAME_CACHE.get(sid, sid)
+                candidates.append((sid, cname, tl, fl, il))
+        return candidates
+    except Exception as e:
+        dlog("REC", f"FinMind 法人失敗：{type(e).__name__}: {e}")
+        record_health("FinMind", False, f"Institution {type(e).__name__}")
+        return []
+
+
 def fetch_institution_data()->tuple:
-    headers={"User-Agent":"Mozilla/5.0"}
+    """三大法人資料（v10.9.59：FinMind 主來源 + TWSE T86 備援）。
+    回傳 (candidates_list, data_date_str, source_note)。
+    """
     now=now_taipei(); weekday=now.weekday(); afc=is_after_close()
     dq=[]
     if weekday<5 and afc: dq.append((now,True))
@@ -4363,6 +4565,19 @@ def fetch_institution_data()->tuple:
         d=now-timedelta(days=i)
         if d.weekday()<5: dq.append((d,False))
         if len(dq)>=7: break
+
+    # === Layer 0：FinMind（v10.9.59）===
+    for cd, is_today in dq:
+        candidates = _fetch_finmind_institution(cd)
+        if candidates:
+            dd = cd.strftime("%Y/%m/%d"); ts = now.strftime("%Y/%m/%d")
+            if   dd==ts:                sn=f"✅ FinMind 當日法人（{dd}）"
+            elif weekday<5 and not afc: sn=f"📅 今日法人尚未公布，FinMind 暫用 {dd}"
+            else:                       sn=f"📅 FinMind 使用 {dd} 前交易日資料"
+            return candidates, dd, sn
+
+    # === Layer 1：TWSE T86 備援（v10.9.59 降為備援，Render 海外 IP 可能被擋）===
+    headers={"User-Agent":"Mozilla/5.0"}
     for cd,is_today in dq:
         try:
             if is_today: url="https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
@@ -4384,11 +4599,11 @@ def fetch_institution_data()->tuple:
                     except: pass
                 if candidates:
                     dd=data.get("date",cd.strftime("%Y/%m/%d")); ts=now.strftime("%Y/%m/%d")
-                    if   dd==ts:                sn=f"✅ 已使用當日法人資料（{dd}）"
-                    elif weekday<5 and not afc: sn=f"📅 今日法人資料尚未公布，暫用 {dd} 資料"
-                    else:                       sn=f"📅 使用 {dd} 前交易日資料"
+                    if   dd==ts:                sn=f"⚠ TWSE 備援 當日法人（{dd}）"
+                    elif weekday<5 and not afc: sn=f"⚠ TWSE 備援 暫用 {dd}"
+                    else:                       sn=f"⚠ TWSE 備援 {dd}"
                     return candidates,dd,sn
-        except Exception as e: dlog("REC", f"法人資料失敗：{e}")
+        except Exception as e: dlog("REC", f"TWSE 法人失敗：{e}")
     return [],"","⚠️ 法人資料來源連線失敗"
 
 def fetch_tpex_institution_data()->list:
