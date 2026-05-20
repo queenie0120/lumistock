@@ -1,6 +1,18 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.56（健檢升級為 Flex 卡片 — Phase 1 #3A）
+LINE Bot 模組 v10.9.57（個股新聞接 FinMind — Phase 2 #5A）
+
+【v10.9.57 更新】
+1. 新增 _load_finmind_news()：個股新聞主來源改為 FinMind TaiwanStockNews
+   - 你已付費（Backer tier）含此 dataset
+   - 資料結構化，含日期、媒體名、連結
+   - 比 Google News RSS 權威穩定
+2. get_tw_stock_news() 改為多層 fallback：
+   FinMind → Google News（白名單）→ Google News（一般）
+3. 新增 _merge_news_lists() 工具函式做跨來源去重
+4. FinMind 新聞呼叫一律 record_health（健檢面板會顯示）
+
+【v10.9.56】健檢升級為 Flex 卡片 — Phase 1 #3A
 
 【v10.9.56 更新】
 1. 新增 make_health_flex()：粉嫩 Flex dashboard，比純文字更專業
@@ -131,7 +143,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.56"
+VERSION              = "10.9.57"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3677,15 +3689,106 @@ def get_news(query:str, count:int=4, trusted_only:bool=True)->list:
     if len(combined)<count: combined+=untrusted[:count-len(combined)]
     return combined[:count]
 
+def _load_finmind_news(stock_id: str, count: int = 4) -> list:
+    """v10.9.57：用 FinMind TaiwanStockNews 抓個股新聞。
+    回傳 [(title, url), ...] 與既有格式一致。
+    FinMind 已付費（Backer tier）含此 dataset，資料較 Google News RSS 結構化、權威。
+    """
+    if not FINMIND_TOKEN:
+        return []
+    # 抓近 7 天
+    end_date = now_taipei().strftime("%Y-%m-%d")
+    start_date = (now_taipei() - timedelta(days=7)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockNews",
+        "data_id": stock_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            record_health("FinMind", False, f"News HTTP {r.status_code}")
+            return []
+        payload = r.json()
+        if payload.get("status") != 200:
+            record_health("FinMind", False, f"News {payload.get('msg','')[:80]}")
+            return []
+        rows = payload.get("data") or []
+        record_health("FinMind", True)
+        # 依日期 desc 排序，取近的
+        rows.sort(key=lambda x: x.get("date",""), reverse=True)
+        results = []
+        seen_titles = set()
+        for r in rows:
+            title = clean_title(r.get("title", "")).strip()
+            link  = (r.get("link") or "").strip()
+            if not title or not link:
+                continue
+            if not is_real_news(title):
+                continue
+            # 標題去重（normalize 後比對）
+            norm = normalize_title(title)
+            if norm in seen_titles:
+                continue
+            seen_titles.add(norm)
+            results.append((title, link))
+            if len(results) >= count:
+                break
+        return results
+    except requests.Timeout:
+        dlog("NEWS", f"FinMind 新聞超時：{stock_id}")
+        record_health("FinMind", False, "news timeout")
+    except Exception as e:
+        dlog("NEWS", f"FinMind 新聞失敗：{type(e).__name__}: {e}")
+        record_health("FinMind", False, f"news {type(e).__name__}")
+    return []
+
+
 def get_tw_stock_news(stock_id:str, cn_name:str, count:int=4)->list:
-    results=[]
+    """個股新聞抓取（v10.9.57：FinMind 主來源 + Google News 備援）。
+    層級：
+      1. FinMind TaiwanStockNews（結構化、含日期/媒體名）— 付費版資料源
+      2. Google News RSS（中文 query 「[名] 台股 財經」）
+      3. Google News RSS（「[id] [名] 股票」）
+      4. Google News RSS（「[id] 台股」，trusted_only=False）
+    """
+    # 第一層：FinMind（v10.9.57 新增）
+    results = _load_finmind_news(stock_id, count=count)
+    if len(results) >= count:
+        return results[:count]
+    # 第二層：Google News（中文名 query）
     if has_chinese(cn_name) and cn_name!=stock_id:
-        results=get_news(f"{cn_name} 台股 財經",count=count,trusted_only=True)
-    if not results:
-        results=get_news(f"{stock_id} {cn_name} 股票",count=count,trusted_only=True)
-    if not results:
-        results=get_news(f"{stock_id} 台股",count=count,trusted_only=False)
-    return results
+        more = get_news(f"{cn_name} 台股 財經",count=count,trusted_only=True)
+        results = _merge_news_lists(results, more, max_count=count)
+    if len(results) >= count:
+        return results[:count]
+    # 第三層：[id] [name] 股票
+    more = get_news(f"{stock_id} {cn_name} 股票",count=count,trusted_only=True)
+    results = _merge_news_lists(results, more, max_count=count)
+    if len(results) >= count:
+        return results[:count]
+    # 第四層：放寬到非白名單
+    more = get_news(f"{stock_id} 台股",count=count,trusted_only=False)
+    results = _merge_news_lists(results, more, max_count=count)
+    return results[:count]
+
+
+def _merge_news_lists(existing: list, new: list, max_count: int = 4) -> list:
+    """合併新聞清單，依 normalize_title 去重，已存在的不加入。"""
+    seen = {normalize_title(t) for t, _ in existing}
+    out = list(existing)
+    for t, u in new:
+        norm = normalize_title(t)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append((t, u))
+        if len(out) >= max_count:
+            break
+    return out
 
 
 def get_news_with_ai(query: str, stock_name: str = "", count: int = 4,
