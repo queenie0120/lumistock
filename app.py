@@ -1,6 +1,25 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.61（健檢合理範圍改為動態 — 解決 hardcode 跟不上市場）
+LINE Bot 模組 v10.9.62（持股管理升級 Flex carousel — Phase 2 第 1 步）
+
+【v10.9.62 更新】
+觸及使用者願景紅線（11-12）：持股管理 / 停損目標提醒
+
+1. 新增 _get_portfolio_advice(stock_id) → 系統建議：
+   - 停損 = 近 60 天最低點 × 0.95
+   - 目標 = 近 60 天最高點 × 1.05
+   - 下次除權息（用 v10.9.60 的 lazy load 機制）
+2. 新增 make_portfolio_flex_carousel(user_id) → 粉嫩持股 carousel
+   - Overview bubble：總損益 + 檔數 + 免責聲明
+   - 每檔一張 bubble：
+     * Header（漲粉 / 跌藍）：代碼名稱 + 損益 + 損益%
+     * Body：現價、成本、股數
+     * 💡 系統建議價：停損 / 目標（含距現價%）
+     * 💰 下次除息：日期 + 配息金額（若有）
+3. 「持股」handler 改為 Flex carousel（Flex 失敗 fallback 純文字）
+4. 新增「持股文字」指令保留純文字版
+
+【v10.9.61】健檢合理範圍改為動態
 
 【v10.9.61 更新】
 使用者反映：「現在市場很多股票漲很兇，似乎要看市場」
@@ -203,7 +222,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.61"
+VERSION              = "10.9.62"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4922,6 +4941,212 @@ def build_and_push_recommendation(user_id:str):
 # ══════════════════════════════════════════
 #  持股
 # ══════════════════════════════════════════
+def _get_portfolio_advice(stock_id: str) -> dict:
+    """v10.9.62：根據近 60 天還原股價算系統建議停損/目標 + 下次除權息。
+    回傳 {stop_loss, target, ex_div_date, ex_div_cash, ex_div_stock} 或 None。
+    """
+    advice = {"stop_loss": None, "target": None,
+              "ex_div_date": None, "ex_div_cash": 0, "ex_div_stock": 0}
+    # 動態合理範圍 → 取低點 × 0.95 當停損、高點 × 1.05 當目標
+    rng = _get_dynamic_sanity_range(stock_id, source="finmind_tw")
+    if rng:
+        lo, hi = rng
+        # rng 已是 (60 天 min × 0.7, 60 天 max × 1.3)，反推回 raw min/max
+        raw_lo = lo / 0.7
+        raw_hi = hi / 1.3
+        advice["stop_loss"] = raw_lo * 0.95
+        advice["target"] = raw_hi * 1.05
+    # 除權息：lazy load 該股，取近期未來那筆
+    try:
+        _lazy_load_exdiv_for_stock(stock_id)
+        info = EX_DIVIDEND_CALENDAR.get(stock_id)
+        if info:
+            date = info.get("date", "")
+            # 只顯示未來的（>= 今天）
+            today = now_taipei().strftime("%Y%m%d")
+            if date >= today:
+                advice["ex_div_date"] = date
+                advice["ex_div_cash"] = info.get("cash", 0)
+                advice["ex_div_stock"] = info.get("stock", 0)
+    except: pass
+    return advice
+
+
+def _fmt_exdiv_date(date_str: str) -> str:
+    """20260613 → 06/13"""
+    if not date_str or len(date_str) < 8:
+        return date_str
+    return f"{date_str[4:6]}/{date_str[6:8]}"
+
+
+def make_portfolio_flex_carousel(user_id: str) -> dict:
+    """v10.9.62：持股 Flex carousel。每檔一張卡 + 開頭一張 overview 總損益。"""
+    portfolio = load_portfolio()
+    up = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
+    if not up:
+        return None
+
+    # 先算每檔現價、損益
+    rows = []
+    total_profit = 0
+    total_cost = 0
+    for symbol, data in up.items():
+        sid = symbol.replace(".TW", "")
+        try:
+            if sid.isdigit():
+                tw = get_tw_stock(sid)
+                price = tw["price"] if tw else 0
+                name  = tw["name"] if tw else sid
+            else:
+                us = get_us_stock(symbol)
+                price = us["price"] if us else 0
+                name  = us["name"] if us else symbol
+        except:
+            price = 0; name = sid
+        shares = data["shares"]
+        bp = data["buy_price"]
+        profit = (price - bp) * shares if price else 0
+        cost = bp * shares
+        pct = (price - bp) / bp * 100 if price and bp else 0
+        rows.append({
+            "symbol": symbol, "sid": sid, "name": name,
+            "price": price, "bp": bp, "shares": shares,
+            "profit": profit, "pct": pct, "cost": cost,
+        })
+        total_profit += profit
+        total_cost += cost
+    total_pct = (total_profit / total_cost * 100) if total_cost else 0
+
+    bubbles = []
+    # Overview bubble
+    is_up = total_profit >= 0
+    overview_color = "#D97A5C" if is_up else "#7AABBE"
+    bubbles.append({
+        "type": "bubble", "size": "kilo",
+        "header": {"type": "box", "layout": "vertical",
+                   "backgroundColor": "#E8B8A8", "paddingAll": "14px",
+                   "contents": [
+                       {"type": "text", "text": "📋 我的持股總覽",
+                        "size": "md", "color": "#FFFFFF", "weight": "bold"},
+                       {"type": "text",
+                        "text": f"共 {len(rows)} 檔 ‧ {now_taipei().strftime('%m/%d %H:%M')}",
+                        "size": "xxs", "color": "#FDF6F0", "margin": "xs"},
+                   ]},
+        "body": {"type": "box", "layout": "vertical",
+                 "backgroundColor": "#FDF6F0", "paddingAll": "16px", "spacing": "sm",
+                 "contents": [
+                     {"type": "text", "text": "總損益", "size": "xs", "color": "#9B6B5A"},
+                     {"type": "text", "text": f"{total_profit:+,.0f}",
+                      "size": "3xl", "color": overview_color, "weight": "bold"},
+                     {"type": "text", "text": f"{'▲' if is_up else '▼'} {total_pct:+.2f}%",
+                      "size": "sm", "color": overview_color},
+                     {"type": "separator", "color": "#E8C4B4"},
+                     {"type": "text", "text": "⚠ 系統建議僅供參考，非投資建議",
+                      "size": "xxs", "color": "#C9A89A", "align": "center", "margin": "sm"},
+                 ]},
+    })
+
+    # 每檔股票一張卡
+    for r in rows:
+        profit = r["profit"]
+        pct = r["pct"]
+        is_up = profit >= 0
+        c = "#D97A5C" if is_up else "#7AABBE"
+        arrow = "▲" if is_up else "▼"
+        sign = "+" if is_up else ""
+
+        # 系統建議
+        advice_box = []
+        if r["sid"].isdigit():
+            adv = _get_portfolio_advice(r["sid"])
+            if adv.get("stop_loss") and adv.get("target"):
+                sl = adv["stop_loss"]
+                tg = adv["target"]
+                sl_pct = (sl - r["price"]) / r["price"] * 100 if r["price"] else 0
+                tg_pct = (tg - r["price"]) / r["price"] * 100 if r["price"] else 0
+                advice_box = [
+                    {"type": "separator", "color": "#E8C4B4"},
+                    {"type": "text", "text": "💡 系統建議價", "size": "xs",
+                     "color": "#A05A48", "weight": "bold", "margin": "sm"},
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "停損", "size": "xxs",
+                         "color": "#9B6B5A", "flex": 1},
+                        {"type": "text", "text": f"{sl:,.2f}",
+                         "size": "xs", "color": "#7AABBE", "weight": "bold", "flex": 2},
+                        {"type": "text", "text": f"{sl_pct:+.1f}%",
+                         "size": "xxs", "color": "#7AABBE", "align": "end", "flex": 2},
+                    ]},
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "目標", "size": "xxs",
+                         "color": "#9B6B5A", "flex": 1},
+                        {"type": "text", "text": f"{tg:,.2f}",
+                         "size": "xs", "color": "#D97A5C", "weight": "bold", "flex": 2},
+                        {"type": "text", "text": f"{tg_pct:+.1f}%",
+                         "size": "xxs", "color": "#D97A5C", "align": "end", "flex": 2},
+                    ]},
+                ]
+            # 除權息
+            if adv.get("ex_div_date"):
+                d_short = _fmt_exdiv_date(adv["ex_div_date"])
+                cash = adv.get("ex_div_cash", 0)
+                stock = adv.get("ex_div_stock", 0)
+                div_text = f"{d_short} ‧ 現金 {cash} 元"
+                if stock > 0:
+                    div_text += f" + 配股 {stock}"
+                advice_box.extend([
+                    {"type": "separator", "color": "#E8C4B4"},
+                    {"type": "box", "layout": "horizontal", "spacing": "sm",
+                     "backgroundColor": "#FAE6DE", "cornerRadius": "6px",
+                     "paddingAll": "8px", "margin": "sm", "contents": [
+                        {"type": "text", "text": "💰 下次除息",
+                         "size": "xxs", "color": "#A05A48", "weight": "bold", "flex": 2},
+                        {"type": "text", "text": div_text,
+                         "size": "xxs", "color": "#5B4040", "flex": 5, "wrap": True},
+                    ]},
+                ])
+
+        bubble = {
+            "type": "bubble", "size": "kilo",
+            "header": {"type": "box", "layout": "vertical",
+                       "backgroundColor": c, "paddingAll": "12px",
+                       "contents": [
+                           {"type": "text",
+                            "text": f"{r['symbol']} {r['name']}",
+                            "size": "sm", "color": "#FFFFFF", "weight": "bold", "wrap": True},
+                           {"type": "text",
+                            "text": f"{arrow} {profit:+,.0f}　{sign}{pct:.1f}%",
+                            "size": "md", "color": "#FFFFFF", "weight": "bold", "margin": "xs"},
+                       ]},
+            "body": {"type": "box", "layout": "vertical",
+                     "backgroundColor": "#FDF6F0", "paddingAll": "12px", "spacing": "xs",
+                     "contents": [
+                         {"type": "box", "layout": "horizontal", "contents": [
+                             {"type": "text", "text": "現價", "size": "xxs",
+                              "color": "#9B6B5A", "flex": 2},
+                             {"type": "text", "text": f"{r['price']:,.2f}" if r['price'] else "—",
+                              "size": "sm", "color": "#5B4040", "weight": "bold",
+                              "align": "end", "flex": 3},
+                         ]},
+                         {"type": "box", "layout": "horizontal", "contents": [
+                             {"type": "text", "text": "成本", "size": "xxs",
+                              "color": "#9B6B5A", "flex": 2},
+                             {"type": "text", "text": f"{r['bp']:,.2f}",
+                              "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
+                         ]},
+                         {"type": "box", "layout": "horizontal", "contents": [
+                             {"type": "text", "text": "股數", "size": "xxs",
+                              "color": "#9B6B5A", "flex": 2},
+                             {"type": "text", "text": f"{r['shares']:,}",
+                              "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
+                         ]},
+                         *advice_box,
+                     ]},
+        }
+        bubbles.append(bubble)
+
+    return {"type": "carousel", "contents": bubbles}
+
+
 def get_portfolio_summary(user_id:str)->str:
     portfolio=load_portfolio()
     up={k:v for k,v in portfolio.items() if v.get("user_id")==user_id}
@@ -5867,7 +6092,19 @@ def handle_message(event):
         return
 
     # ══ 持股管理指令 ══
-    if text=="持股": reply_text(event.reply_token, get_portfolio_summary(user_id)); return
+    if text=="持股":
+        # v10.9.62：Flex carousel（含系統建議停損/目標 + 下次除權息）
+        try:
+            flex = make_portfolio_flex_carousel(user_id)
+            if flex:
+                reply_flex(event.reply_token, flex, "我的持股")
+                return
+        except Exception as e:
+            dlog("PORTFOLIO", f"Flex 失敗 fallback 文字：{e}")
+        reply_text(event.reply_token, get_portfolio_summary(user_id)); return
+    if text=="持股文字":
+        # v10.9.62 保留純文字版（debug 用）
+        reply_text(event.reply_token, get_portfolio_summary(user_id)); return
 
     # v10.9.25：可點選刪除的持股清單
     if text in ["我的持股", "持股清單"]:
