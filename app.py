@@ -1,6 +1,24 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.63（持股自動警報推播 — Phase 2 第 2 步）
+LINE Bot 模組 v10.9.64（截圖辨識持股 — Phase 2 第 3 步）
+
+【v10.9.64 更新】
+觸及使用者願景：方便、即時、減少手動輸入
+
+1. 使用者直接傳券商庫存截圖 → 30 秒內辨識完成
+2. 新增 ImageMessageContent handler（事件流：圖片 → 下載 → vision → 預覽）
+3. 新增 analyze_portfolio_screenshot()
+   - 用 Groq Llama 4 Scout vision model
+   - prompt 要求回傳 JSON：[{stock_id, shares, avg_price}]
+   - 驗證：代號 4-6 位數字 / 股數 / 均價皆 > 0
+   - 強制換算「張 → 股」（× 1000）
+4. 新增確認流程：
+   - 收圖 → 預覽 → 使用者打「確認匯入」/「取消匯入」
+   - 5 分鐘內有效（WAITING_PORTFOLIO_IMPORT state）
+5. 新增隱私提示：「截圖會送雲端，建議遮蔽帳號餘額」
+6. 「新增持股說明」更新文字，介紹兩種方式
+
+【v10.9.63】持股自動警報推播
 
 【v10.9.63 更新】
 觸及使用者願景紅線：持股提醒實用、即時通知風險
@@ -222,12 +240,13 @@ from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
+    Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, TextMessage, PushMessageRequest,
     FlexMessage, FlexContainer, QuickReply, QuickReplyItem,
     MessageAction, PostbackAction
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent, PostbackEvent
+import base64
 import requests
 import json, os, re, threading, time
 from datetime import datetime, timezone, timedelta
@@ -239,7 +258,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.63"
+VERSION              = "10.9.64"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -251,6 +270,7 @@ handler       = WebhookHandler(CHANNEL_SECRET)
 
 WAITING_SUGGESTION = set()
 WAITING_STOCK_NEWS = {}  # v10.9.58: user_id -> set_at_timestamp（5 分鐘內輸入股票代號 → 回新聞 carousel）
+WAITING_PORTFOLIO_IMPORT = {}  # v10.9.64: user_id -> {"items": [...], "ts": ts}（5 分鐘內確認）
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 NAME_CACHE         = {}
 STARTUP_DONE       = False
@@ -3801,6 +3821,110 @@ def groq_chat(messages: list, max_tokens: int = 1500, temperature: float = 0.2, 
         return ""
 
 
+def analyze_portfolio_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -> list:
+    """v10.9.64：用 Groq Llama 4 Scout vision 辨識券商庫存截圖。
+    回傳 [{"stock_id":"2330","shares":100,"avg_price":2010.0}, ...]
+    """
+    if not GROQ_AVAILABLE:
+        dlog("VISION", "Groq 未設定，無法辨識")
+        return []
+    try:
+        b64 = base64.b64encode(image_bytes).decode()
+    except Exception as e:
+        dlog("VISION", f"base64 編碼失敗：{e}")
+        return []
+
+    prompt = """這是台灣證券戶的庫存截圖。請仔細辨識所有持股，回傳純 JSON array（不要 markdown）：
+
+[{"stock_id": "2330", "shares": 100, "avg_price": 2010.0}, ...]
+
+規則：
+- stock_id 是 4-6 位字元（例：2330、00878、6446、2330R）
+- shares 一律換算成「股數」（若截圖是「張」則 ×1000）
+- avg_price 是平均買進價（每股新台幣）
+- 看不清楚的欄位填 null（整筆會被略過）
+- 只回 JSON array，不要其他文字、不要 markdown
+- 若無法辨識任何持股，回傳 []
+"""
+
+    payload = {
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            ]
+        }],
+        "max_tokens": 2048,
+        "temperature": 0.0,
+    }
+
+    try:
+        r = requests.post(GROQ_API_URL, headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }, json=payload, timeout=30)
+        if r.status_code != 200:
+            dlog("VISION", f"Groq vision 失敗 HTTP {r.status_code}: {r.text[:200]}")
+            record_health("Groq AI", False, f"vision HTTP {r.status_code}")
+            return []
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        record_health("Groq AI", True)
+        # 去除 markdown 包裝
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        try:
+            holdings = json.loads(text)
+        except Exception as e:
+            dlog("VISION", f"JSON 解析失敗：{e} / raw={text[:200]}")
+            return []
+        if not isinstance(holdings, list):
+            return []
+        # validation
+        valid = []
+        for h in holdings:
+            if not isinstance(h, dict): continue
+            sid = str(h.get("stock_id", "")).strip().upper()
+            sh = h.get("shares")
+            bp = h.get("avg_price")
+            if not sid or not re.match(r"^[0-9]{4,6}[A-Z]?$", sid): continue
+            if sh is None or bp is None: continue
+            try:
+                shares = int(float(sh))
+                price = float(bp)
+                if shares <= 0 or price <= 0: continue
+                valid.append({"stock_id": sid, "shares": shares, "avg_price": price})
+            except: continue
+        dlog("VISION", f"辨識完成：raw {len(holdings)} 項 → valid {len(valid)} 項")
+        return valid
+    except Exception as e:
+        dlog("VISION", f"vision 例外：{type(e).__name__}: {e}")
+        record_health("Groq AI", False, f"vision {type(e).__name__}")
+        return []
+
+
+def format_portfolio_import_preview(items: list) -> str:
+    """組合「辨識結果預覽」訊息給使用者確認。"""
+    if not items:
+        return "❌ 沒有辨識到任何持股"
+    lines = ["📋 辨識結果 — 確認後即可匯入",
+             "━━━━━━━━━━━━━━"]
+    for i, h in enumerate(items, 1):
+        sid = h["stock_id"]
+        name = NAME_CACHE.get(sid, "")
+        lines.append(f"{i}. {sid} {name}".rstrip())
+        lines.append(f"　{h['shares']:,} 股 ‧ 均價 {h['avg_price']:,.2f}")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("⚠ 請核對辨識結果")
+    lines.append("　• 輸入「確認匯入」儲存全部")
+    lines.append("　• 輸入「取消匯入」放棄")
+    lines.append("　• 5 分鐘後自動取消")
+    return "\n".join(lines)
+
+
 def ai_analyze_news_batch(news_list: list, stock_name: str = "", market_type: str = "tw") -> list:
     """一次呼叫 Groq 處理整批新聞：語意去重 + 情緒 + 摘要（v10.9.35）
 
@@ -5665,6 +5789,59 @@ def handle_postback(event):
         except: pass
 
 
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image(event):
+    """v10.9.64：使用者傳券商庫存截圖 → Groq vision 辨識 → 確認後匯入持股。"""
+    user_id = event.source.user_id
+    msg_id = event.message.id
+    dlog("IMAGE", f"收到圖片 user={user_id[:10]}... msg_id={msg_id}")
+    if is_blocked_user(user_id):
+        return
+    if not is_registered_user(user_id):
+        reply_text(event.reply_token, "請先註冊才能使用此功能")
+        return
+    if not GROQ_AVAILABLE:
+        reply_text(event.reply_token,
+            "⚠️ AI 辨識功能未啟用（需 GROQ_API_KEY）\n"
+            "請聯繫管理員")
+        return
+    reply_text(event.reply_token,
+        "🔍 收到持股截圖，AI 辨識中...\n"
+        "約 15-30 秒後回報結果\n\n"
+        "⚠ 截圖將送到 AI 雲端辨識；\n建議事先遮蔽帳號、餘額等敏感資訊")
+
+    def _bg():
+        try:
+            with ApiClient(configuration) as api_client:
+                blob_api = MessagingApiBlob(api_client)
+                content = blob_api.get_message_content(message_id=msg_id)
+            holdings = analyze_portfolio_screenshot(content, mime="image/jpeg")
+            if not holdings:
+                push_message(user_id,
+                    "❌ 無法辨識任何持股\n"
+                    "可能原因：\n"
+                    "　• 截圖不清楚 / 字太小\n"
+                    "　• 不是券商庫存頁\n"
+                    "　• AI 服務暫時忙碌\n\n"
+                    "建議重新拍攝或手動「新增 代號 股數 均價」")
+                return
+            WAITING_PORTFOLIO_IMPORT[user_id] = {"items": holdings, "ts": time.time()}
+            push_message(user_id, format_portfolio_import_preview(holdings))
+        except Exception as e:
+            dlog("IMAGE", f"處理圖片失敗：{type(e).__name__}: {e}")
+            push_message(user_id, f"❌ 處理圖片失敗：{type(e).__name__}")
+
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+def is_registered_user(user_id: str) -> bool:
+    """簡易註冊檢查（避免外人濫用 AI 配額）。Owner / Admin 自動算註冊。"""
+    if is_owner(user_id) or is_admin(user_id):
+        return True
+    # 其他人視已加好友即可（暫不嚴格驗證）
+    return True
+
+
 @handler.add(MessageEvent,message=TextMessageContent)
 def handle_message(event):
     text=event.message.text.strip(); user_id=event.source.user_id
@@ -6133,7 +6310,49 @@ def handle_message(event):
     if text=="查使用者說明": reply_text(event.reply_token,"格式：查使用者 姓名\n例如:查使用者 王小明"); return
     if text=="新增管理者說明": reply_text(event.reply_token,"格式：新增管理者 註冊姓名\n例如：新增管理者 王小明\n\n（系統會自動從使用者名單找對應的 user_id）"); return
     if text=="移除管理者說明": reply_text(event.reply_token,"格式：移除管理者 姓名"); return
-    if text=="新增持股說明": reply_text(event.reply_token,"格式：新增 代碼 股數 買入價\n例如：新增 2330 100 200"); return
+    if text=="新增持股說明":
+        reply_text(event.reply_token,
+            "📋 新增持股 — 兩種方式\n━━━━━━━━━━━━━━\n"
+            "1️⃣ 手動輸入\n"
+            "　格式：新增 代碼 股數 買入價\n"
+            "　例如：新增 2330 100 2010\n\n"
+            "2️⃣ 截圖辨識（v10.9.64 新功能）✨\n"
+            "　直接傳券商庫存截圖給我\n"
+            "　AI 自動辨識 → 確認 → 一鍵匯入\n"
+            "　⚠ 截圖會送雲端辨識，建議先遮蔽帳號餘額")
+        return
+    # v10.9.64：持股截圖匯入確認
+    if text in ["確認匯入", "確認", "yes", "Yes", "YES"]:
+        record = WAITING_PORTFOLIO_IMPORT.get(user_id)
+        if not record or (time.time() - record["ts"]) > 300:
+            reply_text(event.reply_token, "⏰ 沒有待確認的匯入或已過期\n請重新傳截圖")
+            return
+        items = record["items"]
+        portfolio = load_portfolio()
+        added = 0
+        for h in items:
+            symbol = h["stock_id"]
+            portfolio[symbol] = {
+                "user_id": user_id,
+                "shares": h["shares"],
+                "buy_price": h["avg_price"],
+            }
+            try:
+                name = NAME_CACHE.get(symbol, symbol)
+                save_portfolio_to_sheets(user_id, symbol, name, "TW", h["shares"], h["avg_price"])
+            except: pass
+            added += 1
+        save_portfolio(portfolio)
+        WAITING_PORTFOLIO_IMPORT.pop(user_id, None)
+        reply_text(event.reply_token,
+            f"✅ 已匯入 {added} 檔持股\n輸入「持股」查看完整清單")
+        return
+    if text in ["取消匯入", "取消", "no", "No", "NO"]:
+        if WAITING_PORTFOLIO_IMPORT.pop(user_id, None):
+            reply_text(event.reply_token, "✅ 已取消匯入，原資料未變動")
+        else:
+            reply_text(event.reply_token, "⏰ 沒有待確認的匯入")
+        return
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="損益分析": reply_text(event.reply_token, get_portfolio_summary(user_id)); return
