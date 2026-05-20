@@ -1,6 +1,15 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.51（修：櫃買指數改用 TPEx 官方來源）
+LINE Bot 模組 v10.9.52（資料來源 metadata 系統 PR #2B：大盤指數卡片）
+
+【v10.9.52 更新】
+1. 新增 fmt_data_meta_full()：含來源名稱的完整 metadata 字串
+   例：「📡 TPEx 官方 ‧ ✓ 即時資料」
+   例：「📡 Yahoo Finance（日線備援）‧ ⚠ 收盤資料」
+2. make_quote_flex（大盤/外匯/商品/指數卡片）底部加 metadata 行
+3. 使用者可以一眼判斷：資料是即時 / 收盤 / 延遲 / 備援，避免跟其他 App 比對時混淆
+
+【v10.9.51】修：櫃買指數改用 TPEx 官方來源
 
 【v10.9.51 更新】
 1. 新增 get_taiwan_otc_index()：用 TPEx 官方 openapi/v1/tpex_index 抓櫃買指數
@@ -73,7 +82,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.51"
+VERSION              = "10.9.52"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -146,6 +155,24 @@ def fmt_data_meta(meta: dict) -> str:
     else:
         state = "收盤資料"
     return f"{tag} ‧ {state}"
+
+def fmt_data_meta_full(meta: dict) -> str:
+    """完整版：包含來源名稱。例如：
+        📡 TPEx 官方 ‧ ✓ 即時資料
+        📡 Yahoo Finance ‧ ✓ 收盤資料
+        📡 Yahoo Finance（日線備援）‧ ⚠ 收盤資料
+    """
+    if not isinstance(meta, dict):
+        return ""
+    source = meta.get("source", "")
+    flag = "⚠" if meta.get("is_fallback") else "✓"
+    if meta.get("is_realtime"):
+        state = "即時資料"
+    elif meta.get("delay_min", 0) > 0:
+        state = f"延遲約 {meta['delay_min']} 分"
+    else:
+        state = "收盤資料"
+    return f"📡 {source} ‧ {flag} {state}"
 
 def format_us_volume(v) -> str:
     if v in ["-", "", None, "N/A", 0]: return "N/A"
@@ -2516,6 +2543,10 @@ def make_quote_flex(name: str, data: dict, color: str = "#5B8DB8") -> dict:
     sign  = "+" if is_up else ""
     # v10.9.29：加強弱方向標籤
     str_icon, str_label, str_color = get_market_strength_label(pct)
+    # v10.9.52：metadata 行
+    meta = data.get("meta")
+    meta_text = fmt_data_meta_full(meta) if isinstance(meta, dict) else ""
+    meta_color = "#B89BC4" if (isinstance(meta, dict) and meta.get("is_fallback")) else "#A07560"
     return {
         "type":"bubble","size":"kilo",
         "header":{
@@ -2533,7 +2564,8 @@ def make_quote_flex(name: str, data: dict, color: str = "#5B8DB8") -> dict:
                     {"type":"text","text":f"{str_icon} {str_label}","size":"xs","color":str_color,"weight":"bold","flex":0},
                     {"type":"text","text":now_taipei().strftime("%m/%d %H:%M"),
                      "size":"xxs","color":"#AAAAAA","align":"end","flex":1,"gravity":"bottom"}
-                ]}
+                ]},
+                *([{"type":"text","text":meta_text,"size":"xxs","color":meta_color,"wrap":True,"margin":"sm"}] if meta_text else [])
             ]
         }
     }
