@@ -1,6 +1,23 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.62（持股管理升級 Flex carousel — Phase 2 第 1 步）
+LINE Bot 模組 v10.9.63（持股自動警報推播 — Phase 2 第 2 步）
+
+【v10.9.63 更新】
+觸及使用者願景紅線：持股提醒實用、即時通知風險
+
+1. 新增 run_portfolio_alerts()：掃描所有 user 持股，三類觸發
+   a) 現價 ≤ 系統建議停損 → ⚠️ 跌破停損警告
+   b) 現價 ≥ 系統建議目標 × 0.95 → 📈 接近目標提示
+   c) 今日 = 除權息日 → 💰 今日除息提醒
+2. 新增 format_portfolio_alerts_msg() 組合 LINE 推播文字
+3. 整合進每日 06:30 自動健檢：
+   - 健檢 push 後，順便掃 portfolio
+   - 每位有警報的 user 收到一則整合訊息
+4. 新增 Owner 指令「持股警報測試」/「持股警報」/「立即持股警報」
+   - 背景跑、推播完整結果
+   - 給 Owner 報告：N 位 user / M 則訊息
+
+【v10.9.62】持股管理升級 Flex carousel
 
 【v10.9.62 更新】
 觸及使用者願景紅線（11-12）：持股管理 / 停損目標提醒
@@ -222,7 +239,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.62"
+VERSION              = "10.9.63"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1321,8 +1338,91 @@ def format_healthcheck_report(results: list, *, brief_on_success: bool = True) -
     return "\n".join(lines)
 
 
+def run_portfolio_alerts() -> dict:
+    """v10.9.63：掃描所有使用者持股，收集警報。
+    回傳 {user_id: [alert_msg, ...]}
+    觸發條件：
+      a) 現價 ≤ 系統建議停損價 → ⚠️ 跌破
+      b) 現價 ≥ 系統建議目標價 × 0.95 → 📈 接近目標
+      c) 今日 = 除權息日 → 💰 今日除息
+    """
+    alerts_by_user = {}
+    try:
+        portfolio = load_portfolio()
+    except:
+        return alerts_by_user
+    by_user = {}
+    for symbol, data in portfolio.items():
+        uid = data.get("user_id")
+        if uid:
+            by_user.setdefault(uid, []).append((symbol, data))
+    today = now_taipei().strftime("%Y%m%d")
+
+    for uid, holdings in by_user.items():
+        user_alerts = []
+        for symbol, data in holdings:
+            sid = symbol.replace(".TW", "")
+            if not sid.isdigit():
+                continue  # 暫不處理美股（之後再加）
+            try:
+                tw = get_tw_stock(sid)
+                if not tw: continue
+                price = tw.get("price", 0)
+                name  = tw.get("name", sid)
+                if not price: continue
+                adv = _get_portfolio_advice(sid)
+                # 觸發 a) 跌破停損
+                sl = adv.get("stop_loss")
+                if sl and price <= sl:
+                    pct_below = (price - sl) / sl * 100
+                    user_alerts.append(
+                        f"⚠️ {symbol} {name}\n"
+                        f"　現價 {price:,.2f} 跌破系統停損 {sl:,.2f}\n"
+                        f"　已破位 {pct_below:+.1f}%，建議檢視持倉"
+                    )
+                # 觸發 b) 接近目標（不重疊 a）
+                tg = adv.get("target")
+                if tg and not (sl and price <= sl) and price >= tg * 0.95:
+                    diff = (tg - price) / tg * 100
+                    user_alerts.append(
+                        f"📈 {symbol} {name}\n"
+                        f"　現價 {price:,.2f} 接近系統目標 {tg:,.2f}\n"
+                        f"　距目標 {abs(diff):.1f}%，可考慮停利"
+                    )
+                # 觸發 c) 今日除息
+                if adv.get("ex_div_date") == today:
+                    cash = adv.get("ex_div_cash", 0)
+                    stock = adv.get("ex_div_stock", 0)
+                    div_text = f"現金 {cash} 元"
+                    if stock > 0:
+                        div_text += f" + 配股 {stock}"
+                    user_alerts.append(
+                        f"💰 {symbol} {name}\n"
+                        f"　今日除息：{div_text}\n"
+                        f"　卡片漲跌已自動修正"
+                    )
+            except Exception as e:
+                dlog("PORTFOLIO-ALERT", f"檢查 {symbol} 失敗：{type(e).__name__}: {e}")
+        if user_alerts:
+            alerts_by_user[uid] = user_alerts
+    return alerts_by_user
+
+
+def format_portfolio_alerts_msg(alerts: list) -> str:
+    """組 LINE 推播文字。"""
+    ts = now_taipei().strftime("%m/%d %H:%M")
+    lines = [f"💗 持股提醒  {ts}", "━━━━━━━━━━━━━━"]
+    for i, a in enumerate(alerts):
+        if i > 0: lines.append("")
+        lines.append(a)
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("⚠ 系統建議僅供參考，非投資建議")
+    return "\n".join(lines)
+
+
 def _run_daily_healthcheck():
-    """執行每日自動健檢 + 排下一次"""
+    """執行每日自動健檢 + 持股警報 + 排下一次"""
     dlog("HEALTHCHECK-AUTO", "🔄 開始每日自動健檢")
     try:
         results = run_healthcheck_tests()
@@ -1334,6 +1434,17 @@ def _run_daily_healthcheck():
             push_to_owner(report)
         except Exception as e:
             dlog("HEALTHCHECK-AUTO", f"推播失敗：{e}")
+        # v10.9.63：持股警報
+        try:
+            alerts_by_user = run_portfolio_alerts()
+            for uid, alerts in alerts_by_user.items():
+                msg = format_portfolio_alerts_msg(alerts)
+                push_message(uid, msg)
+            dlog("HEALTHCHECK-AUTO",
+                 f"持股警報：{len(alerts_by_user)} 位 user / "
+                 f"{sum(len(a) for a in alerts_by_user.values())} 則訊息")
+        except Exception as e:
+            dlog("HEALTHCHECK-AUTO", f"持股警報執行失敗：{type(e).__name__}: {e}")
     except Exception as e:
         dlog("HEALTHCHECK-AUTO", f"❌ 例外：{type(e).__name__}: {e}")
         try:
@@ -5896,6 +6007,24 @@ def handle_message(event):
                 except Exception as e:
                     push_to_owner(f"🚨 立即測試例外\n{type(e).__name__}: {e}")
             threading.Thread(target=_bg, daemon=True).start()
+            return
+        elif text in ["持股警報測試", "持股警報", "立即持股警報"]:
+            # v10.9.63：手動觸發持股警報掃描（與 06:30 自動跑同樣邏輯）
+            dlog("HANDLER", "→ 持股警報測試")
+            reply_text(event.reply_token, "💗 掃描所有 user 持股中...\n約 10-20 秒後推播")
+            def _bg_alert():
+                try:
+                    alerts_by_user = run_portfolio_alerts()
+                    if not alerts_by_user:
+                        push_to_owner("✨ 所有 user 持股都在安全範圍內，無警報")
+                        return
+                    for uid, alerts in alerts_by_user.items():
+                        push_message(uid, format_portfolio_alerts_msg(alerts))
+                    total = sum(len(a) for a in alerts_by_user.values())
+                    push_to_owner(f"✅ 持股警報完成\n{len(alerts_by_user)} 位 user / {total} 則訊息")
+                except Exception as e:
+                    push_to_owner(f"🚨 持股警報例外\n{type(e).__name__}: {e}")
+            threading.Thread(target=_bg_alert, daemon=True).start()
             return
         elif text.startswith("查快取 "):
             sid=text.replace("查快取 ","").strip()
