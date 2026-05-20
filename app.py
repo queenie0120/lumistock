@@ -1,6 +1,20 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.64（截圖辨識持股 — Phase 2 第 3 步）
+LINE Bot 模組 v10.9.65（持股警報 24h dedup — Phase 2 第 4 步）
+
+【v10.9.65 更新】
+問題：v10.9.63 之後若同一檔股票跌破停損，每天 06:30 都會推播一次 → 轟炸感
+
+解法：加 24h dedup
+1. 新增 ALERT_HISTORY 字典 + 持久化到 /tmp/lumistock_alert_history.json
+2. 新增 _should_alert(uid, sid, type) 守門員
+   - 同一 (user, stock, type) 在 24h 內已通報過 → 跳過
+   - 自動清掉超過 7 天的舊紀錄，避免無限長大
+3. run_portfolio_alerts 每個觸發點都用 _should_alert wrap
+   - stop_loss / near_target / ex_dividend 三類各自獨立 dedup
+4. 24h 後若依然觸發 → 重新通報（提醒使用者狀況持續）
+
+【v10.9.64】截圖辨識持股
 
 【v10.9.64 更新】
 觸及使用者願景：方便、即時、減少手動輸入
@@ -258,7 +272,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.64"
+VERSION              = "10.9.65"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1358,13 +1372,52 @@ def format_healthcheck_report(results: list, *, brief_on_success: bool = True) -
     return "\n".join(lines)
 
 
+# v10.9.65：警報 24h dedup —— 同一筆 (user, stock, type) 24 小時內只發一次
+ALERT_HISTORY_FILE = "/tmp/lumistock_alert_history.json"
+ALERT_DEDUP_TTL = 86400  # 24 小時
+
+def _load_alert_history() -> dict:
+    try:
+        if os.path.exists(ALERT_HISTORY_FILE):
+            with open(ALERT_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except: pass
+    return {}
+
+def _save_alert_history(history: dict) -> None:
+    try:
+        with open(ALERT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f)
+    except Exception as e:
+        dlog("PORTFOLIO-ALERT", f"alert history 寫入失敗：{e}")
+
+ALERT_HISTORY = _load_alert_history()
+
+def _should_alert(uid: str, sid: str, alert_type: str) -> bool:
+    """24h dedup：同一 (user, stock, type) 24 小時內只通報一次。"""
+    key = f"{uid}|{sid}|{alert_type}"
+    last = ALERT_HISTORY.get(key, 0)
+    now_ts = time.time()
+    if (now_ts - last) < ALERT_DEDUP_TTL:
+        return False
+    ALERT_HISTORY[key] = now_ts
+    # 順便清掉超過 7 天的舊紀錄，避免無限長大
+    cutoff = now_ts - 7 * 86400
+    stale_keys = [k for k, v in ALERT_HISTORY.items() if v < cutoff]
+    for k in stale_keys:
+        ALERT_HISTORY.pop(k, None)
+    _save_alert_history(ALERT_HISTORY)
+    return True
+
+
 def run_portfolio_alerts() -> dict:
     """v10.9.63：掃描所有使用者持股，收集警報。
+    v10.9.65：加 24h dedup（同一筆 user × stock × type 一日只發一次）。
     回傳 {user_id: [alert_msg, ...]}
     觸發條件：
-      a) 現價 ≤ 系統建議停損價 → ⚠️ 跌破
-      b) 現價 ≥ 系統建議目標價 × 0.95 → 📈 接近目標
-      c) 今日 = 除權息日 → 💰 今日除息
+      a) 現價 ≤ 系統建議停損價 → ⚠️ 跌破（dedup key: stop_loss）
+      b) 現價 ≥ 系統建議目標價 × 0.95 → 📈 接近目標（dedup key: near_target）
+      c) 今日 = 除權息日 → 💰 今日除息（dedup key: ex_dividend）
     """
     alerts_by_user = {}
     try:
@@ -1393,7 +1446,7 @@ def run_portfolio_alerts() -> dict:
                 adv = _get_portfolio_advice(sid)
                 # 觸發 a) 跌破停損
                 sl = adv.get("stop_loss")
-                if sl and price <= sl:
+                if sl and price <= sl and _should_alert(uid, sid, "stop_loss"):
                     pct_below = (price - sl) / sl * 100
                     user_alerts.append(
                         f"⚠️ {symbol} {name}\n"
@@ -1402,7 +1455,9 @@ def run_portfolio_alerts() -> dict:
                     )
                 # 觸發 b) 接近目標（不重疊 a）
                 tg = adv.get("target")
-                if tg and not (sl and price <= sl) and price >= tg * 0.95:
+                if (tg and not (sl and price <= sl)
+                    and price >= tg * 0.95
+                    and _should_alert(uid, sid, "near_target")):
                     diff = (tg - price) / tg * 100
                     user_alerts.append(
                         f"📈 {symbol} {name}\n"
@@ -1410,7 +1465,8 @@ def run_portfolio_alerts() -> dict:
                         f"　距目標 {abs(diff):.1f}%，可考慮停利"
                     )
                 # 觸發 c) 今日除息
-                if adv.get("ex_div_date") == today:
+                if (adv.get("ex_div_date") == today
+                    and _should_alert(uid, sid, "ex_dividend")):
                     cash = adv.get("ex_div_cash", 0)
                     stock = adv.get("ex_div_stock", 0)
                     div_text = f"現金 {cash} 元"
