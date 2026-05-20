@@ -1,6 +1,16 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.55（每日自動健檢 + 立即測試 — Phase 1 #4）
+LINE Bot 模組 v10.9.56（健檢升級為 Flex 卡片 — Phase 1 #3A）
+
+【v10.9.56 更新】
+1. 新增 make_health_flex()：粉嫩 Flex dashboard，比純文字更專業
+   - Header（杏粉 #E8B8A8）：💗 系統健檢 / 版本 / 運行時長 / 啟動時間
+   - Body：資料源狀態列（icon + 名稱 + 成功率 + 最後活動 + 錯誤訊息）
+   - 系統資訊：名稱快取、Groq AI、FinMind token 狀態
+2. 「健檢」/「系統健檢」/「health」改為回 Flex（Flex 失敗時 fallback 純文字）
+3. 新增「健檢文字」指令保留純文字版（給 debug 用）
+
+【v10.9.55】每日自動健檢 + 立即測試 — Phase 1 #4
 
 【v10.9.55 更新】
 1. 新增 run_healthcheck_tests()：依序測試 8 個關鍵項目
@@ -121,7 +131,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.55"
+VERSION              = "10.9.56"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -255,6 +265,96 @@ def _fmt_uptime() -> str:
     if sec < 3600: return f"{sec//60} 分"
     if sec < 86400: return f"{sec//3600} 小時 {(sec%3600)//60} 分"
     return f"{sec//86400} 天 {(sec%86400)//3600} 小時"
+
+def make_health_flex() -> dict:
+    """v10.9.56：Flex 版健檢面板（粉嫩 dashboard 風格）。
+    Header：💗 系統健檢 / 版本 / 運行時長
+    Body：各資料源狀態列（icon + 名稱 + 最後活動 + 成功率）
+    Footer：系統資訊（名稱快取、token 狀態）
+    """
+    # 整理資料源狀態
+    if HEALTH_STATE:
+        items = sorted(
+            HEALTH_STATE.items(),
+            key=lambda kv: (kv[1].get("last_ok_at") or kv[1].get("last_fail_at") or now_taipei()),
+            reverse=True,
+        )
+    else:
+        items = []
+
+    source_boxes = []
+    for source, s in items:
+        ok_n = s["ok_count"]
+        fail_n = s["fail_count"]
+        total = ok_n + fail_n
+        ok_at = s.get("last_ok_at")
+        fail_at = s.get("last_fail_at")
+        if fail_n == 0 and ok_n > 0:
+            icon, color = "✅", "#A05A48"
+        elif ok_n == 0 and fail_n > 0:
+            icon, color = "❌", "#D97A5C"
+        elif fail_at and ok_at and fail_at > ok_at:
+            icon, color = "⚠️", "#E89B82"
+        else:
+            icon, color = "✅", "#A05A48"
+        rate = (ok_n / total * 100) if total else 0
+        last_activity = _fmt_health_ts(ok_at) if ok_at else (_fmt_health_ts(fail_at) if fail_at else "從未")
+        source_boxes.append({
+            "type":"box","layout":"horizontal","spacing":"sm",
+            "contents":[
+                {"type":"text","text":f"{icon} {source}","size":"xs","color":color,"weight":"bold","flex":4,"wrap":True},
+                {"type":"text","text":f"{rate:.0f}%","size":"xs","color":color,"flex":1,"align":"end"},
+            ]
+        })
+        source_boxes.append({
+            "type":"text","text":f"　最後活動 {last_activity}　成功 {ok_n} ／失敗 {fail_n}",
+            "size":"xxs","color":"#9B6B5A","wrap":True,
+        })
+        if fail_n and s.get("last_error"):
+            source_boxes.append({
+                "type":"text","text":f"　錯誤：{s['last_error']}",
+                "size":"xxs","color":"#D97A5C","wrap":True,
+            })
+
+    if not source_boxes:
+        source_boxes = [{"type":"text","text":"尚無資料源被呼叫過","size":"xs","color":"#9B6B5A","align":"center"}]
+
+    return {
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#E8B8A8","paddingAll":"14px",
+            "contents":[
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"💗 系統健檢","size":"lg","color":"#FFFFFF","weight":"bold","flex":1},
+                    {"type":"text","text":f"v{VERSION}","size":"xs","color":"#FDF6F0","align":"end","gravity":"bottom","flex":1},
+                ]},
+                {"type":"text","text":f"運行 {_fmt_uptime()} ‧ 啟動 {SYSTEM_START_AT.strftime('%m/%d %H:%M')}",
+                 "size":"xxs","color":"#F0D5C0","margin":"sm"},
+            ]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"sm",
+            "contents":[
+                {"type":"text","text":"📊 資料源狀態","size":"sm","color":"#A05A48","weight":"bold"},
+                *source_boxes,
+                {"type":"separator","color":"#E8C4B4","margin":"md"},
+                {"type":"text","text":"📌 系統資訊","size":"sm","color":"#A05A48","weight":"bold","margin":"sm"},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"名稱快取","size":"xxs","color":"#9B6B5A","flex":2},
+                    {"type":"text","text":f"{len(NAME_CACHE):,} 筆","size":"xxs","color":"#5B4040","flex":3,"weight":"bold"},
+                ]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"Groq AI","size":"xxs","color":"#9B6B5A","flex":2},
+                    {"type":"text","text":("啟用" if GROQ_AVAILABLE else "未設定"),
+                     "size":"xxs","color":("#A05A48" if GROQ_AVAILABLE else "#D97A5C"),"flex":3,"weight":"bold"},
+                ]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"FinMind","size":"xxs","color":"#9B6B5A","flex":2},
+                    {"type":"text","text":("已設 token" if FINMIND_TOKEN else "未設（免費 600/hr）"),
+                     "size":"xxs","color":("#A05A48" if FINMIND_TOKEN else "#9B6B5A"),"flex":3,"weight":"bold"},
+                ]},
+                {"type":"separator","color":"#E8C4B4","margin":"md"},
+                {"type":"text","text":"輸入「立即測試」可主動 ping 所有 API","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"},
+            ]}
+    }
+
 
 def get_health_summary() -> str:
     """產生系統健檢純文字訊息（Owner / Admin 用）。
@@ -4983,8 +5083,18 @@ def handle_message(event):
                 f"📊 NAME_CACHE 狀態\n━━━━━━━━━━━━━━\n"
                 f"總筆數：{total}\n載入完成：{'✅' if NAME_CACHE_LOADED else '⏳載入中'}\n前5筆：\n{ss}"); return
         elif text in ["健檢", "系統健檢", "health"]:
-            # v10.9.53：Owner 健檢面板（各資料源狀態 / 成功率 / 系統資訊）
-            dlog("HANDLER", "→ 系統健檢")
+            # v10.9.56：Flex 版健檢面板（粉嫩 dashboard，比純文字更專業）
+            dlog("HANDLER", "→ 系統健檢（Flex）")
+            try:
+                flex = make_health_flex()
+                reply_flex(event.reply_token, flex, "系統健檢")
+            except Exception as e:
+                dlog("HEALTHCHECK", f"Flex 失敗 fallback 文字：{e}")
+                reply_text(event.reply_token, get_health_summary())
+            return
+        elif text in ["健檢文字", "系統健檢文字"]:
+            # 純文字版備用（給 debug 看完整資訊）
+            dlog("HANDLER", "→ 系統健檢（文字版）")
             reply_text(event.reply_token, get_health_summary()); return
         elif text in ["立即測試", "立即健檢", "ping"]:
             # v10.9.55：手動觸發完整 API 測試（同 06:30 自動跑的內容）
