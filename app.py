@@ -1,8 +1,17 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.50（修：櫃買指數等 Yahoo 指數報價錯誤）
+LINE Bot 模組 v10.9.51（修：櫃買指數改用 TPEx 官方來源）
 
-【v10.9.50 更新】
+【v10.9.51 更新】
+1. 新增 get_taiwan_otc_index()：用 TPEx 官方 openapi/v1/tpex_index 抓櫃買指數
+   - 問題深挖：Yahoo ^TWOII 不只 rmp 卡 2024 舊值，連 close 陣列日期也偏移 1 天
+     （Yahoo 把 5/19 的值標成 5/20，5/18 的標成 5/19，依此類推）
+   - 結果：使用者跟富邦比對發現 Lumistock 顯示 398.18 但實際 5/20 應為 396.42
+   - 修法：櫃買指數完全棄用 Yahoo，改用 TPEx 自家 OpenAPI，權威且資料對齊
+2. MARKET_SYMBOLS["查櫃買指數"] 用 __TPEXIDX__ 標記，handler 走特殊分支
+3. 回傳含 meta（source="TPEx 官方"）→ 卡片底部會顯示「✓ 主來源」
+
+【v10.9.50】
 1. 修正 get_yahoo_quote：偵測 regularMarketPrice 過時或異常時改用日線 close
    - 觸發：櫃買指數 ^TWOII 的 regularMarketPrice 卡在 2024-10-12 舊值 269.45，
      但實際近日收盤是 400+，導致漲跌幅出現 -34% 等荒謬數字
@@ -64,7 +73,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.50"
+VERSION              = "10.9.51"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2090,7 +2099,7 @@ FOREX_SYMBOLS = {
 MARKET_SYMBOLS = {
     # 🇹🇼 台股
     "查台股加權": ("^TWII",  "台股加權指數"),
-    "查櫃買指數": ("^TWOII", "台灣櫃買指數"),
+    "查櫃買指數": ("__TPEXIDX__", "台灣櫃買指數"),  # v10.9.51：改用 TPEx 官方
     # 🇺🇸 美股
     "查道瓊":    ("^DJI",   "道瓊工業指數"),
     "查Nasdaq":  ("^IXIC",  "那斯達克指數"),
@@ -2448,6 +2457,53 @@ def get_yahoo_quote(symbol: str) -> dict:
     except Exception as e:
         dlog("YAHOO", f"get_yahoo_quote({symbol}) 失敗：{type(e).__name__}: {e}")
         return {}
+
+
+def get_taiwan_otc_index() -> dict:
+    """抓台灣櫃買指數（櫃買指數）— 用 TPEx 官方 OpenAPI。
+    v10.9.51：放棄 Yahoo（^TWOII rmp 卡 2024 舊值且 close 陣列日期偏移 1 天），
+              改用 TPEx 自己的 openapi/v1/tpex_index，資料權威且無 IP 阻擋。
+    Endpoint: https://www.tpex.org.tw/openapi/v1/tpex_index
+    回傳結構與 get_yahoo_quote 一致，方便上層 make_quote_flex 直接套用。
+    """
+    url = "https://www.tpex.org.tw/openapi/v1/tpex_index"
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            dlog("TPEX", f"櫃買指數 HTTP {r.status_code}")
+            return {}
+        rows = r.json()
+        if not isinstance(rows, list) or not rows:
+            dlog("TPEX", "櫃買指數回應為空")
+            return {}
+        # 依 Date 排序，取最後兩筆
+        rows = sorted(rows, key=lambda x: x.get("Date",""))
+        last = rows[-1]
+        prev = rows[-2] if len(rows) >= 2 else last
+        try:
+            price = float(str(last.get("Close","0")).replace(",",""))
+            prev_close = float(str(prev.get("Close","0")).replace(",",""))
+            chg_str = str(last.get("Change","0")).strip().replace(",","")
+            chg = float(chg_str) if chg_str else (price - prev_close)
+            pct = chg / prev_close * 100 if prev_close else 0
+        except Exception as e:
+            dlog("TPEX", f"櫃買指數解析失敗：{e}")
+            return {}
+        date_str = str(last.get("Date",""))
+        # 判斷是否為今日資料（盤後 OpenAPI 通常會更新到當日收盤）
+        today_str = now_taipei().strftime("%Y%m%d")
+        is_today = (date_str == today_str)
+        return {
+            "price": price, "chg": chg, "pct": pct,
+            "ms": "REGULAR" if is_today else "POST",
+            "meta": build_data_meta("TPEx 官方", is_realtime=False,
+                                    is_fallback=False,
+                                    delay_min=0 if is_today else 1440),
+        }
+    except Exception as e:
+        dlog("TPEX", f"get_taiwan_otc_index 失敗：{type(e).__name__}: {e}")
+        return {}
+
 
 def make_quote_flex(name: str, data: dict, color: str = "#5B8DB8") -> dict:
     if not data: return None
@@ -4399,6 +4455,17 @@ def handle_message(event):
                     reply_flex(event.reply_token, flex, name)
                     return
             reply_text(event.reply_token, "⚠️ 台灣金價取得失敗\n請稍後再試")
+            return
+        # v10.9.51：櫃買指數改用 TPEx 官方（Yahoo ^TWOII 資料偏移 1 天且 rmp 卡舊值）
+        if sym == "__TPEXIDX__":
+            dlog("HANDLER", "→ 查櫃買指數（TPEx 官方）")
+            data = get_taiwan_otc_index()
+            if data:
+                flex = make_quote_flex(name, data, "#5B8DB8")
+                if flex:
+                    reply_flex(event.reply_token, flex, name)
+                    return
+            reply_text(event.reply_token, "⚠️ 櫃買指數暫時無法取得\n請稍後再試")
             return
         # 一般指數
         data = get_yahoo_quote(sym)
