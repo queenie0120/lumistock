@@ -1,6 +1,24 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.60（修正：除權息改為 lazy load per-stock）
+LINE Bot 模組 v10.9.61（健檢合理範圍改為動態 — 解決 hardcode 跟不上市場）
+
+【v10.9.61 更新】
+使用者反映：「現在市場很多股票漲很兇，似乎要看市場」
+問題：hardcode SANITY_RANGES（2454 設 300-3000）跟不上實際 3,230 元 → 誤報
+
+改動：
+1. 刪除 SANITY_RANGES 硬編碼字典
+2. 新增 _get_dynamic_sanity_range(key, source) + 6 小時快取
+   - finmind_tw：抓還原股價近 60 天 close
+   - yahoo_index：抓 Yahoo chart 近 3 個月 close
+3. 範圍公式：(近 60 天 min × 0.7, 近 60 天 max × 1.3)
+   - 30% 餘裕給市場波動（台股單日 ±10%）
+   - 只有真的異常（如 Yahoo 給 269 vs 實際 400）才警報
+4. run_healthcheck_tests 重構改用動態範圍
+   - 報告中顯示範圍：「範圍外 (1,500-2,800，近 60 天)」
+   - 沒歷史資料時 fallback 到「price > 0」基本檢查
+
+【v10.9.60】除權息改為 lazy load per-stock
 
 【v10.9.60 修正】
 - 發現 FinMind TaiwanStockDividend 不支援全市場 broad query（只回 3 筆/年）
@@ -185,7 +203,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.60"
+VERSION              = "10.9.61"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1134,16 +1152,47 @@ def start_ex_dividend_scheduler():
 # ══════════════════════════════════════════
 _HEALTHCHECK_SCHEDULER_STARTED = False
 
-# 合理性範圍：(min, max)，超出視為異常
-SANITY_RANGES = {
-    "加權指數":   (10000, 60000),
-    "櫃買指數":   (50, 1000),
-    "道瓊":      (20000, 80000),
-    "Nasdaq":    (5000, 50000),
-    "2330 台積電": (300, 5000),
-    "0050":      (50, 500),
-    "2454 聯發科": (300, 3000),
-}
+# v10.9.61：合理性範圍改為「從歷史收盤動態計算」而非寫死
+# 公式：(近 60 天 min × 0.7, 近 60 天 max × 1.3)
+# 餘裕 30% 給市場波動（台股單日 ±10%，留 3 倍 buffer）
+SANITY_RANGE_CACHE = {}  # key -> (range_tuple, computed_at_ts)
+SANITY_RANGE_TTL = 6 * 3600  # 6 小時重算
+
+
+def _get_dynamic_sanity_range(key: str, source: str = "finmind_tw") -> tuple:
+    """從近 60 天歷史收盤動態計算合理範圍。
+    key: stock_id (TW) 或 Yahoo symbol（^TWII / ^DJI / ^IXIC）
+    source: "finmind_tw" / "yahoo_index"
+    回傳 (low, high) 或 None（無歷史資料）
+    """
+    now_ts = time.time()
+    cached = SANITY_RANGE_CACHE.get(key)
+    if cached and (now_ts - cached[1]) < SANITY_RANGE_TTL:
+        return cached[0]
+    closes = []
+    try:
+        if source == "finmind_tw":
+            closes = _load_finmind_closes_adj(key)
+        elif source == "yahoo_index":
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{key}?interval=1d&range=3mo"
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            data = r.json()["chart"]["result"][0]
+            quotes = data.get("indicators", {}).get("quote", [{}])[0]
+            closes = [c for c in quotes.get("close", []) if c is not None]
+    except Exception as e:
+        dlog("HEALTHCHECK", f"動態範圍 {key} 失敗：{type(e).__name__}")
+    if not closes or len(closes) < 5:
+        return None
+    closes = closes[-60:]
+    lo, hi = min(closes), max(closes)
+    rng = (lo * 0.7, hi * 1.3)
+    SANITY_RANGE_CACHE[key] = (rng, now_ts)
+    return rng
+
+
+def _format_range(rng: tuple) -> str:
+    if not rng: return "N/A"
+    return f"{rng[0]:,.0f}–{rng[1]:,.0f}"
 
 def run_healthcheck_tests() -> list:
     """逐項測試關鍵資料源，回傳 [(name, ok, value_or_msg, detail), ...]"""
@@ -1167,58 +1216,54 @@ def run_healthcheck_tests() -> list:
         results.append(("FinMind StockInfo", False, f"{type(e).__name__}: {e}", ""))
         record_health("FinMind", False, f"{type(e).__name__}: {e}")
 
-    # === TPEx 官方櫃買指數 ===
+    # === TPEx 官方櫃買指數（動態範圍：用 ^TWOII Yahoo close 算）===
     try:
         d = get_taiwan_otc_index()
         price = d.get("price", 0) if d else 0
-        lo, hi = SANITY_RANGES["櫃買指數"]
-        ok = bool(d) and lo <= price <= hi
-        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
+        rng = _get_dynamic_sanity_range("^TWOII", source="yahoo_index")
+        if rng:
+            lo, hi = rng
+            ok = bool(d) and lo <= price <= hi
+            detail = "" if ok else (f"範圍外 ({_format_range(rng)}，近 60 天)" if d else "空回應")
+        else:
+            ok = bool(d) and price > 0
+            detail = "" if ok else "空回應或 price<=0"
         results.append(("TPEx 櫃買指數", ok, f"{price:,.2f}" if d else "無資料", detail))
     except Exception as e:
         results.append(("TPEx 櫃買指數", False, f"{type(e).__name__}: {e}", ""))
 
-    # === Yahoo 加權指數 ^TWII ===
-    try:
-        d = get_yahoo_quote("^TWII")
-        price = d.get("price", 0) if d else 0
-        lo, hi = SANITY_RANGES["加權指數"]
-        ok = bool(d) and lo <= price <= hi
-        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
-        results.append(("Yahoo 加權指數", ok, f"{price:,.2f}" if d else "無資料", detail))
-    except Exception as e:
-        results.append(("Yahoo 加權指數", False, f"{type(e).__name__}: {e}", ""))
+    # === Yahoo 指數動態範圍批次測 ===
+    for sym, label in [("^TWII", "Yahoo 加權指數"), ("^DJI", "Yahoo 道瓊"),
+                        ("^IXIC", "Yahoo Nasdaq")]:
+        try:
+            d = get_yahoo_quote(sym)
+            price = d.get("price", 0) if d else 0
+            rng = _get_dynamic_sanity_range(sym, source="yahoo_index")
+            if rng:
+                lo, hi = rng
+                ok = bool(d) and lo <= price <= hi
+                detail = "" if ok else (f"範圍外 ({_format_range(rng)}，近 60 天)" if d else "空回應")
+            else:
+                ok = bool(d) and price > 0
+                detail = "" if ok else "空回應或 price<=0"
+            results.append((label, ok, f"{price:,.2f}" if d else "無資料", detail))
+        except Exception as e:
+            results.append((label, False, f"{type(e).__name__}: {e}", ""))
 
-    # === Yahoo 道瓊 ===
-    try:
-        d = get_yahoo_quote("^DJI")
-        price = d.get("price", 0) if d else 0
-        lo, hi = SANITY_RANGES["道瓊"]
-        ok = bool(d) and lo <= price <= hi
-        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
-        results.append(("Yahoo 道瓊", ok, f"{price:,.2f}" if d else "無資料", detail))
-    except Exception as e:
-        results.append(("Yahoo 道瓊", False, f"{type(e).__name__}: {e}", ""))
-
-    # === Yahoo Nasdaq ===
-    try:
-        d = get_yahoo_quote("^IXIC")
-        price = d.get("price", 0) if d else 0
-        lo, hi = SANITY_RANGES["Nasdaq"]
-        ok = bool(d) and lo <= price <= hi
-        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
-        results.append(("Yahoo Nasdaq", ok, f"{price:,.2f}" if d else "無資料", detail))
-    except Exception as e:
-        results.append(("Yahoo Nasdaq", False, f"{type(e).__name__}: {e}", ""))
-
-    # === 熱門股 2330 / 0050 / 2454 ===
-    for sid, label in [("2330", "2330 台積電"), ("0050", "0050"), ("2454", "2454 聯發科")]:
+    # === 熱門個股動態範圍 ===
+    for sid, label in [("2330", "2330 台積電"), ("0050", "0050"),
+                        ("2454", "2454 聯發科")]:
         try:
             d = get_tw_stock(sid)
             price = d.get("price", 0) if d else 0
-            lo, hi = SANITY_RANGES.get(label, (1, 10000))
-            ok = bool(d) and lo <= price <= hi
-            detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "查無")
+            rng = _get_dynamic_sanity_range(sid, source="finmind_tw")
+            if rng:
+                lo, hi = rng
+                ok = bool(d) and lo <= price <= hi
+                detail = "" if ok else (f"範圍外 ({_format_range(rng)}，近 60 天)" if d else "查無")
+            else:
+                ok = bool(d) and price > 0
+                detail = "" if ok else "查無或 price<=0"
             results.append((f"台股 {label}", ok, f"{price:,.2f}" if d else "無資料", detail))
         except Exception as e:
             results.append((f"台股 {label}", False, f"{type(e).__name__}: {e}", ""))
