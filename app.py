@@ -1,6 +1,22 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.54（系統健檢按鈕加入選單，方便一鍵呼叫）
+LINE Bot 模組 v10.9.55（每日自動健檢 + 立即測試 — Phase 1 #4）
+
+【v10.9.55 更新】
+1. 新增 run_healthcheck_tests()：依序測試 8 個關鍵項目
+   - FinMind StockInfo
+   - TPEx 官方櫃買指數
+   - Yahoo 加權指數 / 道瓊 / Nasdaq
+   - 台股 2330 台積電 / 0050 / 2454 聯發科
+   每項含合理性範圍檢查（例：櫃買 50-1000，加權 10000-60000）
+2. 新增 format_healthcheck_report()：成功時 brief 早安、失敗時詳細報告
+3. 新增 _run_daily_healthcheck() + scheduler，每天台北時間 06:30 自動跑
+   - 通過 → push「🌸 早安，系統一切正常」
+   - 失敗 → push「🚨 自動健檢報告」含每項細節
+4. 新增 Owner 指令「立即測試」/「立即健檢」/「ping」→ 背景跑 + push 完整報告
+5. 「立即測試所有 API」按鈕加進「系統管理」Flex 選單
+
+【v10.9.54】系統健檢按鈕加入選單，方便一鍵呼叫
 
 【v10.9.54 更新】
 1. make_admin_menu_flex（管理後台）最上方加「💗 系統健檢」按鈕
@@ -105,7 +121,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.54"
+VERSION              = "10.9.55"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -808,6 +824,188 @@ def start_ex_dividend_scheduler():
     dlog("EXDIV-AUTO", "✅ 除權息自動更新排程器已啟動")
 
 
+# ══════════════════════════════════════════
+#  自動化健檢測試（v10.9.55）— Phase 1 #4
+#  每天台北時間 06:30 自動跑：
+#    - 各資料源 ping 測試
+#    - 指數合理性檢查（櫃買 / 加權 / 道瓊 / Nasdaq）
+#    - 熱門股查詢測試（2330 / 0050 / 2454）
+#  失敗→push 詳細報告給 Owner；成功→push 簡短早安通知
+# ══════════════════════════════════════════
+_HEALTHCHECK_SCHEDULER_STARTED = False
+
+# 合理性範圍：(min, max)，超出視為異常
+SANITY_RANGES = {
+    "加權指數":   (10000, 60000),
+    "櫃買指數":   (50, 1000),
+    "道瓊":      (20000, 80000),
+    "Nasdaq":    (5000, 50000),
+    "2330 台積電": (300, 5000),
+    "0050":      (50, 500),
+    "2454 聯發科": (300, 3000),
+}
+
+def run_healthcheck_tests() -> list:
+    """逐項測試關鍵資料源，回傳 [(name, ok, value_or_msg, detail), ...]"""
+    results = []
+
+    # === FinMind StockInfo ===
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {"dataset": "TaiwanStockInfo"}
+        if FINMIND_TOKEN:
+            params["token"] = FINMIND_TOKEN
+        r = requests.get(url, params=params, timeout=15)
+        payload = r.json() if r.status_code == 200 else {}
+        rows = payload.get("data") or []
+        ok = (r.status_code == 200 and payload.get("status") == 200 and len(rows) > 100)
+        results.append(("FinMind StockInfo", ok,
+                        f"{len(rows)} 筆" if ok else f"HTTP {r.status_code} / msg: {payload.get('msg','')[:80]}",
+                        ""))
+        record_health("FinMind", ok, "" if ok else payload.get("msg","")[:80])
+    except Exception as e:
+        results.append(("FinMind StockInfo", False, f"{type(e).__name__}: {e}", ""))
+        record_health("FinMind", False, f"{type(e).__name__}: {e}")
+
+    # === TPEx 官方櫃買指數 ===
+    try:
+        d = get_taiwan_otc_index()
+        price = d.get("price", 0) if d else 0
+        lo, hi = SANITY_RANGES["櫃買指數"]
+        ok = bool(d) and lo <= price <= hi
+        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
+        results.append(("TPEx 櫃買指數", ok, f"{price:,.2f}" if d else "無資料", detail))
+    except Exception as e:
+        results.append(("TPEx 櫃買指數", False, f"{type(e).__name__}: {e}", ""))
+
+    # === Yahoo 加權指數 ^TWII ===
+    try:
+        d = get_yahoo_quote("^TWII")
+        price = d.get("price", 0) if d else 0
+        lo, hi = SANITY_RANGES["加權指數"]
+        ok = bool(d) and lo <= price <= hi
+        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
+        results.append(("Yahoo 加權指數", ok, f"{price:,.2f}" if d else "無資料", detail))
+    except Exception as e:
+        results.append(("Yahoo 加權指數", False, f"{type(e).__name__}: {e}", ""))
+
+    # === Yahoo 道瓊 ===
+    try:
+        d = get_yahoo_quote("^DJI")
+        price = d.get("price", 0) if d else 0
+        lo, hi = SANITY_RANGES["道瓊"]
+        ok = bool(d) and lo <= price <= hi
+        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
+        results.append(("Yahoo 道瓊", ok, f"{price:,.2f}" if d else "無資料", detail))
+    except Exception as e:
+        results.append(("Yahoo 道瓊", False, f"{type(e).__name__}: {e}", ""))
+
+    # === Yahoo Nasdaq ===
+    try:
+        d = get_yahoo_quote("^IXIC")
+        price = d.get("price", 0) if d else 0
+        lo, hi = SANITY_RANGES["Nasdaq"]
+        ok = bool(d) and lo <= price <= hi
+        detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "空回應")
+        results.append(("Yahoo Nasdaq", ok, f"{price:,.2f}" if d else "無資料", detail))
+    except Exception as e:
+        results.append(("Yahoo Nasdaq", False, f"{type(e).__name__}: {e}", ""))
+
+    # === 熱門股 2330 / 0050 / 2454 ===
+    for sid, label in [("2330", "2330 台積電"), ("0050", "0050"), ("2454", "2454 聯發科")]:
+        try:
+            d = get_tw_stock(sid)
+            price = d.get("price", 0) if d else 0
+            lo, hi = SANITY_RANGES.get(label, (1, 10000))
+            ok = bool(d) and lo <= price <= hi
+            detail = "" if ok else (f"範圍外 ({lo}-{hi})" if d else "查無")
+            results.append((f"台股 {label}", ok, f"{price:,.2f}" if d else "無資料", detail))
+        except Exception as e:
+            results.append((f"台股 {label}", False, f"{type(e).__name__}: {e}", ""))
+
+    return results
+
+
+def format_healthcheck_report(results: list, *, brief_on_success: bool = True) -> str:
+    """組裝健檢報告純文字。
+    全綠時回 brief 早安；有任何失敗則回完整報告（含每項細節）。
+    """
+    total = len(results)
+    ok_n  = sum(1 for r in results if r[1])
+    fail_n = total - ok_n
+    ts = now_taipei().strftime("%m/%d %H:%M")
+
+    if fail_n == 0 and brief_on_success:
+        return (f"🌸 早安，系統一切正常\n━━━━━━━━━━━━━━\n"
+                f"自動健檢時間：{ts}\n"
+                f"通過：{ok_n}/{total} ✅\n"
+                f"全部資料源運作正常 💗")
+
+    icon = "🚨" if fail_n else "✨"
+    lines = [f"{icon} 自動健檢報告  {ts}",
+             "━━━━━━━━━━━━━━",
+             f"通過：{ok_n}/{total}　失敗：{fail_n}",
+             ""]
+    for name, ok, value, detail in results:
+        sym = "✅" if ok else "❌"
+        lines.append(f"{sym} {name}")
+        lines.append(f"　值：{value}")
+        if detail:
+            lines.append(f"　問題：{detail}")
+    lines.append("")
+    lines.append("（輸入「健檢」查詢累積統計）")
+    return "\n".join(lines)
+
+
+def _run_daily_healthcheck():
+    """執行每日自動健檢 + 排下一次"""
+    dlog("HEALTHCHECK-AUTO", "🔄 開始每日自動健檢")
+    try:
+        results = run_healthcheck_tests()
+        ok_n = sum(1 for r in results if r[1])
+        total = len(results)
+        report = format_healthcheck_report(results, brief_on_success=True)
+        dlog("HEALTHCHECK-AUTO", f"完成：{ok_n}/{total} 通過")
+        try:
+            push_to_owner(report)
+        except Exception as e:
+            dlog("HEALTHCHECK-AUTO", f"推播失敗：{e}")
+    except Exception as e:
+        dlog("HEALTHCHECK-AUTO", f"❌ 例外：{type(e).__name__}: {e}")
+        try:
+            push_to_owner(f"🚨 自動健檢執行例外\n{type(e).__name__}: {e}")
+        except: pass
+    finally:
+        _schedule_next_healthcheck()
+
+
+def _schedule_next_healthcheck():
+    """計算到下一個台北時間 06:30 的秒數，設定 Timer"""
+    try:
+        now = now_taipei()
+        next_run = now.replace(hour=6, minute=30, second=0, microsecond=0)
+        if now >= next_run:
+            next_run += timedelta(days=1)
+        delay_seconds = (next_run - now).total_seconds()
+        timer = threading.Timer(delay_seconds, _run_daily_healthcheck)
+        timer.daemon = True
+        timer.start()
+        hours = delay_seconds / 3600
+        dlog("HEALTHCHECK-AUTO", f"⏰ 下次自動健檢：{next_run.strftime('%m/%d %H:%M')}（{hours:.1f} 小時後）")
+    except Exception as e:
+        dlog("HEALTHCHECK-AUTO", f"❌ 排程設定失敗：{type(e).__name__}: {e}")
+
+
+def start_healthcheck_scheduler():
+    """啟動每日健檢排程器（每天 06:30 執行）。多次呼叫只會啟動一次。"""
+    global _HEALTHCHECK_SCHEDULER_STARTED
+    if _HEALTHCHECK_SCHEDULER_STARTED:
+        return
+    _HEALTHCHECK_SCHEDULER_STARTED = True
+    _schedule_next_healthcheck()
+    dlog("HEALTHCHECK-AUTO", "✅ 自動健檢排程器已啟動")
+
+
 def _load_finmind_taiwan_stock_info() -> int:
     """FinMind TaiwanStockInfo：全市場股票名稱對照（上市+上櫃，約 4100 筆）
     解決 Render 海外 IP 被 TWSE ISIN 擋住的問題。
@@ -988,6 +1186,12 @@ def init_name_cache():
         start_ex_dividend_scheduler()
     except Exception as e:
         dlog("EXDIV-AUTO", f"❌ 排程器啟動失敗：{e}")
+
+    # v10.9.55：啟動每日自動健檢（每天 06:30，除權息更新後 30 分鐘）
+    try:
+        start_healthcheck_scheduler()
+    except Exception as e:
+        dlog("HEALTHCHECK-AUTO", f"❌ 排程器啟動失敗：{e}")
 
     try:
         push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
@@ -2213,6 +2417,7 @@ def make_system_mgmt_flex() -> dict:
     return make_menu_flex(
         "⚙️ 系統管理","點按鈕即可操作 ✨","#E8B8A8",
         [("💗 系統健檢","健檢"),                  # v10.9.54：監測入口，放第一個
+         ("🩺 立即測試所有 API","立即測試"),       # v10.9.55：手動觸發完整測試
          ("🔄 重新載入名稱快取","重載名稱"),
          ("📊 查看快取狀態","快取狀態"),
          ("🔍 查詢個別代號","查快取說明"),
@@ -4781,6 +4986,19 @@ def handle_message(event):
             # v10.9.53：Owner 健檢面板（各資料源狀態 / 成功率 / 系統資訊）
             dlog("HANDLER", "→ 系統健檢")
             reply_text(event.reply_token, get_health_summary()); return
+        elif text in ["立即測試", "立即健檢", "ping"]:
+            # v10.9.55：手動觸發完整 API 測試（同 06:30 自動跑的內容）
+            dlog("HANDLER", "→ 立即測試所有 API")
+            reply_text(event.reply_token, "🩺 開始測試所有 API...\n約 10-20 秒後回報結果")
+            def _bg():
+                try:
+                    results = run_healthcheck_tests()
+                    report = format_healthcheck_report(results, brief_on_success=False)
+                    push_to_owner(report)
+                except Exception as e:
+                    push_to_owner(f"🚨 立即測試例外\n{type(e).__name__}: {e}")
+            threading.Thread(target=_bg, daemon=True).start()
+            return
         elif text.startswith("查快取 "):
             sid=text.replace("查快取 ","").strip()
             cached=NAME_CACHE.get(sid,"（無）")
