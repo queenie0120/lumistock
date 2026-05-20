@@ -1,6 +1,15 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.59（A 計畫：除權息 + 三大法人 + 還原股價 全部接 FinMind）
+LINE Bot 模組 v10.9.60（修正：除權息改為 lazy load per-stock）
+
+【v10.9.60 修正】
+- 發現 FinMind TaiwanStockDividend 不支援全市場 broad query（只回 3 筆/年）
+- 但 per-stock query 回完整歷史（2330 25 筆 / 0050 13 筆）
+- 改用 lazy load：使用者查某檔股票時才抓該檔除權息
+- _lazy_load_exdiv_for_stock() 在 get_ex_dividend_info 第一次查時自動執行
+- 結果存入 EX_DIVIDEND_CALENDAR 供後續快取
+
+【v10.9.59】A 計畫：除權息 + 三大法人 + 還原股價 全部接 FinMind
 
 【v10.9.59 三大改動】
 
@@ -176,7 +185,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.59"
+VERSION              = "10.9.60"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -961,12 +970,79 @@ def load_ex_dividend_calendar() -> int:
     return total
 
 
+def _lazy_load_exdiv_for_stock(stock_id: str) -> None:
+    """v10.9.60：lazy load 個股除權息（FinMind dataset 不支援全市場 broad query，
+    只支援 per-stock，所以使用者查某檔時才補抓該檔的近期除權息）。
+    抓到後寫入 EX_DIVIDEND_CALENDAR 供 get_ex_dividend_info 使用。
+    """
+    if not FINMIND_TOKEN:
+        return
+    if stock_id in EX_DIVIDEND_CALENDAR:
+        return  # 已有資料就不重抓
+    now = now_taipei()
+    start_date = (now - timedelta(days=400)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockDividend",
+        "data_id": stock_id,
+        "start_date": start_date,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return
+        payload = r.json()
+        if payload.get("status") != 200:
+            return
+        rows = payload.get("data") or []
+        record_health("FinMind", True)
+        today_dt = now.replace(hour=0,minute=0,second=0,microsecond=0) - timedelta(days=1)
+        # 挑「除息日 ≥ 今天-1」最近的一筆
+        best = None
+        for row in rows:
+            try:
+                cash  = float(row.get("CashEarningsDistribution", 0) or 0)
+                stock = float(row.get("StockEarningsDistribution", 0) or 0)
+                if cash <= 0 and stock <= 0:
+                    continue
+                date_str = (row.get("CashExDividendTradingDate") or row.get("StockExDividendTradingDate") or "").strip()
+                if not date_str or "-" not in date_str:
+                    continue
+                parts = date_str.split("-")
+                yr, mo, dy = int(parts[0]), int(parts[1]), int(parts[2])
+                ex_dt = datetime(yr, mo, dy, tzinfo=TZ_TAIPEI)
+                if ex_dt < today_dt:
+                    continue
+                # 取最近未來的那筆
+                if not best or ex_dt < best["_dt"]:
+                    best = {
+                        "date": f"{yr:04d}{mo:02d}{dy:02d}",
+                        "cash": cash, "stock": stock,
+                        "adjusted_reference_price": None,
+                        "source": "finmind",
+                        "note": f"年度 {row.get('year','')}",
+                        "_dt": ex_dt,
+                    }
+            except: continue
+        if best:
+            best.pop("_dt", None)
+            EX_DIVIDEND_CALENDAR[stock_id] = best
+            dlog("EXDIV", f"lazy load {stock_id} → 除息日 {best['date']} 現金 {best['cash']}")
+    except Exception as e:
+        record_health("FinMind", False, f"Dividend lazy {type(e).__name__}")
+
+
 def get_ex_dividend_info(stock_id: str) -> dict:
     """查某檔股票是否「今天」是除權息日（v10.9.45 擴充：回傳 Phase 2 欄位）
+    v10.9.60：若 EX_DIVIDEND_CALENDAR 沒這檔，先 lazy load FinMind 補抓
 
     回傳 None = 今天不是除權息日
     回傳 dict = 完整除權息資訊（含 Phase 2 預留欄位）
     """
+    # v10.9.60：lazy load
+    if stock_id not in EX_DIVIDEND_CALENDAR:
+        _lazy_load_exdiv_for_stock(stock_id)
     if not EX_DIVIDEND_CALENDAR:
         return None
     info = EX_DIVIDEND_CALENDAR.get(stock_id)
