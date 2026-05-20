@@ -1,6 +1,19 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.57（個股新聞接 FinMind — Phase 2 #5A）
+LINE Bot 模組 v10.9.58（個股新聞 carousel — 從財經新聞→個股新聞→輸入代號 → 10 則新聞）
+
+【v10.9.58 更新】
+1. 新增 get_finmind_news_enriched()：回傳完整 dict（含 date / source / link / title），近 14 天
+2. 新增 make_stock_news_carousel()：粉嫩 Flex carousel，每張卡 1 則新聞
+   - Header（杏粉）：#N + 股票代號名稱 + 媒體 + 時間
+   - Body：完整標題
+   - Footer：📖 看完整按鈕（直接連去原文）
+3. 新增 WAITING_STOCK_NEWS state 字典 (user_id → timestamp，TTL 5 分鐘)
+4. 「個股新聞」設 state；下次輸入股票代號 → 回 carousel
+   - 個股查詢卡片仍維持 4 則（不變）
+   - 想看更多 → 走「財經新聞 → 個股新聞 → 輸入代號」路徑
+
+【v10.9.57】個股新聞接 FinMind — Phase 2 #5A
 
 【v10.9.57 更新】
 1. 新增 _load_finmind_news()：個股新聞主來源改為 FinMind TaiwanStockNews
@@ -143,7 +156,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.57"
+VERSION              = "10.9.58"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -154,6 +167,7 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(CHANNEL_SECRET)
 
 WAITING_SUGGESTION = set()
+WAITING_STOCK_NEWS = {}  # v10.9.58: user_id -> set_at_timestamp（5 分鐘內輸入股票代號 → 回新聞 carousel）
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 NAME_CACHE         = {}
 STARTUP_DONE       = False
@@ -3776,6 +3790,114 @@ def get_tw_stock_news(stock_id:str, cn_name:str, count:int=4)->list:
     return results[:count]
 
 
+def get_finmind_news_enriched(stock_id: str, count: int = 10) -> list:
+    """v10.9.58：抓 FinMind 個股新聞，回傳完整 dict（含 date / source / link / title）。
+    用於「個股新聞」carousel：要顯示媒體名 + 時間，所以不能簡化成 tuple。
+    """
+    if not FINMIND_TOKEN:
+        return []
+    end_date = now_taipei().strftime("%Y-%m-%d")
+    start_date = (now_taipei() - timedelta(days=14)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockNews",
+        "data_id": stock_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            record_health("FinMind", False, f"News HTTP {r.status_code}")
+            return []
+        payload = r.json()
+        if payload.get("status") != 200:
+            record_health("FinMind", False, f"News {payload.get('msg','')[:80]}")
+            return []
+        rows = payload.get("data") or []
+        record_health("FinMind", True)
+        rows.sort(key=lambda x: x.get("date",""), reverse=True)
+        seen_titles = set()
+        out = []
+        for r in rows:
+            title  = clean_title(r.get("title", "")).strip()
+            link   = (r.get("link") or "").strip()
+            source = (r.get("source") or "").strip()
+            date   = (r.get("date") or "").strip()
+            if not title or not link:
+                continue
+            if not is_real_news(title):
+                continue
+            norm = normalize_title(title)
+            if norm in seen_titles:
+                continue
+            seen_titles.add(norm)
+            out.append({"title": title, "url": link, "source": source, "date": date})
+            if len(out) >= count:
+                break
+        return out
+    except Exception as e:
+        dlog("NEWS", f"FinMind enriched 失敗：{type(e).__name__}: {e}")
+        record_health("FinMind", False, f"news enriched {type(e).__name__}")
+        return []
+
+
+def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict:
+    """v10.9.58：個股新聞 carousel — 每張卡 1 則新聞含媒體 / 時間 / 連結。粉嫩風格。"""
+    bubbles = []
+    for i, n in enumerate(news_dicts[:10], start=1):
+        title  = n.get("title", "")
+        url    = n.get("url", "")
+        source = n.get("source", "未知來源")
+        date   = n.get("date", "")
+        # 日期格式化：「2026-05-20 14:30:00」→「05/20 14:30」
+        date_short = date
+        try:
+            if len(date) >= 16:
+                date_short = date[5:16].replace("-", "/")
+        except: pass
+
+        bubble = {
+            "type": "bubble", "size": "kilo",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": "#E8B8A8", "paddingAll": "10px",
+                "contents": [
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": f"#{i}", "size": "xs",
+                         "color": "#FDF6F0", "flex": 0, "weight": "bold"},
+                        {"type": "text", "text": f"{stock_id} {name}", "size": "xs",
+                         "color": "#FFFFFF", "weight": "bold", "flex": 1, "margin": "sm"},
+                    ]},
+                    {"type": "text", "text": f"📰 {source}　{date_short}",
+                     "size": "xxs", "color": "#FDF6F0", "margin": "xs", "wrap": True},
+                ]
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": "#FDF6F0", "paddingAll": "12px",
+                "contents": [
+                    {"type": "text", "text": title, "size": "sm",
+                     "color": "#5B4040", "weight": "bold", "wrap": True},
+                ]
+            },
+            "footer": {
+                "type": "box", "layout": "vertical", "paddingAll": "8px",
+                "contents": [
+                    {"type": "button", "style": "primary", "color": "#E89B82",
+                     "height": "sm",
+                     "action": {"type": "uri", "label": "📖 看完整", "uri": url}}
+                ]
+            }
+        }
+        bubbles.append(bubble)
+
+    if not bubbles:
+        return None
+    return {"type": "carousel", "contents": bubbles}
+
+
 def _merge_news_lists(existing: list, new: list, max_count: int = 4) -> list:
     """合併新聞清單，依 normalize_title 去重，已存在的不加入。"""
     seen = {normalize_title(t) for t, _ in existing}
@@ -5130,8 +5252,10 @@ def handle_message(event):
         reply_text(event.reply_token, format_news_text(news,"🌏 地緣政治"))
         return
     if text=="個股新聞":
+        # v10.9.58：設定 5 分鐘內 state，下次輸入股票代號 → 回新聞 carousel（10 則）
+        WAITING_STOCK_NEWS[user_id] = time.time()
         reply_text_with_qr(event.reply_token,
-            "📊 個股新聞\n━━━━━━━━━━━━━━\n請直接輸入股票代號查詢\n例如：2330",
+            "📰 個股新聞\n━━━━━━━━━━━━━━\n請輸入股票代號，將回傳近 14 天最多 10 則新聞\n例如：2330",
             [("台積電","2330"),("聯發科","2454"),("鴻海","2317"),("廣達","2382")])
         return
 
@@ -5476,6 +5600,24 @@ def handle_message(event):
     # ══ 股票代號查詢 ══
     t=text.upper().replace("查","").strip()
     if t and (t.isdigit() or (t.isalpha() and len(t)>=1) or t.replace("-","").isalnum()):
+        # v10.9.58：「個股新聞」模式 — 5 分鐘內輸入代號 → 回新聞 carousel（不是個股 Flex）
+        waiting_at = WAITING_STOCK_NEWS.get(user_id)
+        if waiting_at and (time.time() - waiting_at) < 300:
+            WAITING_STOCK_NEWS.pop(user_id, None)
+            dlog("HANDLER", f"→ 個股新聞 carousel {t}")
+            # 嘗試解出中文名（先用快取，再用 fallback）
+            name = NAME_CACHE.get(t, "")
+            if not has_chinese(name):
+                name = get_tw_stock_name_fallback(t) or ""
+            news_dicts = get_finmind_news_enriched(t, count=10)
+            if news_dicts:
+                carousel = make_stock_news_carousel(t, name or t, news_dicts)
+                if carousel:
+                    reply_flex(event.reply_token, carousel, f"{t} 個股新聞")
+                    return
+            reply_text(event.reply_token,
+                f"📰 {t} {name}\n━━━━━━━━━━━━━━\n近 14 天無相關新聞\n或資料源暫時無法取得")
+            return
         dlog("HANDLER", f"→ 股票查詢 {t}")
         flex,err=get_stock_flex(t,user_id)
         if flex: reply_flex(event.reply_token,flex,f"{t} 股票資訊")
