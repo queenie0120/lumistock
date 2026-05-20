@@ -1,6 +1,22 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.52（資料來源 metadata 系統 PR #2B：大盤指數卡片）
+LINE Bot 模組 v10.9.53（Owner 系統健檢面板 — Phase 1 #3）
+
+【v10.9.53 更新】
+1. 新增 HEALTH_STATE 全域字典追蹤每個資料源的健康狀態
+2. 新增 record_health(source, ok, error) 與 get_health_summary()
+3. 已 instrument 的資料源（呼叫即記錄成功 / 失敗 + 錯誤訊息）：
+   - FinMind（_load_finmind_taiwan_stock_info）
+   - Yahoo Finance（get_yahoo_quote）
+   - TPEx 官方（get_taiwan_otc_index）
+   - Google Sheets（log_to_sheets）
+   - Groq AI（groq_chat）
+4. 新增 Owner 指令「健檢」/「系統健檢」/「health」→ 純文字面板
+   - 各資料源 icon（✅/⚠️/❌）、最後成功 / 失敗時間、累計次數、成功率、最近錯誤
+   - 系統資訊：版本、名稱快取大小、啟動時間、運行時間、Groq / FinMind token 狀態
+5. 命中願景紅線「我要知道哪個 API 壞了」
+
+【v10.9.52】資料來源 metadata 套用到大盤指數卡片（PR #2B）
 
 【v10.9.52 更新】
 1. 新增 fmt_data_meta_full()：含來源名稱的完整 metadata 字串
@@ -82,7 +98,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.52"
+VERSION              = "10.9.53"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -173,6 +189,98 @@ def fmt_data_meta_full(meta: dict) -> str:
     else:
         state = "收盤資料"
     return f"📡 {source} ‧ {flag} {state}"
+
+
+# ══════════════════════════════════════════
+#  系統健檢（v10.9.53）
+#  追蹤每個資料源的健康狀態，Owner 打「健檢」可看
+# ══════════════════════════════════════════
+SYSTEM_START_AT = now_taipei()
+HEALTH_STATE: dict = {}  # source_key -> {ok_count, fail_count, last_ok_at, last_fail_at, last_error}
+
+def record_health(source: str, ok: bool, error: str = "") -> None:
+    """記錄一次資料源呼叫的成功 / 失敗。任何 except 都應呼叫 record_health(..., ok=False)。"""
+    s = HEALTH_STATE.setdefault(source, {
+        "ok_count": 0, "fail_count": 0,
+        "last_ok_at": None, "last_fail_at": None, "last_error": "",
+    })
+    if ok:
+        s["ok_count"] += 1
+        s["last_ok_at"] = now_taipei()
+    else:
+        s["fail_count"] += 1
+        s["last_fail_at"] = now_taipei()
+        if error:
+            s["last_error"] = str(error)[:120]
+
+def _fmt_health_ts(ts) -> str:
+    """格式化時間戳為「X 分前」或「MM/DD HH:MM」。"""
+    if not ts:
+        return "從未"
+    delta = (now_taipei() - ts).total_seconds()
+    if delta < 60:
+        return f"{int(delta)} 秒前"
+    if delta < 3600:
+        return f"{int(delta/60)} 分前"
+    if delta < 86400:
+        return f"{int(delta/3600)} 小時前"
+    return ts.strftime("%m/%d %H:%M")
+
+def _fmt_uptime() -> str:
+    sec = int((now_taipei() - SYSTEM_START_AT).total_seconds())
+    if sec < 60: return f"{sec} 秒"
+    if sec < 3600: return f"{sec//60} 分"
+    if sec < 86400: return f"{sec//3600} 小時 {(sec%3600)//60} 分"
+    return f"{sec//86400} 天 {(sec%86400)//3600} 小時"
+
+def get_health_summary() -> str:
+    """產生系統健檢純文字訊息（Owner / Admin 用）。
+    每個資料源顯示：icon、最後成功時間、最後失敗時間、累計成功 / 失敗次數。
+    """
+    lines = []
+    lines.append(f"📊 系統健檢  v{VERSION}")
+    lines.append("━━━━━━━━━━━━━━")
+    if not HEALTH_STATE:
+        lines.append("（尚無資料源被呼叫）")
+    else:
+        # 依「最近一次成功時間」排序，最近的在前
+        items = sorted(
+            HEALTH_STATE.items(),
+            key=lambda kv: (kv[1].get("last_ok_at") or kv[1].get("last_fail_at") or now_taipei()),
+            reverse=True,
+        )
+        for source, s in items:
+            ok_n   = s["ok_count"]
+            fail_n = s["fail_count"]
+            total  = ok_n + fail_n
+            ok_at  = s.get("last_ok_at")
+            fail_at = s.get("last_fail_at")
+            # 健康狀態判斷
+            if fail_n == 0 and ok_n > 0:
+                icon = "✅"
+            elif ok_n == 0 and fail_n > 0:
+                icon = "❌"
+            elif fail_at and ok_at and fail_at > ok_at:
+                icon = "⚠️"  # 最近一次是失敗
+            else:
+                icon = "✅"
+            rate = (ok_n / total * 100) if total else 0
+            lines.append(f"{icon} {source}")
+            lines.append(f"　最後成功：{_fmt_health_ts(ok_at)}　成功 {ok_n} 次")
+            if fail_n:
+                lines.append(f"　最後失敗：{_fmt_health_ts(fail_at)}　失敗 {fail_n} 次")
+                if s.get("last_error"):
+                    lines.append(f"　錯誤：{s['last_error']}")
+            lines.append(f"　成功率：{rate:.1f}%")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("📌 系統資訊")
+    lines.append(f"　版本：v{VERSION}")
+    lines.append(f"　名稱快取：{len(NAME_CACHE):,} 筆")
+    lines.append(f"　啟動時間：{SYSTEM_START_AT.strftime('%m/%d %H:%M')}")
+    lines.append(f"　運行時間：{_fmt_uptime()}")
+    lines.append(f"　Groq AI：{'啟用' if GROQ_AVAILABLE else '未設定'}")
+    lines.append(f"　FinMind：{'已設 token' if FINMIND_TOKEN else '未設 token（免費 600 次/小時）'}")
+    return "\n".join(lines)
 
 def format_us_volume(v) -> str:
     if v in ["-", "", None, "N/A", 0]: return "N/A"
@@ -706,10 +814,12 @@ def _load_finmind_taiwan_stock_info() -> int:
         r = requests.get(url, params=params, timeout=30)
         if r.status_code != 200:
             dlog("CACHE", f"FinMind StockInfo HTTP {r.status_code}")
+            record_health("FinMind", False, f"HTTP {r.status_code}")
             return 0
         payload = r.json()
         if payload.get("status") != 200:
             dlog("CACHE", f"FinMind StockInfo 回應錯誤：{payload.get('msg','')[:120]}")
+            record_health("FinMind", False, payload.get("msg", "")[:80])
             return 0
         data = payload.get("data") or []
         added = 0
@@ -726,11 +836,14 @@ def _load_finmind_taiwan_stock_info() -> int:
                 NAME_CACHE[code] = name
                 added += 1
         dlog("CACHE", f"FinMind StockInfo：{len(data)} 筆原始 / 新增 {added} 筆")
+        record_health("FinMind", True)
         return added
     except requests.Timeout:
         dlog("CACHE", "FinMind StockInfo 超時（30秒）")
+        record_health("FinMind", False, "timeout 30s")
     except Exception as e:
         dlog("CACHE", f"FinMind StockInfo 失敗：{type(e).__name__}: {e}")
+        record_health("FinMind", False, f"{type(e).__name__}: {e}")
     return 0
 
 
@@ -1519,7 +1632,9 @@ def log_to_sheets(user_id, action, content, result):
         if sheet:
             sheet.append_row([now_taipei().strftime("%Y-%m-%d %H:%M"),
                              user_id, action, content, result, "", ""])
-    except: pass
+            record_health("Google Sheets", True)
+    except Exception as e:
+        record_health("Google Sheets", False, f"{type(e).__name__}: {e}")
 
 def save_suggestion_to_sheets(user_id, text):
     try:
@@ -2474,6 +2589,7 @@ def get_yahoo_quote(symbol: str) -> dict:
         prev   = closes[-2] if len(closes) >= 2 else price
         chg    = price - prev
         pct    = chg / prev * 100 if prev else 0
+        record_health("Yahoo Finance", True)
         return {
             "price":price, "chg":chg, "pct":pct, "ms":ms,
             "meta": build_data_meta(meta_source,
@@ -2483,6 +2599,7 @@ def get_yahoo_quote(symbol: str) -> dict:
         }
     except Exception as e:
         dlog("YAHOO", f"get_yahoo_quote({symbol}) 失敗：{type(e).__name__}: {e}")
+        record_health("Yahoo Finance", False, f"{type(e).__name__}: {e}")
         return {}
 
 
@@ -2498,10 +2615,12 @@ def get_taiwan_otc_index() -> dict:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         if r.status_code != 200:
             dlog("TPEX", f"櫃買指數 HTTP {r.status_code}")
+            record_health("TPEx 官方", False, f"HTTP {r.status_code}")
             return {}
         rows = r.json()
         if not isinstance(rows, list) or not rows:
             dlog("TPEX", "櫃買指數回應為空")
+            record_health("TPEx 官方", False, "empty response")
             return {}
         # 依 Date 排序，取最後兩筆
         rows = sorted(rows, key=lambda x: x.get("Date",""))
@@ -2520,6 +2639,7 @@ def get_taiwan_otc_index() -> dict:
         # 判斷是否為今日資料（盤後 OpenAPI 通常會更新到當日收盤）
         today_str = now_taipei().strftime("%Y%m%d")
         is_today = (date_str == today_str)
+        record_health("TPEx 官方", True)
         return {
             "price": price, "chg": chg, "pct": pct,
             "ms": "REGULAR" if is_today else "POST",
@@ -2529,6 +2649,7 @@ def get_taiwan_otc_index() -> dict:
         }
     except Exception as e:
         dlog("TPEX", f"get_taiwan_otc_index 失敗：{type(e).__name__}: {e}")
+        record_health("TPEx 官方", False, f"{type(e).__name__}: {e}")
         return {}
 
 
@@ -2921,21 +3042,27 @@ def groq_chat(messages: list, max_tokens: int = 1500, temperature: float = 0.2, 
         r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
         if r.status_code == 200:
             data = r.json()
+            record_health("Groq AI", True)
             return data["choices"][0]["message"]["content"].strip()
         elif r.status_code == 429:
             dlog("GROQ", f"⏸️ 達到速率限制（429），暫時降級為規則式")
+            record_health("Groq AI", False, "rate limit 429")
             return ""
         elif r.status_code == 413:
             dlog("GROQ", f"📏 請求太大（413），可能批次太多新聞")
+            record_health("Groq AI", False, "payload too large 413")
             return ""
         else:
             dlog("GROQ", f"❌ API 錯誤 HTTP {r.status_code}: {r.text[:200]}")
+            record_health("Groq AI", False, f"HTTP {r.status_code}")
             return ""
     except requests.Timeout:
         dlog("GROQ", "⏱️ API 超時（>8s）")
+        record_health("Groq AI", False, "timeout")
         return ""
     except Exception as e:
         dlog("GROQ", f"❌ 呼叫失敗：{e}")
+        record_health("Groq AI", False, f"{type(e).__name__}: {e}")
         return ""
 
 
@@ -4641,6 +4768,10 @@ def handle_message(event):
             reply_text(event.reply_token,
                 f"📊 NAME_CACHE 狀態\n━━━━━━━━━━━━━━\n"
                 f"總筆數：{total}\n載入完成：{'✅' if NAME_CACHE_LOADED else '⏳載入中'}\n前5筆：\n{ss}"); return
+        elif text in ["健檢", "系統健檢", "health"]:
+            # v10.9.53：Owner 健檢面板（各資料源狀態 / 成功率 / 系統資訊）
+            dlog("HANDLER", "→ 系統健檢")
+            reply_text(event.reply_token, get_health_summary()); return
         elif text.startswith("查快取 "):
             sid=text.replace("查快取 ","").strip()
             cached=NAME_CACHE.get(sid,"（無）")
