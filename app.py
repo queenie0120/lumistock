@@ -1,6 +1,24 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.65（持股警報 24h dedup — Phase 2 第 4 步）
+LINE Bot 模組 v10.9.66（美股強化 + 外匯 metadata 確認）
+
+【v10.9.66 更新】
+使用者反映：「美股的狀況還有許多要更新及修正，資料不一定每一檔都正確」
+Audit 後發現 get_us_stock 沒有 v10.9.50 的 stale rmp 防禦、沒有 meta、沒有 record_health。
+
+改動：
+1. get_us_stock 重構（套用 v10.9.50 同等防禦）
+   - 偵測 regularMarketPrice 過時（>24h）或偏離 close >5%
+   - 異常時改用日線 close，標記為「Yahoo Finance（日線備援）」
+   - POST/PRE/REGULAR 三種市場狀態各自處理
+   - 回傳值加 meta 欄位（source / is_realtime / is_fallback / delay_min）
+2. record_health：呼叫成功/失敗都記錄到健檢
+3. get_stock_flex 美股流向傳遞 meta 給 make_stock_flex
+4. 外匯：v10.9.52 已自動含 metadata（透過 make_quote_flex 既有顯示），確認無需改動
+
+如果未來 Yahoo 對任何美股給出像櫃買 -34% 那種異常值，會立刻被偵測並降級。
+
+【v10.9.65】持股警報 24h dedup
 
 【v10.9.65 更新】
 問題：v10.9.63 之後若同一檔股票跌破停損，每天 06:30 都會推播一次 → 轟炸感
@@ -272,7 +290,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.65"
+VERSION              = "10.9.66"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3670,38 +3688,104 @@ def get_tw_stock(stock_id: str) -> dict:
 #  美股資料
 # ══════════════════════════════════════════
 def get_us_stock(symbol: str) -> dict:
+    """美股報價（v10.9.66：補上 v10.9.50 同等的 stale rmp 防禦 + meta + record_health）。
+    跟 get_yahoo_quote 同樣的偵測邏輯：
+      若 regularMarketPrice 過時（> 24hr）或偏離 latest_close > 5%，改用日線 close 並標記為備援。
+    """
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
-        r=requests.get(url,headers=headers,timeout=10)
-        result=r.json()["chart"]["result"][0]; meta=result["meta"]
-        quotes=result.get("indicators",{}).get("quote",[{}])[0]
-        opens=[o for o in quotes.get("open",[]) if o is not None]
-        highs=[h for h in quotes.get("high",[]) if h is not None]
-        lows=[l for l in quotes.get("low",[]) if l is not None]
-        vols=[v for v in quotes.get("volume",[]) if v is not None]
-        closes=[c for c in quotes.get("close",[]) if c is not None]
-        ms=meta.get("marketState","")
-        if ms=="POST":
-            price=(meta.get("postMarketPrice") or meta.get("regularMarketPrice") or (closes[-1] if closes else 0))
-            prev=closes[-1] if closes else price
-        elif ms=="PRE":
-            price=(meta.get("preMarketPrice") or meta.get("regularMarketPrice") or (closes[-1] if closes else 0))
-            prev=closes[-2] if len(closes)>=2 else price
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=10d"
+        r = requests.get(url, headers=headers, timeout=10)
+        result = r.json()["chart"]["result"][0]
+        meta_raw = result["meta"]
+        quotes = result.get("indicators",{}).get("quote",[{}])[0]
+        opens  = [o for o in quotes.get("open",[]) if o is not None]
+        highs  = [h for h in quotes.get("high",[]) if h is not None]
+        lows   = [l for l in quotes.get("low",[]) if l is not None]
+        vols   = [v for v in quotes.get("volume",[]) if v is not None]
+        closes = [c for c in quotes.get("close",[]) if c is not None]
+        ms = meta_raw.get("marketState","")
+
+        rmp = meta_raw.get("regularMarketPrice")
+        rmt = meta_raw.get("regularMarketTime", 0)
+        latest_close = closes[-1] if closes else 0
+
+        is_stale = False
+        is_outlier = False
+        try:
+            if rmt:
+                is_stale = (datetime.now(timezone.utc).timestamp() - float(rmt)) > 86400
+            if rmp and latest_close:
+                is_outlier = abs(float(rmp) - latest_close) / latest_close > 0.05
+        except: pass
+
+        meta_source = "Yahoo Finance"
+        meta_is_realtime = False
+        meta_is_fallback = False
+        meta_delay_min = 15
+
+        # 依市場狀態 + stale 偵測決定 price / prev
+        if ms == "POST":
+            post_price = meta_raw.get("postMarketPrice")
+            if post_price:
+                price = float(post_price)
+                meta_delay_min = 0
+            elif rmp and not is_stale and not is_outlier:
+                price = float(rmp)
+                meta_delay_min = 0
+            else:
+                price = latest_close
+                meta_is_fallback = True
+                meta_source = "Yahoo Finance（日線備援）"
+            prev = closes[-1] if closes else price
+        elif ms == "PRE":
+            pre_price = meta_raw.get("preMarketPrice")
+            if pre_price:
+                price = float(pre_price)
+                meta_delay_min = 0
+            elif rmp and not is_stale and not is_outlier:
+                price = float(rmp)
+                meta_delay_min = 0
+            else:
+                price = latest_close
+                meta_is_fallback = True
+                meta_source = "Yahoo Finance（日線備援）"
+            prev = closes[-2] if len(closes) >= 2 else price
         else:
-            price=meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
-            prev=closes[-2] if len(closes)>=2 else price
-        chg=price-prev; pct=chg/prev*100 if prev else 0
-        name=meta.get("shortName") or meta.get("longName") or symbol
-        sl={"POST":"盤後","PRE":"盤前","REGULAR":"盤中","CLOSED":"收盤"}.get(ms,"")
-        return {"name":name[:20],"price":price,"chg":chg,"pct":pct,
-                "open":f"{opens[-1]:.2f}" if opens else "N/A",
-                "high":f"{highs[-1]:.2f}" if highs else "N/A",
-                "low":f"{lows[-1]:.2f}" if lows else "N/A",
-                "vol":format_us_volume(vols[-1]) if vols else "N/A",
-                "status":sl,"closes":[]}
-    except: pass
-    return None
+            if rmp and not is_stale and not is_outlier:
+                price = float(rmp)
+                meta_is_realtime = (ms == "REGULAR")
+                meta_delay_min = 0 if meta_is_realtime else 15
+            else:
+                price = latest_close
+                meta_is_fallback = True
+                meta_source = "Yahoo Finance（日線備援）"
+                if rmp and (is_stale or is_outlier):
+                    dlog("YAHOO", f"⚠️ US {symbol} rmp 異常（rmp={rmp}, latest={latest_close}, stale={is_stale}, outlier={is_outlier}）→ 改用日線 close")
+            prev = closes[-2] if len(closes) >= 2 else price
+
+        chg = price - prev
+        pct = chg / prev * 100 if prev else 0
+        name = meta_raw.get("shortName") or meta_raw.get("longName") or symbol
+        sl = {"POST":"盤後","PRE":"盤前","REGULAR":"盤中","CLOSED":"收盤"}.get(ms,"")
+
+        record_health("Yahoo Finance", True)
+        return {
+            "name": name[:20], "price": price, "chg": chg, "pct": pct,
+            "open": f"{opens[-1]:.2f}" if opens else "N/A",
+            "high": f"{highs[-1]:.2f}" if highs else "N/A",
+            "low": f"{lows[-1]:.2f}" if lows else "N/A",
+            "vol": format_us_volume(vols[-1]) if vols else "N/A",
+            "status": sl, "closes": [],
+            "meta": build_data_meta(meta_source,
+                                    is_realtime=meta_is_realtime,
+                                    is_fallback=meta_is_fallback,
+                                    delay_min=meta_delay_min),
+        }
+    except Exception as e:
+        dlog("YAHOO", f"get_us_stock({symbol}) 失敗：{type(e).__name__}: {e}")
+        record_health("Yahoo Finance", False, f"US {type(e).__name__}: {e}")
+        return None
 
 def get_us_closes(symbol: str) -> list:
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -5615,7 +5699,8 @@ def get_stock_flex(symbol:str, user_id:str="")->tuple:
                                us["price"],us["chg"],us["pct"],
                                us.get("open","N/A"),us.get("high","N/A"),
                                us.get("low","N/A"),us.get("vol","N/A"),
-                               kline,news,query_time),None
+                               kline,news,query_time,
+                               meta=us.get("meta")),None
 
 
 HELP_MSG="""✨ 慧股拾光 Lumistock
