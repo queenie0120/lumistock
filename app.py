@@ -1,6 +1,13 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.53（Owner 系統健檢面板 — Phase 1 #3）
+LINE Bot 模組 v10.9.54（系統健檢按鈕加入選單，方便一鍵呼叫）
+
+【v10.9.54 更新】
+1. make_admin_menu_flex（管理後台）最上方加「💗 系統健檢」按鈕
+2. make_system_mgmt_flex（系統管理）最上方加「💗 系統健檢」按鈕
+3. 使用者不需要再手動打字「健檢」，從 Rich Menu 進去即可一鍵點開
+
+【v10.9.53】Owner 系統健檢面板 — Phase 1 #3
 
 【v10.9.53 更新】
 1. 新增 HEALTH_STATE 全域字典追蹤每個資料源的健康狀態
@@ -98,7 +105,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.53"
+VERSION              = "10.9.54"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2169,6 +2176,7 @@ def make_admin_menu_flex(user_id: str) -> dict:
     owner = is_owner(user_id)
     color = "#E8B8A8"
     buttons = [
+        ("💗 系統健檢","健檢"),                  # v10.9.54：放最上方，Owner 一鍵直達
         ("👥 使用者管理","使用者管理選單"),
         ("⚙️ 系統管理","系統管理選單"),
     ]
@@ -2204,7 +2212,8 @@ def make_user_mgmt_flex(owner: bool) -> dict:
 def make_system_mgmt_flex() -> dict:
     return make_menu_flex(
         "⚙️ 系統管理","點按鈕即可操作 ✨","#E8B8A8",
-        [("🔄 重新載入名稱快取","重載名稱"),    # 最常用，放第一個
+        [("💗 系統健檢","健檢"),                  # v10.9.54：監測入口，放第一個
+         ("🔄 重新載入名稱快取","重載名稱"),
          ("📊 查看快取狀態","快取狀態"),
          ("🔍 查詢個別代號","查快取說明"),
          ("🌸 重設 Rich Menu","重設選單")]     # 緊急救援
