@@ -1,6 +1,24 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.67（TPEx 櫃買指數加 retry — 解決 06:30 transient 空回應）
+LINE Bot 模組 v10.9.68（立即持股警報 + 按鈕，可繞過 dedup）
+
+【v10.9.68 更新】
+使用者提問：警報 dedup 加進選單會奇怪嗎？
+
+問題：v10.9.65 dedup 連手動觸發都擋住 → 使用者按「立即測試」看不到已被抑制的警報。
+
+修法：
+1. run_portfolio_alerts(force=False) 加 force 參數
+   - 06:30 自動跑：force=False，維持 dedup 防轟炸
+   - 手動觸發：force=True，跳過 dedup，重發所有觸發
+2. 「持股警報測試 / 持股警報 / 立即持股警報」改用 force=True
+3. 「💗 立即持股警報」按鈕加進「持股管理」Flex 選單
+   - 一鍵點開不必打字
+   - 放在「查持股」下方，最常用位置
+
+不加「重置警報紀錄」按鈕：使用者誤觸機率高且 Render /tmp 機制讓重置變相自動。
+
+【v10.9.67】TPEx 櫃買指數加 retry
 
 【v10.9.67 更新】
 使用者觀察：今天 06:30 自動健檢報告 7/8 通過，TPEx 櫃買指數又「空回應」失敗。
@@ -301,7 +319,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.67"
+VERSION              = "10.9.68"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1439,14 +1457,17 @@ def _should_alert(uid: str, sid: str, alert_type: str) -> bool:
     return True
 
 
-def run_portfolio_alerts() -> dict:
+def run_portfolio_alerts(force: bool = False) -> dict:
     """v10.9.63：掃描所有使用者持股，收集警報。
     v10.9.65：加 24h dedup（同一筆 user × stock × type 一日只發一次）。
+    v10.9.68：加 force 參數，True 時忽略 dedup（手動觸發用）。
     回傳 {user_id: [alert_msg, ...]}
     觸發條件：
       a) 現價 ≤ 系統建議停損價 → ⚠️ 跌破（dedup key: stop_loss）
       b) 現價 ≥ 系統建議目標價 × 0.95 → 📈 接近目標（dedup key: near_target）
       c) 今日 = 除權息日 → 💰 今日除息（dedup key: ex_dividend）
+
+    force=True：跳過 _should_alert 檢查，所有觸發條件都會 push。
     """
     alerts_by_user = {}
     try:
@@ -1475,7 +1496,7 @@ def run_portfolio_alerts() -> dict:
                 adv = _get_portfolio_advice(sid)
                 # 觸發 a) 跌破停損
                 sl = adv.get("stop_loss")
-                if sl and price <= sl and _should_alert(uid, sid, "stop_loss"):
+                if sl and price <= sl and (force or _should_alert(uid, sid, "stop_loss")):
                     pct_below = (price - sl) / sl * 100
                     user_alerts.append(
                         f"⚠️ {symbol} {name}\n"
@@ -1486,7 +1507,7 @@ def run_portfolio_alerts() -> dict:
                 tg = adv.get("target")
                 if (tg and not (sl and price <= sl)
                     and price >= tg * 0.95
-                    and _should_alert(uid, sid, "near_target")):
+                    and (force or _should_alert(uid, sid, "near_target"))):
                     diff = (tg - price) / tg * 100
                     user_alerts.append(
                         f"📈 {symbol} {name}\n"
@@ -1495,7 +1516,7 @@ def run_portfolio_alerts() -> dict:
                     )
                 # 觸發 c) 今日除息
                 if (adv.get("ex_div_date") == today
-                    and _should_alert(uid, sid, "ex_dividend")):
+                    and (force or _should_alert(uid, sid, "ex_dividend"))):
                     cash = adv.get("ex_div_cash", 0)
                     stock = adv.get("ex_div_stock", 0)
                     div_text = f"現金 {cash} 元"
@@ -2949,9 +2970,12 @@ def make_news_menu_flex() -> dict:
 def make_portfolio_menu_flex() -> dict:
     return make_menu_flex(
         "📋 持股管理", "新增・查詢・損益分析", "#5B8B6B",
-        [("➕ 新增持股","新增持股說明"), ("📋 查持股","持股"),
+        [("📋 查持股","持股"),
+         ("💗 立即持股警報","立即持股警報"),       # v10.9.68：手動 force 警報
+         ("➕ 新增持股","新增持股說明"),
          ("🗑️ 我的持股（可刪除）","我的持股"),
-         ("📊 損益分析","損益分析"), ("🔴 停損提醒","停損提醒說明"),
+         ("📊 損益分析","損益分析"),
+         ("🔴 停損提醒","停損提醒說明"),
          ("🎯 目標價提醒","目標價提醒說明")]
     )
 
@@ -6345,21 +6369,25 @@ def handle_message(event):
             threading.Thread(target=_bg, daemon=True).start()
             return
         elif text in ["持股警報測試", "持股警報", "立即持股警報"]:
-            # v10.9.63：手動觸發持股警報掃描（與 06:30 自動跑同樣邏輯）
-            dlog("HANDLER", "→ 持股警報測試")
-            reply_text(event.reply_token, "💗 掃描所有 user 持股中...\n約 10-20 秒後推播")
+            # v10.9.63：手動觸發持股警報掃描
+            # v10.9.68：手動觸發 force=True，跳過 dedup，立即重發所有觸發條件
+            dlog("HANDLER", "→ 立即持股警報（force=True）")
+            reply_text(event.reply_token,
+                "💗 立即掃描持股警報中...\n"
+                "（會忽略 24h dedup，重發所有觸發）\n"
+                "約 10-20 秒後推播")
             def _bg_alert():
                 try:
-                    alerts_by_user = run_portfolio_alerts()
+                    alerts_by_user = run_portfolio_alerts(force=True)
                     if not alerts_by_user:
                         push_to_owner("✨ 所有 user 持股都在安全範圍內，無警報")
                         return
                     for uid, alerts in alerts_by_user.items():
                         push_message(uid, format_portfolio_alerts_msg(alerts))
                     total = sum(len(a) for a in alerts_by_user.values())
-                    push_to_owner(f"✅ 持股警報完成\n{len(alerts_by_user)} 位 user / {total} 則訊息")
+                    push_to_owner(f"✅ 立即警報完成\n{len(alerts_by_user)} 位 user / {total} 則訊息")
                 except Exception as e:
-                    push_to_owner(f"🚨 持股警報例外\n{type(e).__name__}: {e}")
+                    push_to_owner(f"🚨 立即警報例外\n{type(e).__name__}: {e}")
             threading.Thread(target=_bg_alert, daemon=True).start()
             return
         elif text.startswith("查快取 "):
