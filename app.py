@@ -1,6 +1,17 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.66（美股強化 + 外匯 metadata 確認）
+LINE Bot 模組 v10.9.67（TPEx 櫃買指數加 retry — 解決 06:30 transient 空回應）
+
+【v10.9.67 更新】
+使用者觀察：今天 06:30 自動健檢報告 7/8 通過，TPEx 櫃買指數又「空回應」失敗。
+這是 v10.9.55 起多次出現的 transient 問題（不是 endpoint 壞了，是 TPEx server 一時不穩）。
+
+修法：
+- get_taiwan_otc_index 加最多 3 次重試，間隔 2 秒
+- 任一次成功就用，全失敗才回 {}
+- 錯誤訊息含「3x retry」標籤，未來辨識更容易
+
+【v10.9.66】美股強化 + 外匯 metadata 確認
 
 【v10.9.66 更新】
 使用者反映：「美股的狀況還有許多要更新及修正，資料不一定每一檔都正確」
@@ -290,7 +301,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.66"
+VERSION              = "10.9.67"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3387,39 +3398,46 @@ def get_yahoo_quote(symbol: str) -> dict:
 
 
 def get_taiwan_otc_index() -> dict:
-    """抓台灣櫃買指數（櫃買指數）— 用 TPEx 官方 OpenAPI。
-    v10.9.51：放棄 Yahoo（^TWOII rmp 卡 2024 舊值且 close 陣列日期偏移 1 天），
-              改用 TPEx 自己的 openapi/v1/tpex_index，資料權威且無 IP 阻擋。
-    Endpoint: https://www.tpex.org.tw/openapi/v1/tpex_index
-    回傳結構與 get_yahoo_quote 一致，方便上層 make_quote_flex 直接套用。
+    """抓台灣櫃買指數 — TPEx 官方 OpenAPI（v10.9.67：加 retry 解決 transient 失敗）。
+    v10.9.51：放棄 Yahoo（^TWOII rmp 卡舊值 + close 日期偏移 1 天）。
+    v10.9.67：06:30 自動健檢偶爾跑出「空回應」→ 加最多 3 次重試（2 秒間隔）
     """
     url = "https://www.tpex.org.tw/openapi/v1/tpex_index"
+    rows = None
+    last_err = ""
+    MAX_RETRY = 3
+    for attempt in range(MAX_RETRY):
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+            else:
+                parsed = r.json()
+                if not isinstance(parsed, list) or not parsed:
+                    last_err = "empty list"
+                else:
+                    rows = parsed
+                    break  # ← 成功跳出 retry loop
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        if attempt < MAX_RETRY - 1:
+            time.sleep(2)
+
+    if not rows:
+        dlog("TPEX", f"櫃買指數失敗（{MAX_RETRY} 次重試後仍失敗）：{last_err}")
+        record_health("TPEx 官方", False, f"{MAX_RETRY}x retry: {last_err}")
+        return {}
+
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if r.status_code != 200:
-            dlog("TPEX", f"櫃買指數 HTTP {r.status_code}")
-            record_health("TPEx 官方", False, f"HTTP {r.status_code}")
-            return {}
-        rows = r.json()
-        if not isinstance(rows, list) or not rows:
-            dlog("TPEX", "櫃買指數回應為空")
-            record_health("TPEx 官方", False, "empty response")
-            return {}
-        # 依 Date 排序，取最後兩筆
         rows = sorted(rows, key=lambda x: x.get("Date",""))
         last = rows[-1]
         prev = rows[-2] if len(rows) >= 2 else last
-        try:
-            price = float(str(last.get("Close","0")).replace(",",""))
-            prev_close = float(str(prev.get("Close","0")).replace(",",""))
-            chg_str = str(last.get("Change","0")).strip().replace(",","")
-            chg = float(chg_str) if chg_str else (price - prev_close)
-            pct = chg / prev_close * 100 if prev_close else 0
-        except Exception as e:
-            dlog("TPEX", f"櫃買指數解析失敗：{e}")
-            return {}
+        price = float(str(last.get("Close","0")).replace(",",""))
+        prev_close = float(str(prev.get("Close","0")).replace(",",""))
+        chg_str = str(last.get("Change","0")).strip().replace(",","")
+        chg = float(chg_str) if chg_str else (price - prev_close)
+        pct = chg / prev_close * 100 if prev_close else 0
         date_str = str(last.get("Date",""))
-        # 判斷是否為今日資料（盤後 OpenAPI 通常會更新到當日收盤）
         today_str = now_taipei().strftime("%Y%m%d")
         is_today = (date_str == today_str)
         record_health("TPEx 官方", True)
@@ -3431,8 +3449,8 @@ def get_taiwan_otc_index() -> dict:
                                     delay_min=0 if is_today else 1440),
         }
     except Exception as e:
-        dlog("TPEX", f"get_taiwan_otc_index 失敗：{type(e).__name__}: {e}")
-        record_health("TPEx 官方", False, f"{type(e).__name__}: {e}")
+        dlog("TPEX", f"櫃買指數解析失敗：{type(e).__name__}: {e}")
+        record_health("TPEx 官方", False, f"parse {type(e).__name__}")
         return {}
 
 
