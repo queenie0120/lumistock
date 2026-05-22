@@ -1,6 +1,16 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.71（修：持股重啟後遺失 — 從 Sheets 還原）
+LINE Bot 模組 v10.9.72（合併「查持股」與「我的持股」重複按鈕）
+
+【v10.9.72 更新】
+使用者反映：「查持股」和「我的持股（可刪除）」其實是同一件事。
+修法：
+1. make_portfolio_flex_carousel 每張卡片加「🗑️ 刪除這檔」按鈕
+2. 「我的持股」改用 make_portfolio_flex_carousel（與「持股」同一 view）
+3. 選單移除重複按鈕，「查持股」更名「我的持股」
+結果：一個「我的持股」= 分析 + 刪除，不再重複
+
+【v10.9.71】修持股重啟後遺失 — 從 Sheets 還原
 
 【v10.9.71 修正（嚴重 bug）】
 現象：截圖匯入 7 檔持股成功，但服務重啟後「持股」變空。
@@ -362,7 +372,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.71"
+VERSION              = "10.9.72"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3063,10 +3073,9 @@ def make_news_menu_flex() -> dict:
 def make_portfolio_menu_flex() -> dict:
     return make_menu_flex(
         "📋 持股管理", "新增・查詢・損益分析", "#5B8B6B",
-        [("📋 查持股","持股"),
+        [("📋 我的持股","持股"),                   # v10.9.72：合併（分析 + 可刪除）
          ("💗 立即持股警報","立即持股警報"),       # v10.9.68：手動 force 警報
          ("➕ 新增持股","新增持股說明"),
-         ("🗑️ 我的持股（可刪除）","我的持股"),
          ("📊 損益分析","損益分析"),
          ("🔴 停損提醒","停損提醒說明"),
          ("🎯 目標價提醒","目標價提醒說明")]
@@ -5907,6 +5916,13 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
                          ]},
                          *advice_box,
                      ]},
+            # v10.9.72：每張卡片加刪除按鈕（合併「我的持股」功能）
+            "footer": {"type": "box", "layout": "vertical", "paddingAll": "8px",
+                       "contents": [
+                           {"type": "button", "style": "secondary", "height": "sm",
+                            "action": {"type": "postback", "label": "🗑️ 刪除這檔",
+                                       "data": f"action=del_portfolio&symbol={r['symbol']}"}}
+                       ]},
         }
         bubbles.append(bubble)
 
@@ -6499,7 +6515,7 @@ def handle_message(event):
     if text=="持股管理":
         dlog("HANDLER", "→ 持股管理選單")
         reply_flex_with_qr(event.reply_token, make_portfolio_menu_flex(), "持股管理",
-            [("查持股","持股"),("新增持股","新增持股說明"),
+            [("我的持股","持股"),("新增持股","新增持股說明"),
              ("損益分析","損益分析"),("停損提醒","停損提醒說明")])
         return
 
@@ -6540,7 +6556,7 @@ def handle_message(event):
 
     if text=="持股管理選單" and is_admin(user_id):
         reply_flex_with_qr(event.reply_token, make_portfolio_menu_flex(), "持股管理",
-            [("查持股","持股"),("新增持股","新增持股說明"),("損益分析","損益分析")])
+            [("我的持股","持股"),("新增持股","新增持股說明"),("損益分析","損益分析")])
         return
 
     # ══ 殖利率 AI 解讀（v10.9.32 新增）══
@@ -7026,12 +7042,16 @@ def handle_message(event):
 
     # v10.9.25：可點選刪除的持股清單
     if text in ["我的持股", "持股清單"]:
-        dlog("HANDLER", "→ 持股清單（互動）")
-        flex = make_portfolio_action_carousel(user_id)
-        if flex:
-            reply_flex(event.reply_token, flex, "我的持股")
-        else:
-            reply_text(event.reply_token, get_portfolio_summary(user_id))
+        # v10.9.72：合併為豐富卡片（含分析 + 刪除按鈕），與「持股」同一個 view
+        dlog("HANDLER", "→ 持股清單（合併版）")
+        try:
+            flex = make_portfolio_flex_carousel(user_id)
+            if flex:
+                reply_flex(event.reply_token, flex, "我的持股")
+                return
+        except Exception as e:
+            dlog("PORTFOLIO", f"Flex 失敗 fallback：{e}")
+        reply_text(event.reply_token, get_portfolio_summary(user_id))
         return
 
     # v10.9.25：黑名單清單（管理者用）
