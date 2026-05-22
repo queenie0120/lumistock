@@ -1,6 +1,23 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.72（合併「查持股」與「我的持股」重複按鈕）
+LINE Bot 模組 v10.9.73（持股多使用者隔離 — 複合 key）
+
+【v10.9.73 更新（重要：個人投資助理原則）】
+原則：個人投資助理，使用者之間的資料不可互相參雜（除非系統層級問題）。
+Bug：持股原本用「代號」當唯一 key，多人持有同一檔會互相覆蓋。
+修法：
+1. 新增 _pf_key(user_id, symbol) / _pf_symbol(key) 複合 key 工具
+2. 持股 key 改為「user_id|symbol」，每人每檔獨立
+3. 全面更新 8 個 touch point：
+   - 還原 / 新增 / 截圖匯入 / 刪除（postback + 指令）
+   - 我的持股 carousel / 文字版 / action carousel
+   - 持股警報掃描 / AI 問答帶持倉
+4. 相容舊 symbol-only key（刪除時多重比對）
+5. 台股代號統一不帶 .TW
+
+結果：你跟家人朋友各自的 2330 完全獨立，不再互相覆蓋。
+
+【v10.9.72】合併「查持股」與「我的持股」重複按鈕
 
 【v10.9.72 更新】
 使用者反映：「查持股」和「我的持股（可刪除）」其實是同一件事。
@@ -372,7 +389,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.72"
+VERSION              = "10.9.73"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1534,10 +1551,11 @@ def run_portfolio_alerts(force: bool = False) -> dict:
     except:
         return alerts_by_user
     by_user = {}
-    for symbol, data in portfolio.items():
+    for key, data in portfolio.items():
         uid = data.get("user_id")
         if uid:
-            by_user.setdefault(uid, []).append((symbol, data))
+            # v10.9.73：複合 key 取 symbol
+            by_user.setdefault(uid, []).append((_pf_symbol(key), data))
     today = now_taipei().strftime("%Y%m%d")
 
     for uid, holdings in by_user.items():
@@ -2419,7 +2437,8 @@ def make_portfolio_action_carousel(user_id: str) -> dict:
         if not up:
             return None
         bubbles = []
-        for symbol, data in list(up.items())[:10]:
+        for key, data in list(up.items())[:10]:
+            symbol = _pf_symbol(key)
             sid = symbol.replace(".TW","")
             try:
                 if sid.isdigit():
@@ -2781,6 +2800,14 @@ def get_user_detail(reg_name: str) -> str:
 # ══════════════════════════════════════════
 #  持股
 # ══════════════════════════════════════════
+def _pf_key(user_id: str, symbol: str) -> str:
+    """v10.9.73：持股複合 key（多使用者隔離，個人投資助理不可互相參雜）。"""
+    return f"{user_id}|{symbol}"
+
+def _pf_symbol(key: str) -> str:
+    """從複合 key 取出 symbol；相容舊的 symbol-only key。"""
+    return key.split("|", 1)[1] if "|" in key else key
+
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
         with open(PORTFOLIO_FILE,"r",encoding="utf-8") as f: return json.load(f)
@@ -2822,8 +2849,8 @@ def restore_portfolio_from_sheets() -> int:
                 continue
             # 正規化：台股代號統一去掉 .TW，避免「2330」與「2330.TW」重複
             norm_symbol = symbol.replace(".TW", "") if symbol.replace(".TW","").isdigit() else symbol
-            # 後寫覆蓋前寫（同 symbol 取最新；append_row 為時間順序）
-            portfolio[norm_symbol] = {"user_id": uid, "shares": shares, "buy_price": buy_price}
+            # v10.9.73：複合 key（user_id|symbol）多使用者隔離，後寫覆蓋同一人同檔
+            portfolio[_pf_key(uid, norm_symbol)] = {"user_id": uid, "shares": shares, "buy_price": buy_price}
         if portfolio:
             # 合併：Sheets 還原優先，但保留 /tmp 既有未同步的（理論上不該有）
             save_portfolio(portfolio)
@@ -4411,15 +4438,16 @@ def ai_qa_answer(user_id: str, question: str) -> str:
             context_parts.append("【即時資料區（僅能引用以下數據，未列出的不可編造）】")
             for sid in stocks:
                 context_parts.append(_build_stock_context(sid))
-            # 持股問答：附上使用者持倉
+            # 持股問答：附上「該使用者自己」的持倉（v10.9.73：複合 key 隔離）
             try:
                 portfolio = load_portfolio()
                 up = {k: v for k, v in portfolio.items()
-                      if v.get("user_id") == user_id and k.replace(".TW","") in stocks}
+                      if v.get("user_id") == user_id
+                      and _pf_symbol(k).replace(".TW","") in stocks}
                 if up:
                     context_parts.append("【使用者持倉】")
-                    for sym, data in up.items():
-                        context_parts.append(f"　{sym}：{data['shares']} 股，成本 {data['buy_price']}")
+                    for k, data in up.items():
+                        context_parts.append(f"　{_pf_symbol(k)}：{data['shares']} 股，成本 {data['buy_price']}")
             except: pass
 
         # 3) 市場 / 國際關鍵字
@@ -5765,7 +5793,8 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
     rows = []
     total_profit = 0
     total_cost = 0
-    for symbol, data in up.items():
+    for key, data in up.items():
+        symbol = _pf_symbol(key)  # v10.9.73：從複合 key 取 symbol
         sid = symbol.replace(".TW", "")
         try:
             if sid.isdigit():
@@ -5935,7 +5964,8 @@ def get_portfolio_summary(user_id:str)->str:
     if not up:
         return "📋 持股清單是空的\n━━━━━━━━━━━━━━\n新增方式：\n　新增 2330 100 200\n　（代碼 股數 買入均價）"
     msg="📋 我的持股\n━━━━━━━━━━━━━━\n"; total=0
-    for symbol,data in up.items():
+    for key,data in up.items():
+        symbol=_pf_symbol(key)  # v10.9.73：複合 key 取 symbol
         try:
             sid=symbol.replace(".TW","")
             if sid.isdigit():
@@ -6313,15 +6343,26 @@ def handle_postback(event):
                 reply_text(event.reply_token, add_admin_by_name(name))
             return
 
-        # ── 刪除持股
+        # ── 刪除持股（v10.9.73：複合 key + 嚴格使用者隔離）
         if action == "del_portfolio":
             symbol = params.get("symbol", "")
             if symbol:
                 p = load_portfolio()
-                if symbol in p and p[symbol].get("user_id") == user_id:
-                    del p[symbol]
+                norm = symbol.replace(".TW","") if symbol.replace(".TW","").isdigit() else symbol
+                ckey = _pf_key(user_id, norm)
+                # 優先複合 key；相容舊 symbol-only key（但須確認 user_id 相符）
+                target = None
+                if ckey in p:
+                    target = ckey
+                elif symbol in p and p[symbol].get("user_id") == user_id:
+                    target = symbol
+                elif norm in p and p[norm].get("user_id") == user_id:
+                    target = norm
+                if target:
+                    del p[target]
                     save_portfolio(p)
                     delete_portfolio_from_sheets(user_id, symbol)
+                    delete_portfolio_from_sheets(user_id, norm)
                     reply_text(event.reply_token, f"✅ 已刪除持股：{symbol}")
                 else:
                     reply_text(event.reply_token, f"❌ 找不到持股或無權限")
@@ -6918,7 +6959,8 @@ def handle_message(event):
         added = 0
         for h in items:
             symbol = h["stock_id"]
-            portfolio[symbol] = {
+            # v10.9.73：複合 key（多使用者隔離）
+            portfolio[_pf_key(user_id, symbol)] = {
                 "user_id": user_id,
                 "shares": h["shares"],
                 "buy_price": h["avg_price"],
@@ -7067,17 +7109,18 @@ def handle_message(event):
     if text.startswith("新增 "):
         parts=text.split()
         if len(parts)==4:
-            symbol=parts[1].upper(); market="台股" if symbol.isdigit() else "美股"
-            if symbol.isdigit(): symbol+=".TW"
+            raw=parts[1].upper(); market="台股" if raw.isdigit() else "美股"
+            # v10.9.73：台股統一不帶 .TW，並用複合 key（多使用者隔離）
+            symbol=raw
             try:
                 p=load_portfolio()
-                p[symbol]={"shares":int(parts[2]),"buy_price":float(parts[3]),"user_id":user_id}
+                p[_pf_key(user_id, symbol)]={"shares":int(parts[2]),"buy_price":float(parts[3]),"user_id":user_id}
                 save_portfolio(p)
-                tw=get_tw_stock(parts[1]) if parts[1].isdigit() else None
-                us=get_us_stock(symbol) if not parts[1].isdigit() else None
+                tw=get_tw_stock(raw) if raw.isdigit() else None
+                us=get_us_stock(raw) if not raw.isdigit() else None
                 name=(tw or us or {}).get("name",symbol) if (tw or us) else symbol
                 if not name or name==symbol:
-                    name=NAME_CACHE.get(parts[1],symbol) if parts[1].isdigit() else symbol
+                    name=NAME_CACHE.get(raw,symbol) if raw.isdigit() else symbol
                 save_portfolio_to_sheets(user_id,symbol,name,market,int(parts[2]),float(parts[3]))
                 log_to_sheets(user_id,"新增持股",symbol,"成功")
                 reply_text(event.reply_token,
@@ -7089,14 +7132,21 @@ def handle_message(event):
     if text.startswith("刪除 "):
         parts=text.split()
         if len(parts)==2:
-            symbol=parts[1].upper()
-            if symbol.isdigit(): symbol+=".TW"
+            raw=parts[1].upper()
+            norm=raw.replace(".TW","")
+            # v10.9.73：複合 key + 相容舊 key
             p=load_portfolio()
-            if symbol in p:
-                del p[symbol]; save_portfolio(p)
-                delete_portfolio_from_sheets(user_id,symbol)
-                reply_text(event.reply_token,f"✅ 已刪除 {symbol}")
-            else: reply_text(event.reply_token,f"找不到 {symbol}")
+            ckey=_pf_key(user_id, norm)
+            target=None
+            for cand in [ckey, norm, raw, raw+".TW"]:
+                if cand in p and (("|" in cand) or p[cand].get("user_id")==user_id):
+                    target=cand; break
+            if target:
+                del p[target]; save_portfolio(p)
+                delete_portfolio_from_sheets(user_id,norm)
+                delete_portfolio_from_sheets(user_id,raw)
+                reply_text(event.reply_token,f"✅ 已刪除 {norm}")
+            else: reply_text(event.reply_token,f"找不到 {norm}")
         else: reply_text(event.reply_token,"格式：刪除 代碼\n範例：刪除 2330")
         return
 
