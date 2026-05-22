@@ -1,6 +1,29 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.68（立即持股警報 + 按鈕，可繞過 dedup）
+LINE Bot 模組 v10.9.69（AI 智能問答系統 — grounded chat）
+
+【v10.9.69 更新】
+新增 AI 智能問答：有資料佐證、不亂答、合規、會做商品比較與族群分析。
+
+1. AI_QA_SYSTEM_PROMPT：master prompt 編入所有規則
+   - 最高原則：資料區沒給的數字絕不編造、資料不足要誠實說
+   - 合規：禁用「建議買進/賣出/保證/明牌」，改「偏多/偏空/觀察重點」，結尾免責
+   - 商品比較從「人」的角度：適合族群 / 投資心態 / 投資人格 / 目標導向
+   - 不說「哪個比較好」，說「哪個比較適合什麼樣的人」
+   - AI 信心評分（高/中/低）
+2. 問題類型自動判斷 + grounding：
+   - 個股 → 即時報價 + 均線/RSI + 區間 + 除權息 + 新聞（真實資料）
+   - 大盤/國際 → 指數 + 匯率快照
+   - 商品比較/知識 → LLM 知識 + 標示具體數字需查證
+   - 功能/排錯 → App 內建說明
+   - 持股問答 → 帶入使用者持倉
+3. 觸發方式：
+   - 「💬 問 AI 助理」按鈕（加進 AI 分析選單）→ 5 分鐘問答模式
+   - 「問 XXX」前綴 → 直接問答
+   - 「結束問答」離開模式
+4. 背景執行 + push，避免卡住 webhook
+
+【v10.9.68】立即持股警報 + 按鈕
 
 【v10.9.68 更新】
 使用者提問：警報 dedup 加進選單會奇怪嗎？
@@ -319,7 +342,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.68"
+VERSION              = "10.9.69"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -332,6 +355,7 @@ handler       = WebhookHandler(CHANNEL_SECRET)
 WAITING_SUGGESTION = set()
 WAITING_STOCK_NEWS = {}  # v10.9.58: user_id -> set_at_timestamp（5 分鐘內輸入股票代號 → 回新聞 carousel）
 WAITING_PORTFOLIO_IMPORT = {}  # v10.9.64: user_id -> {"items": [...], "ts": ts}（5 分鐘內確認）
+WAITING_AI_QA = {}  # v10.9.69: user_id -> set_at_ts（AI 問答模式，5 分鐘內任何訊息當問題）
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 NAME_CACHE         = {}
 STARTUP_DONE       = False
@@ -2953,7 +2977,8 @@ def make_forex_menu_flex() -> dict:
 def make_ai_menu_flex() -> dict:
     return make_menu_flex(
         "🤖 AI 分析", "智慧選股・多維度評分", "#E89B82",
-        [("⭐ 觀察清單","觀察清單"), ("📈 趨勢觀察","趨勢觀察"),
+        [("💬 問 AI 助理","問AI"),                # v10.9.69：AI 智能問答入口
+         ("⭐ 觀察清單","觀察清單"), ("📈 趨勢觀察","趨勢觀察"),
          ("🌱 成長觀察","成長觀察"), ("💰 存股觀察","存股觀察"),
          ("🌊 波段觀察","波段觀察"), ("🤖 AI概念觀察","AI概念觀察")]
     )
@@ -4105,6 +4130,262 @@ def format_portfolio_import_preview(items: list) -> str:
     lines.append("　• 輸入「取消匯入」放棄")
     lines.append("　• 5 分鐘後自動取消")
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════
+#  AI 智能問答系統（v10.9.69）
+#  核心：grounding（先查資料再回答）+ 不亂答 + 合規 + 商品比較/族群分析
+# ══════════════════════════════════════════
+
+AI_QA_SYSTEM_PROMPT = """你是 Lumistock（慧股拾光）的 AI 投資研究助理，由 Hui 開發。
+角色：AI 投資助理 / 市場研究員 / 商品比較顧問 / 投資教育助理 / 功能客服。
+全程使用繁體中文，語氣專業但好懂。
+
+【最高原則：絕不無根據亂答】
+1. 只有「資料區」提供的數據才能引用為事實。
+2. 絕對不可以憑空編造：股價、漲跌幅、成交量、法人買賣超、配息金額、費用率、成分股、新聞內容、財報數字。
+3. 若「資料區」沒有某項資料，就明說「目前缺少 XX 資料，無法精準判斷」，不可以假裝知道。
+4. 不確定就說不確定。寧可保守，不要硬掰。
+
+【合規（重要）】
+1. 禁用詞：建議買進、建議賣出、保證、一定漲、一定跌、明牌、必賺、現在買一定對。
+2. 改用：偏多 / 偏空 / 短線有機會 / 需留意 / 可考慮觀察 / 接近壓力 / 跌破支撐要小心。
+3. 不預測未來股價（「明天會漲嗎」→ 答「無法預測，只能整理目前技術/籌碼/消息面」）。
+4. 每則投資相關回答結尾務必加一行：「⚠ 僅供參考，不構成投資建議」。
+
+【商品比較必須從「人」的角度，不只比商品】
+比較 ETF / 基金 / 股票 / 債券 時，除商品差異外，必須分析：
+- 適合什麼樣的人、什麼投資心態、追求什麼目標
+- 不適合什麼樣的人
+- 投資前該有的觀念（配息≠獲利、總報酬比殖利率重要、除息會扣股價、要看填息）
+- 不可以說「哪個比較好」，要說「哪個比較適合什麼樣的人」
+- 提醒可以「核心（市值型）+ 衛星（高股息）」搭配，不一定二選一
+
+【投資人格對應】依使用者描述判斷並對應合適方向：
+- 保守穩健型（怕虧損、不想盯盤）→ 市值型 ETF 定期定額 + 債券搭配，避免槓桿/單壓
+- 穩定現金流型（喜歡領息）→ 高股息 ETF / 債券 ETF，但提醒別只看殖利率
+- 長期成長型（年輕、可承受波動）→ 市值型/全球型 ETF、優質成長股
+- 積極研究型（願做功課）→ 個股/成長股/波段，但需停損與資金控管
+- 短線交易型 → 流動性高標的，提醒高股息 ETF 不適合當短線主力
+- 容易焦慮型 → 定期定額、分散、低頻檢視，避免槓桿/短線/重壓
+
+【回答格式（依問題類型彈性運用，不要每次都套同一模板）】
+- 個股：①現況（價/漲跌/量）②技術面（均線/RSI/趨勢）③籌碼面（法人）④消息面（新聞）⑤觀察重點 ⑥風險 ⑦AI 信心(高/中/低)
+- 商品比較：①快速結論 ②商品定位 ③主要差異 ④適合族群與心態 ⑤優缺點 ⑥風險 ⑦總結（依目標）⑧AI 信心
+- 知識教學：①白話解釋 ②投資上代表什麼 ③怎麼用 ④常見誤解 ⑤簡單範例
+- 功能/排錯：①功能說明 ②操作步驟 ③可能異常原因 ④需要時提醒回報管理員
+
+【避免】
+- 不要只說「投資有風險請自行判斷」就結束（要有實質分析）
+- 不要過度絕對
+- 商品比較若缺最新具體數字（費用率/配息/成分股），標示「具體數字需查證最新資料」
+
+【AI 信心評分依據】資料完整度、資料更新時間、指標是否一致、是否有重大事件干擾。資料嚴重不足時直接說「目前資料不足，AI 不做強判斷」。
+"""
+
+
+# 常見台股名稱 → 代號（補強：使用者打名稱也能對應）
+_COMMON_NAME_TO_ID = {
+    "台積電": "2330", "聯發科": "2454", "鴻海": "2317", "台達電": "2308",
+    "廣達": "2382", "聯電": "2303", "日月光": "3711", "中華電": "2412",
+    "富邦金": "2881", "國泰金": "2882", "中信金": "2891", "玉山金": "2884",
+    "兆豐金": "2886", "元大金": "2885", "開發金": "2883", "第一金": "2892",
+    "鈊象": "3293", "緯創": "3231", "緯穎": "6669", "技嘉": "2376",
+    "華碩": "2357", "和碩": "4938", "大立光": "3008", "智原": "3035",
+    "創意": "3443", "世芯": "3661", "長榮": "2603", "陽明": "2609",
+    "台塑": "1301", "南亞": "1303", "中鋼": "2002", "台泥": "1101",
+    "統一": "1216", "台塑化": "6505",
+}
+
+def _detect_stocks_in_question(text: str) -> list:
+    """從問題中辨識股票代號（4-6 位數字）或常見名稱，回傳 [stock_id, ...]（最多 3 檔）。"""
+    found = []
+    # 1. 直接的數字代號
+    for m in re.findall(r"\b(\d{4,6}[A-Za-z]?)\b", text):
+        code = m.upper()
+        if code not in found:
+            found.append(code)
+    # 2. 常見名稱
+    for name, code in _COMMON_NAME_TO_ID.items():
+        if name in text and code not in found:
+            found.append(code)
+    # 3. NAME_CACHE 反查（名稱 → 代號），但只比對 >= 2 字的名稱避免誤判
+    if len(found) < 3:
+        for code, nm in list(NAME_CACHE.items())[:6000]:
+            if nm and len(nm) >= 2 and nm in text and code not in found:
+                found.append(code)
+                if len(found) >= 3:
+                    break
+    return found[:3]
+
+
+def _build_stock_context(sid: str) -> str:
+    """組單檔股票的資料區文字（供 AI grounding）。"""
+    tw = get_tw_stock(sid)
+    if not tw:
+        return f"[{sid}] 查無即時報價資料"
+    name = tw.get("name", sid)
+    lines = [f"◆ {sid} {name}"]
+    lines.append(f"　現價 {tw['price']:.2f}　漲跌 {tw['chg']:+.2f}（{tw['pct']:+.2f}%）　{tw.get('status','')}")
+    lines.append(f"　開 {tw.get('open','N/A')} 高 {tw.get('high','N/A')} 低 {tw.get('low','N/A')} 量 {tw.get('vol','N/A')}")
+    if tw.get("ex_dividend"):
+        lines.append(f"　今日除息 {tw['ex_dividend']} 元（漲跌已修正）")
+    # 技術面
+    try:
+        closes = get_tw_closes(sid)
+        k = get_kline_analysis(closes)
+        ma = lambda v: f"{v:.1f}" if v else "N/A"
+        lines.append(f"　技術：趨勢 {k.get('trend','--')}　RSI {k.get('rsi',0):.0f}（{k.get('rsi_label','')}）")
+        lines.append(f"　均線 MA5 {ma(k.get('ma5'))} / MA20 {ma(k.get('ma20'))} / MA60 {ma(k.get('ma60'))} / MA120 {ma(k.get('ma120'))} / MA240 {ma(k.get('ma240'))}")
+    except: pass
+    # 籌碼（用 advice 內含的近期 / 或法人，簡化用 advice 的支撐目標）
+    try:
+        adv = _get_portfolio_advice(sid)
+        if adv.get("stop_loss") and adv.get("target"):
+            lines.append(f"　近 60 天區間參考：支撐約 {adv['stop_loss']:.1f}　壓力約 {adv['target']:.1f}")
+        if adv.get("ex_div_date"):
+            lines.append(f"　下次除息日 {adv['ex_div_date']}　現金 {adv.get('ex_div_cash',0)} 元")
+    except: pass
+    # 新聞
+    try:
+        news = get_tw_stock_news(sid, name, count=3)
+        if news:
+            lines.append("　近期新聞：")
+            for t, u in news[:3]:
+                lines.append(f"　・{t}")
+    except: pass
+    return "\n".join(lines)
+
+
+def _build_market_context() -> str:
+    """組大盤 / 國際市場資料區。"""
+    lines = ["◆ 市場概況"]
+    try:
+        mkt = get_market_status()
+        if mkt.get("ok"):
+            lines.append(f"　台股加權 {mkt.get('price',0):.0f}（{mkt.get('pct',0):+.2f}%）")
+    except: pass
+    # 關鍵指數
+    for sym, label in [("^TWII","加權"), ("^IXIC","Nasdaq"), ("^DJI","道瓊"),
+                       ("^SOX","費半"), ("^VIX","VIX")]:
+        try:
+            d = get_yahoo_quote(sym)
+            if d and d.get("price"):
+                lines.append(f"　{label} {d['price']:,.2f}（{d.get('pct',0):+.2f}%）")
+        except: pass
+    # 匯率
+    try:
+        fx = get_yahoo_quote("TWD=X")
+        if fx and fx.get("price"):
+            lines.append(f"　USD/TWD {fx['price']:.3f}（{fx.get('pct',0):+.2f}%）")
+    except: pass
+    return "\n".join(lines)
+
+
+def _is_function_question(text: str) -> bool:
+    kws = ["怎麼", "如何", "為什麼", "沒顯示", "沒更新", "設定", "新增持股",
+           "停損", "怎麼用", "功能", "操作", "壞了", "錯誤", "當機", "卡住"]
+    invest_kws = ["買", "賣", "加碼", "停利", "適合", "差在哪", "比較", "報酬", "配息"]
+    has_func = any(k in text for k in kws)
+    has_invest = any(k in text for k in invest_kws)
+    # 同時有投資詞時優先當投資問題
+    return has_func and not has_invest
+
+
+def _is_compare_or_knowledge(text: str) -> bool:
+    kws = ["差在哪", "差別", "差異", "比較", "vs", "VS", "跟", "和",
+           "什麼是", "解釋", "教學", "意思", "適合", "新手", "保守", "積極",
+           "領息", "成長", "存股", "ETF", "基金", "債券", "0050", "0056",
+           "高股息", "市值型"]
+    return any(k in text for k in kws)
+
+
+def ai_qa_answer(user_id: str, question: str) -> str:
+    """v10.9.69：AI 智能問答主函式。
+    流程：偵測問題類型 → 抓對應真實資料 → 組 context → Groq 推理 → 回答。
+    """
+    if not GROQ_AVAILABLE:
+        return ("🤖 AI 問答功能未啟用\n"
+                "需設定 GROQ_API_KEY，請聯繫管理員")
+
+    q = question.strip()
+    if not q:
+        return "請輸入你的問題，例如：\n　問 2330 現在怎麼看\n　問 0050 跟 0056 差在哪\n　問 怎麼設定停損"
+
+    context_parts = []
+    qtype = "general"
+
+    # 1) 功能問題
+    if _is_function_question(q):
+        qtype = "function"
+        context_parts.append("【App 功能說明區】")
+        context_parts.append(HELP_MSG[:1500])
+        context_parts.append(
+            "常見排錯：\n"
+            "・股票名稱沒顯示 → 名稱快取尚未載入完成 / 該代號不在名稱表 / API 缺名稱欄位。可請管理員「重載名稱」。\n"
+            "・股價沒更新 → 可能 Yahoo 延遲 15 分，或盤後；卡片底部 metadata 會標來源與時間。\n"
+            "・新增持股 → 打「新增 代碼 股數 均價」，或直接傳券商庫存截圖 AI 辨識。\n"
+            "・設定停損 → 持股卡片有系統建議停損；自訂功能開發中。")
+    else:
+        # 2) 個股偵測
+        stocks = _detect_stocks_in_question(q)
+        if stocks:
+            qtype = "stock"
+            context_parts.append("【即時資料區（僅能引用以下數據，未列出的不可編造）】")
+            for sid in stocks:
+                context_parts.append(_build_stock_context(sid))
+            # 持股問答：附上使用者持倉
+            try:
+                portfolio = load_portfolio()
+                up = {k: v for k, v in portfolio.items()
+                      if v.get("user_id") == user_id and k.replace(".TW","") in stocks}
+                if up:
+                    context_parts.append("【使用者持倉】")
+                    for sym, data in up.items():
+                        context_parts.append(f"　{sym}：{data['shares']} 股，成本 {data['buy_price']}")
+            except: pass
+
+        # 3) 市場 / 國際關鍵字
+        market_kws = ["大盤", "台股", "美股", "道瓊", "nasdaq", "Nasdaq", "費半", "費城",
+                      "VIX", "美元", "匯率", "黃金", "原油", "Fed", "升息", "降息",
+                      "殖利率", "美債", "國際", "盤勢", "今天為什麼", "昨晚"]
+        if any(k in q for k in market_kws):
+            if qtype == "general":
+                qtype = "market"
+            context_parts.append(_build_market_context())
+
+        # 4) 商品比較 / 知識（不需即時資料，靠 LLM 知識 + 規則）
+        if _is_compare_or_knowledge(q) and qtype in ("general",):
+            qtype = "compare_knowledge"
+            context_parts.append(
+                "【商品比較 / 知識題：可用你的既有金融知識回答，"
+                "但具體數字（費用率、配息金額、成分股、規模）若無即時資料須標示『需查證最新資料』。"
+                "務必依系統 prompt 的『從人的角度 + 適合族群 + 投資人格』框架回答。】")
+
+    now_str = now_taipei().strftime("%Y-%m-%d %H:%M")
+    context = "\n".join(context_parts) if context_parts else "（本題無即時資料，請用概念性方式回答並提醒資料限制）"
+
+    user_msg = (
+        f"現在時間：{now_str}（台北）\n"
+        f"問題類型偵測：{qtype}\n\n"
+        f"{context}\n\n"
+        f"───────────\n"
+        f"使用者問題：{q}\n\n"
+        f"請依系統規則回答。投資相關務必附資料來源與免責聲明、AI 信心。"
+    )
+
+    messages = [
+        {"role": "system", "content": AI_QA_SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+    answer = groq_chat(messages, max_tokens=1800, temperature=0.3, timeout=30)
+    if not answer:
+        return ("🤖 AI 暫時無法回答（可能是 API 忙碌或額度限制）\n"
+                "請稍後再試，或換個方式提問")
+    # 保險：確保有免責聲明
+    if "不構成投資建議" not in answer and qtype in ("stock", "market", "compare_knowledge"):
+        answer += "\n\n⚠ 僅供參考，不構成投資建議"
+    return answer
 
 
 def ai_analyze_news_batch(news_list: list, stock_name: str = "", market_type: str = "tw") -> list:
@@ -6039,6 +6320,40 @@ def handle_message(event):
 
     update_user_activity(user_id,text)
 
+    # ══ AI 智能問答（v10.9.69）══
+    # 進入問答模式（按鈕）
+    if text in ["問AI", "問 AI", "AI問答", "AI 問答", "問AI助理"]:
+        WAITING_AI_QA[user_id] = time.time()
+        reply_text(event.reply_token,
+            "💬 AI 投資助理已就緒\n━━━━━━━━━━━━━━\n"
+            "直接輸入你的問題即可，例如：\n"
+            "　・2330 現在怎麼看\n"
+            "　・0050 跟 0056 差在哪\n"
+            "　・我是新手適合買 ETF 還是股票\n"
+            "　・今天台股為什麼跌\n"
+            "　・什麼是殖利率\n"
+            "　・怎麼設定停損\n\n"
+            "（5 分鐘內任何訊息都會當問題；輸入「結束問答」可離開）\n"
+            "⚠ AI 只根據查到的資料回答，不會亂掰")
+        return
+    if text in ["結束問答", "離開問答", "退出問答"]:
+        WAITING_AI_QA.pop(user_id, None)
+        reply_text(event.reply_token, "✅ 已離開 AI 問答模式")
+        return
+    # 「問 XXX」前綴：直接問答（不需進入模式）
+    if text.startswith("問 ") or text.startswith("問："):
+        q = text[2:].strip() if text.startswith("問 ") else text[2:].strip()
+        dlog("HANDLER", f"→ AI 問答（前綴）：{q[:30]}")
+        reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
+        def _bg_qa():
+            try:
+                ans = ai_qa_answer(user_id, q)
+                push_message(user_id, ans)
+            except Exception as e:
+                push_message(user_id, f"🤖 回答失敗：{type(e).__name__}")
+        threading.Thread(target=_bg_qa, daemon=True).start()
+        return
+
     # ══ 主選單觸發 ══
     if text=="查股票":
         dlog("HANDLER", "→ 查股票選單")
@@ -6730,6 +7045,21 @@ def handle_message(event):
         flex,err=get_stock_flex(t,user_id)
         if flex: reply_flex(event.reply_token,flex,f"{t} 股票資訊")
         else: reply_text(event.reply_token,err or "查詢失敗")
+        return
+
+    # ══ AI 問答模式（v10.9.69）— 5 分鐘內未匹配任何指令的訊息當作問題 ══
+    qa_at = WAITING_AI_QA.get(user_id)
+    if qa_at and (time.time() - qa_at) < 300:
+        WAITING_AI_QA[user_id] = time.time()  # 續期
+        dlog("HANDLER", f"→ AI 問答（模式）：{text[:30]}")
+        reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
+        def _bg_qa2():
+            try:
+                ans = ai_qa_answer(user_id, text)
+                push_message(user_id, ans)
+            except Exception as e:
+                push_message(user_id, f"🤖 回答失敗：{type(e).__name__}")
+        threading.Thread(target=_bg_qa2, daemon=True).start()
         return
 
     dlog("HANDLER", "→ 無匹配，回 HELP_MSG")
