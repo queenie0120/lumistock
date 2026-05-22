@@ -1,6 +1,26 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.74（AI 問答全面性服務 — 連續對話 + 結束浮標）
+LINE Bot 模組 v10.9.75（大盤新聞升級 Flex carousel + 直接連結）
+
+【v10.9.75 更新】
+新聞分層補完：台股/美股/國際新聞從純文字 + Google News 跳轉
+升級為 Yahoo RSS 直接連結 + Flex carousel。
+
+改動：
+1. 新增 get_yahoo_finance_rss(category)：Yahoo 台股 RSS（tw-market / intl-markets）
+   - 直接連結（tw.news.yahoo.com），Safari 可開，無 Google 中介頁
+   - 含來源、時間、去重、過濾非新聞
+2. 新增 make_news_carousel()：通用新聞 carousel（標題/來源/時間/看完整按鈕）
+3. 台股新聞 → tw-market、美股/國際新聞 → intl-markets
+4. record_health 追蹤 Yahoo News
+5. Yahoo RSS 失敗時 fallback 回原本 get_news 純文字
+
+驗證：滿足願景條件「標示來源/標示時間/連結可在 Safari 打開」
+
+備註：個股新聞（FinMind）本來就是直接連結，已滿足條件。
+      地緣政治暫保留純文字（niche）。
+
+【v10.9.74】AI 問答全面性服務 — 連續對話 + 結束浮標
 
 【v10.9.74 更新】
 使用者要求：AI 助理要全面性服務，不主動結束、隨時換話題、不用重新點選單、
@@ -404,7 +424,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.74"
+VERSION              = "10.9.75"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5065,6 +5085,95 @@ def get_tw_stock_news_with_ai(stock_id: str, cn_name: str, count: int = 4) -> li
 #  特色：原文 + 中文翻譯（美股）+ 情緒分析 + 影響台股
 # ══════════════════════════════════════════
 
+def get_yahoo_finance_rss(category: str, count: int = 10) -> list:
+    """v10.9.75：抓 Yahoo 台灣股市 RSS（直接連結，Safari 可開）。
+    category: tw-market（台股）/ intl-markets（國際/美股）。
+    回傳 [{"title","url","source","date"}, ...]
+    """
+    url = f"https://tw.stock.yahoo.com/rss?category={category}"
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            record_health("Yahoo News", False, f"RSS HTTP {r.status_code}")
+            return []
+        root = ET.fromstring(r.content)
+        items = root.findall(".//item")
+        out = []
+        seen = set()
+        for it in items:
+            title = clean_title(it.findtext("title", "") or "")
+            link = (it.findtext("link", "") or "").strip()
+            pub = (it.findtext("pubDate", "") or "").strip()
+            if not title or not link:
+                continue
+            if not is_real_news(title):
+                continue
+            norm = normalize_title(title)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            # pubDate: "Fri, 22 May 2026 10:30:00 +0800" → "05/22 10:30"
+            date_short = pub
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(pub)
+                date_short = dt.astimezone(TZ_TAIPEI).strftime("%m/%d %H:%M")
+            except: pass
+            out.append({"title": title, "url": link, "source": "Yahoo 股市", "date": date_short})
+            if len(out) >= count:
+                break
+        if out:
+            record_health("Yahoo News", True)
+        return out
+    except Exception as e:
+        dlog("NEWS", f"Yahoo RSS {category} 失敗：{type(e).__name__}: {e}")
+        record_health("Yahoo News", False, f"RSS {type(e).__name__}")
+        return []
+
+
+def make_news_carousel(title: str, color: str, items: list) -> dict:
+    """v10.9.75：通用新聞 carousel（台股/美股/國際大盤新聞用）。
+    每張卡：標題、來源、時間、看完整按鈕（直接連結）。
+    """
+    bubbles = []
+    for i, n in enumerate(items[:10], start=1):
+        t = n.get("title", "")
+        u = n.get("url", "")
+        src = n.get("source", "")
+        date = n.get("date", "")
+        bubble = {
+            "type": "bubble", "size": "kilo",
+            "header": {"type": "box", "layout": "vertical",
+                       "backgroundColor": color, "paddingAll": "10px",
+                       "contents": [
+                           {"type": "box", "layout": "horizontal", "contents": [
+                               {"type": "text", "text": f"#{i}", "size": "xs",
+                                "color": "#FDF6F0", "flex": 0, "weight": "bold"},
+                               {"type": "text", "text": title, "size": "xs",
+                                "color": "#FFFFFF", "weight": "bold", "flex": 1, "margin": "sm"},
+                           ]},
+                           {"type": "text", "text": f"📰 {src}　{date}",
+                            "size": "xxs", "color": "#FDF6F0", "margin": "xs", "wrap": True},
+                       ]},
+            "body": {"type": "box", "layout": "vertical",
+                     "backgroundColor": "#FDF6F0", "paddingAll": "12px",
+                     "contents": [
+                         {"type": "text", "text": t, "size": "sm",
+                          "color": "#5B4040", "weight": "bold", "wrap": True},
+                     ]},
+            "footer": {"type": "box", "layout": "vertical", "paddingAll": "8px",
+                       "contents": [
+                           {"type": "button", "style": "primary", "color": color,
+                            "height": "sm",
+                            "action": {"type": "uri", "label": "📖 看完整", "uri": u}}
+                       ]},
+        }
+        bubbles.append(bubble)
+    if not bubbles:
+        return None
+    return {"type": "carousel", "contents": bubbles}
+
+
 def get_us_news_english(count: int = 8) -> list:
     """抓美股英文新聞（規格書要求：Reuters/CNBC/Bloomberg/MarketWatch/Benzinga）"""
     queries = [
@@ -6738,14 +6847,29 @@ def handle_message(event):
 
     # ══ 新聞查詢 ══
     if text=="台股新聞":
+        # v10.9.75：Yahoo RSS direct links + Flex carousel
+        items = get_yahoo_finance_rss("tw-market", count=10)
+        if items:
+            flex = make_news_carousel("🇹🇼 台股新聞", "#E89B82", items)
+            if flex: reply_flex(event.reply_token, flex, "台股新聞"); return
         news=get_news("台股 股市 財經 今日",4,trusted_only=True)
         reply_text(event.reply_token, format_news_text(news,"🇹🇼 台股新聞"))
         return
     if text=="美股新聞":
+        # v10.9.75：Yahoo intl-markets RSS（含美股/Fed/美債），direct links
+        items = get_yahoo_finance_rss("intl-markets", count=10)
+        if items:
+            flex = make_news_carousel("🇺🇸 美股 / 國際財經", "#5B8DB8", items)
+            if flex: reply_flex(event.reply_token, flex, "美股新聞"); return
         news=get_news("美股 華爾街 財經",4,trusted_only=True)
         reply_text(event.reply_token, format_news_text(news,"🇺🇸 美股新聞"))
         return
     if text=="國際新聞":
+        # v10.9.75：Yahoo intl-markets RSS，direct links
+        items = get_yahoo_finance_rss("intl-markets", count=10)
+        if items:
+            flex = make_news_carousel("🌐 國際財經", "#B89BC4", items)
+            if flex: reply_flex(event.reply_token, flex, "國際新聞"); return
         news=get_news("國際財經 全球市場 Fed",4,trusted_only=True)
         reply_text(event.reply_token, format_news_text(news,"🌐 國際財經新聞"))
         return
