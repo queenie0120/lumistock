@@ -1,6 +1,18 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.70（修：AI 問答模式被股票查詢誤攔）
+LINE Bot 模組 v10.9.71（修：持股重啟後遺失 — 從 Sheets 還原）
+
+【v10.9.71 修正（嚴重 bug）】
+現象：截圖匯入 7 檔持股成功，但服務重啟後「持股」變空。
+原因：持股存 /tmp/lumistock_portfolio.json，Render /tmp 重啟即清空；
+      雖有同步寫 Google Sheets，但 load_portfolio() 只讀 /tmp 沒從 Sheets 還原。
+修法：
+1. 新增 restore_portfolio_from_sheets()：開機從「自選股」Sheet 重建 /tmp
+2. _bg_init() 啟動時呼叫（名稱快取載入後）
+3. 正規化台股代號（去 .TW）避免「2330」與「2330.TW」重複
+   - 手動新增存 .TW、截圖匯入存純代號，現在統一
+
+【v10.9.70】修 AI 問答模式被股票查詢誤攔
 
 【v10.9.70 修正】
 Bug：在 AI 問答模式打「0050與0056差在哪」回「查無此股票」。
@@ -350,7 +362,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.70"
+VERSION              = "10.9.71"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -697,6 +709,11 @@ def startup():
 def _bg_init():
     time.sleep(15)
     init_name_cache()
+    # v10.9.71：從 Sheets 還原持股（Render /tmp 重啟會清空）
+    try:
+        restore_portfolio_from_sheets()
+    except Exception as e:
+        dlog("PORTFOLIO", f"開機還原持股失敗：{e}")
 
 
 # ══════════════════════════════════════════
@@ -2762,6 +2779,49 @@ def load_portfolio():
 def save_portfolio(p):
     with open(PORTFOLIO_FILE,"w",encoding="utf-8") as f:
         json.dump(p, f, ensure_ascii=False, indent=2)
+
+def restore_portfolio_from_sheets() -> int:
+    """v10.9.71：開機時從 Google Sheets「自選股」還原持股到 /tmp。
+    解決 Render /tmp 重啟清空 → 持股遺失的問題。
+    欄位（append_row 順序）：0用戶ID 1代號 2名稱 3市場 4股數 5買入價 ... 9建立 10更新
+    同一 (user_id, symbol) 取最後一筆（最新）。
+    """
+    try:
+        sheet = get_sheet("自選股")
+        if not sheet:
+            return 0
+        rows = sheet.get_all_values()
+        if not rows or len(rows) < 2:
+            return 0
+        portfolio = {}
+        for row in rows[1:]:  # 跳過標題列
+            if len(row) < 6:
+                continue
+            uid = str(row[0]).strip()
+            symbol = str(row[1]).strip()
+            shares_s = str(row[4]).strip().replace(",", "")
+            price_s = str(row[5]).strip().replace(",", "")
+            if not uid or not symbol or not shares_s or not price_s:
+                continue
+            try:
+                shares = int(float(shares_s))
+                buy_price = float(price_s)
+                if shares <= 0 or buy_price <= 0:
+                    continue
+            except:
+                continue
+            # 正規化：台股代號統一去掉 .TW，避免「2330」與「2330.TW」重複
+            norm_symbol = symbol.replace(".TW", "") if symbol.replace(".TW","").isdigit() else symbol
+            # 後寫覆蓋前寫（同 symbol 取最新；append_row 為時間順序）
+            portfolio[norm_symbol] = {"user_id": uid, "shares": shares, "buy_price": buy_price}
+        if portfolio:
+            # 合併：Sheets 還原優先，但保留 /tmp 既有未同步的（理論上不該有）
+            save_portfolio(portfolio)
+            dlog("PORTFOLIO", f"從 Sheets 還原 {len(portfolio)} 檔持股")
+        return len(portfolio)
+    except Exception as e:
+        dlog("PORTFOLIO", f"還原持股失敗：{type(e).__name__}: {e}")
+        return 0
 
 
 # ══════════════════════════════════════════
