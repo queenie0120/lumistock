@@ -1,6 +1,14 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.69（AI 智能問答系統 — grounded chat）
+LINE Bot 模組 v10.9.70（修：AI 問答模式被股票查詢誤攔）
+
+【v10.9.70 修正】
+Bug：在 AI 問答模式打「0050與0056差在哪」回「查無此股票」。
+原因：中文字在 Python isalnum() 回 True，被股票代號查詢分支誤判攔截。
+修法：AI 問答模式檢查移到股票查詢之前；純 4-6 位數字仍走個股卡片，
+      含中文/其他字元的問題才進 AI 問答。
+
+【v10.9.69】AI 智能問答系統 — grounded chat
 
 【v10.9.69 更新】
 新增 AI 智能問答：有資料佐證、不亂答、合規、會做商品比較與族群分析。
@@ -342,7 +350,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.69"
+VERSION              = "10.9.70"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -7020,6 +7028,24 @@ def handle_message(event):
     if text in ["說明","help","Help","?"]:
         reply_text(event.reply_token, HELP_MSG); return
 
+    # ══ AI 問答模式（v10.9.69）— 移到股票查詢之前，避免中文問題被 isalnum 誤判成股票代號 ══
+    qa_at = WAITING_AI_QA.get(user_id)
+    if qa_at and (time.time() - qa_at) < 300:
+        # 純股票代號（4-6 位數字）仍走個股卡片；含中文 / 其他字元的問題才走 AI
+        _t_check = text.upper().replace("查","").strip()
+        if not (_t_check.isdigit() and 4 <= len(_t_check) <= 6):
+            WAITING_AI_QA[user_id] = time.time()  # 續期
+            dlog("HANDLER", f"→ AI 問答（模式）：{text[:30]}")
+            reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
+            def _bg_qa_mode():
+                try:
+                    ans = ai_qa_answer(user_id, text)
+                    push_message(user_id, ans)
+                except Exception as e:
+                    push_message(user_id, f"🤖 回答失敗：{type(e).__name__}")
+            threading.Thread(target=_bg_qa_mode, daemon=True).start()
+            return
+
     # ══ 股票代號查詢 ══
     t=text.upper().replace("查","").strip()
     if t and (t.isdigit() or (t.isalpha() and len(t)>=1) or t.replace("-","").isalnum()):
@@ -7045,21 +7071,6 @@ def handle_message(event):
         flex,err=get_stock_flex(t,user_id)
         if flex: reply_flex(event.reply_token,flex,f"{t} 股票資訊")
         else: reply_text(event.reply_token,err or "查詢失敗")
-        return
-
-    # ══ AI 問答模式（v10.9.69）— 5 分鐘內未匹配任何指令的訊息當作問題 ══
-    qa_at = WAITING_AI_QA.get(user_id)
-    if qa_at and (time.time() - qa_at) < 300:
-        WAITING_AI_QA[user_id] = time.time()  # 續期
-        dlog("HANDLER", f"→ AI 問答（模式）：{text[:30]}")
-        reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
-        def _bg_qa2():
-            try:
-                ans = ai_qa_answer(user_id, text)
-                push_message(user_id, ans)
-            except Exception as e:
-                push_message(user_id, f"🤖 回答失敗：{type(e).__name__}")
-        threading.Thread(target=_bg_qa2, daemon=True).start()
         return
 
     dlog("HANDLER", "→ 無匹配，回 HELP_MSG")
