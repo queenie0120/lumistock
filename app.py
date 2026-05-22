@@ -1,6 +1,25 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.75（大盤新聞升級 Flex carousel + 直接連結）
+LINE Bot 模組 v10.9.76（新聞多來源 + 美股國際分開 + 修地緣政治 + 個股不重複）
+
+【v10.9.76 更新】
+使用者反映：美股=國際內容一樣、地緣政治沒訊息、個股新聞重複、全來自 Yahoo。
+
+改動：
+1. 新增 get_google_news_multi()：Google News RSS 多媒體來源
+   （UDN/中央社/中時/自由/cnyes/換日線…），顯示真實媒體名
+2. 新增 get_category_news(category)：tw / us / intl / geo 分類查詢
+   - 台股：Yahoo 直接連結 + Google 多來源
+   - 美股：道瓊/Nasdaq/標普/費半/Fed（聚焦美國）
+   - 國際：歐日陸/總經/油價/黃金（非美全球，與美股區隔）
+   - 地緣政治：台海/美中/美伊中東/俄烏（修好「暫無新聞」）
+3. 新增 _merge_dedup_news()：跨來源去重
+4. 個股新聞 carousel：FinMind（直接連結）+ Google 多來源，去重補充更多（12 則）
+5. 美股 ≠ 國際（不同 query，去重）
+
+備註：Google 連結為跳轉但手機可開；換取的是多媒體來源多元性。
+
+【v10.9.75】大盤新聞升級 Flex carousel + 直接連結
 
 【v10.9.75 更新】
 新聞分層補完：台股/美股/國際新聞從純文字 + Google News 跳轉
@@ -424,7 +443,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.75"
+VERSION              = "10.9.76"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4980,7 +4999,7 @@ def get_finmind_news_enriched(stock_id: str, count: int = 10) -> list:
 def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict:
     """v10.9.58：個股新聞 carousel — 每張卡 1 則新聞含媒體 / 時間 / 連結。粉嫩風格。"""
     bubbles = []
-    for i, n in enumerate(news_dicts[:10], start=1):
+    for i, n in enumerate(news_dicts[:12], start=1):
         title  = n.get("title", "")
         url    = n.get("url", "")
         source = n.get("source", "未知來源")
@@ -5084,6 +5103,102 @@ def get_tw_stock_news_with_ai(stock_id: str, cn_name: str, count: int = 4) -> li
 #  獨立模組，不影響主流程查詢
 #  特色：原文 + 中文翻譯（美股）+ 情緒分析 + 影響台股
 # ══════════════════════════════════════════
+
+def get_google_news_multi(query: str, count: int = 10) -> list:
+    """v10.9.76：Google News RSS 多來源新聞，回傳 [{title,url,source,date}]。
+    特色：一個 query 涵蓋多家媒體（UDN/中央社/中時/自由/cnyes/換日線…），來源多元。
+    連結為 Google 跳轉，但在手機瀏覽器會正常導向原文。
+    """
+    url = (f"https://news.google.com/rss/search?q={requests.utils.quote(query)}"
+           f"&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            record_health("Google News", False, f"HTTP {r.status_code}")
+            return []
+        root = ET.fromstring(r.content)
+        items = root.findall(".//item")
+        out, seen = [], set()
+        for it in items:
+            raw_title = clean_title(it.findtext("title", "") or "")
+            link = (it.findtext("link", "") or "").strip()
+            if not raw_title or not link:
+                continue
+            # 來源：<source> 元素，或標題尾「… - 媒體名」
+            src_el = it.find("source")
+            source = (src_el.text if src_el is not None else "") or ""
+            title = raw_title
+            if " - " in raw_title:
+                head, tail = raw_title.rsplit(" - ", 1)
+                if not source:
+                    source = tail.strip()
+                title = head.strip()
+            if not source:
+                source = "綜合報導"
+            if not is_real_news(title):
+                continue
+            norm = normalize_title(title)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            pub = (it.findtext("pubDate", "") or "").strip()
+            date_short = pub
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(pub)
+                date_short = dt.astimezone(TZ_TAIPEI).strftime("%m/%d %H:%M")
+            except: pass
+            out.append({"title": title, "url": link, "source": source, "date": date_short})
+            if len(out) >= count:
+                break
+        if out:
+            record_health("Google News", True)
+        return out
+    except Exception as e:
+        dlog("NEWS", f"Google News 失敗：{type(e).__name__}: {e}")
+        record_health("Google News", False, f"{type(e).__name__}")
+        return []
+
+
+def _merge_dedup_news(*lists, count: int = 12) -> list:
+    """合併多個新聞 dict 清單，依 normalize_title 去重，保留先到的。"""
+    out, seen = [], set()
+    for lst in lists:
+        for n in lst:
+            t = n.get("title", "")
+            norm = normalize_title(t)
+            if not t or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(n)
+            if len(out) >= count:
+                return out
+    return out
+
+
+def get_category_news(category: str, count: int = 10) -> list:
+    """v10.9.76：分類大盤新聞，多來源。
+    category: tw / us / intl / geo
+    """
+    if category == "tw":
+        # 台股：Yahoo（直接連結）優先 + Google 補多來源
+        y = get_yahoo_finance_rss("tw-market", count=count)
+        g = get_google_news_multi("台股 加權指數 台積電 上市櫃", count=count)
+        return _merge_dedup_news(y, g, count=count)
+    if category == "us":
+        # 美股：聚焦美國市場
+        return get_google_news_multi(
+            "美股 道瓊 那斯達克 標普500 費城半導體 Fed 聯準會", count=count)
+    if category == "intl":
+        # 國際：聚焦非美國的全球（歐日陸 + 總經 + 商品）
+        return get_google_news_multi(
+            "國際財經 歐洲股市 日本股市 全球經濟 油價 黃金 IMF", count=count)
+    if category == "geo":
+        # 地緣政治：台海 / 美中 / 美伊中東 / 俄烏
+        return get_google_news_multi(
+            "台海 美中 美伊 以色列 中東 俄烏 地緣政治 制裁", count=count)
+    return []
+
 
 def get_yahoo_finance_rss(category: str, count: int = 10) -> list:
     """v10.9.75：抓 Yahoo 台灣股市 RSS（直接連結，Safari 可開）。
@@ -6847,8 +6962,8 @@ def handle_message(event):
 
     # ══ 新聞查詢 ══
     if text=="台股新聞":
-        # v10.9.75：Yahoo RSS direct links + Flex carousel
-        items = get_yahoo_finance_rss("tw-market", count=10)
+        # v10.9.76：多來源（Yahoo 直接連結 + Google 多媒體）
+        items = get_category_news("tw", count=10)
         if items:
             flex = make_news_carousel("🇹🇼 台股新聞", "#E89B82", items)
             if flex: reply_flex(event.reply_token, flex, "台股新聞"); return
@@ -6856,17 +6971,17 @@ def handle_message(event):
         reply_text(event.reply_token, format_news_text(news,"🇹🇼 台股新聞"))
         return
     if text=="美股新聞":
-        # v10.9.75：Yahoo intl-markets RSS（含美股/Fed/美債），direct links
-        items = get_yahoo_finance_rss("intl-markets", count=10)
+        # v10.9.76：聚焦美股（道瓊/Nasdaq/標普/費半/Fed），多媒體
+        items = get_category_news("us", count=10)
         if items:
-            flex = make_news_carousel("🇺🇸 美股 / 國際財經", "#5B8DB8", items)
+            flex = make_news_carousel("🇺🇸 美股新聞", "#5B8DB8", items)
             if flex: reply_flex(event.reply_token, flex, "美股新聞"); return
         news=get_news("美股 華爾街 財經",4,trusted_only=True)
         reply_text(event.reply_token, format_news_text(news,"🇺🇸 美股新聞"))
         return
     if text=="國際新聞":
-        # v10.9.75：Yahoo intl-markets RSS，direct links
-        items = get_yahoo_finance_rss("intl-markets", count=10)
+        # v10.9.76：聚焦非美全球（歐日陸/總經/商品），與美股區隔
+        items = get_category_news("intl", count=10)
         if items:
             flex = make_news_carousel("🌐 國際財經", "#B89BC4", items)
             if flex: reply_flex(event.reply_token, flex, "國際新聞"); return
@@ -6874,7 +6989,12 @@ def handle_message(event):
         reply_text(event.reply_token, format_news_text(news,"🌐 國際財經新聞"))
         return
     if text=="地緣政治新聞":
-        news=get_news("地緣政治 貿易戰 美中 台海",4,trusted_only=True)
+        # v10.9.76：多來源（台海/美中/美伊中東/俄烏），Flex carousel
+        items = get_category_news("geo", count=10)
+        if items:
+            flex = make_news_carousel("🌏 地緣政治", "#A0809B", items)
+            if flex: reply_flex(event.reply_token, flex, "地緣政治"); return
+        news=get_news("地緣政治 美中 台海 俄烏 中東",4,trusted_only=False)
         reply_text(event.reply_token, format_news_text(news,"🌏 地緣政治"))
         return
     if text=="個股新聞":
@@ -7343,14 +7463,18 @@ def handle_message(event):
             name = NAME_CACHE.get(t, "")
             if not has_chinese(name):
                 name = get_tw_stock_name_fallback(t) or ""
-            news_dicts = get_finmind_news_enriched(t, count=10)
+            # v10.9.76：多來源（FinMind 直接連結 + Google 多媒體），去重補充更多
+            fm = get_finmind_news_enriched(t, count=10)
+            gq = f"{t} {name}".strip() if has_chinese(name) else f"{t} 股票"
+            gg = get_google_news_multi(gq, count=10)
+            news_dicts = _merge_dedup_news(fm, gg, count=12)
             if news_dicts:
                 carousel = make_stock_news_carousel(t, name or t, news_dicts)
                 if carousel:
                     reply_flex(event.reply_token, carousel, f"{t} 個股新聞")
                     return
             reply_text(event.reply_token,
-                f"📰 {t} {name}\n━━━━━━━━━━━━━━\n近 14 天無相關新聞\n或資料源暫時無法取得")
+                f"📰 {t} {name}\n━━━━━━━━━━━━━━\n近期無相關新聞\n或資料源暫時無法取得")
             return
         dlog("HANDLER", f"→ 股票查詢 {t}")
         flex,err=get_stock_flex(t,user_id)
