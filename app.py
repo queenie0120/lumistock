@@ -1,6 +1,21 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.73（持股多使用者隔離 — 複合 key）
+LINE Bot 模組 v10.9.74（AI 問答全面性服務 — 連續對話 + 結束浮標）
+
+【v10.9.74 更新】
+使用者要求：AI 助理要全面性服務，不主動結束、隨時換話題、不用重新點選單、
+            每次回答下方顯示「結束問答」浮標可點。
+
+改動：
+1. 移除 5 分鐘自動結束限制 → 進入問答後持續開著，直到使用者點「結束問答」
+2. 連續對話：問完一題直接問下一題，不需重新點 AI 助理選單
+3. 隨時換話題：任何即時問題都即時回答（每題獨立 grounding）
+4. 新增 push_text_with_qr()：push 訊息附 Quick Reply 浮標
+5. 每次 AI 回答下方顯示「🔚 結束問答」浮標，點一下即離開（不用打字）
+6. 「問 XXX」前綴問完也進入連續模式
+7. 純 4-6 位數字仍走個股卡片（保留快速查股）
+
+【v10.9.73】持股多使用者隔離 — 複合 key
 
 【v10.9.73 更新（重要：個人投資助理原則）】
 原則：個人投資助理，使用者之間的資料不可互相參雜（除非系統層級問題）。
@@ -389,7 +404,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.73"
+VERSION              = "10.9.74"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2877,6 +2892,18 @@ def push_message(user_id: str, text: str):
             MessagingApi(api_client).push_message(
                 PushMessageRequest(to=user_id, messages=[TextMessage(text=text)]))
     except: pass
+
+def push_text_with_qr(user_id: str, text: str, qr_pairs: list):
+    """v10.9.74：push 文字訊息並附 Quick Reply 浮標。qr_pairs = [(label, text), ...]"""
+    try:
+        items = [QuickReplyItem(action=MessageAction(label=l, text=t)) for l, t in qr_pairs]
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=user_id, messages=[
+                    TextMessage(text=text, quickReply=QuickReply(items=items))]))
+    except Exception as e:
+        dlog("PUSH", f"push_text_with_qr 失敗：{e}")
+        push_message(user_id, text)  # fallback 純文字
 
 def push_flex(user_id: str, flex_content: dict, alt_text: str = "觀察清單"):
     try:
@@ -6445,7 +6472,7 @@ def handle_message(event):
 
     update_user_activity(user_id,text)
 
-    # ══ AI 智能問答（v10.9.69）══
+    # ══ AI 智能問答（v10.9.69 / v10.9.74 升級為連續對話）══
     # 進入問答模式（按鈕）
     if text in ["問AI", "問 AI", "AI問答", "AI 問答", "問AI助理"]:
         WAITING_AI_QA[user_id] = time.time()
@@ -6458,24 +6485,27 @@ def handle_message(event):
             "　・今天台股為什麼跌\n"
             "　・什麼是殖利率\n"
             "　・怎麼設定停損\n\n"
-            "（5 分鐘內任何訊息都會當問題；輸入「結束問答」可離開）\n"
+            "可以連續發問、隨時換話題，問完一題直接問下一題即可。\n"
+            "結束時點下方「🔚 結束問答」即可離開。\n"
             "⚠ AI 只根據查到的資料回答，不會亂掰")
         return
-    if text in ["結束問答", "離開問答", "退出問答"]:
+    if text in ["結束問答", "離開問答", "退出問答", "🔚 結束問答"]:
         WAITING_AI_QA.pop(user_id, None)
-        reply_text(event.reply_token, "✅ 已離開 AI 問答模式")
+        reply_text(event.reply_token, "✅ 已結束 AI 問答\n隨時想問再點「💬 問 AI 助理」就好 🌸")
         return
-    # 「問 XXX」前綴：直接問答（不需進入模式）
+    # 「問 XXX」前綴：直接問答，並進入連續問答模式
     if text.startswith("問 ") or text.startswith("問："):
-        q = text[2:].strip() if text.startswith("問 ") else text[2:].strip()
+        q = text[2:].strip()
         dlog("HANDLER", f"→ AI 問答（前綴）：{q[:30]}")
+        WAITING_AI_QA[user_id] = time.time()  # v10.9.74：進入模式，之後可連續問
         reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
         def _bg_qa():
             try:
                 ans = ai_qa_answer(user_id, q)
-                push_message(user_id, ans)
             except Exception as e:
-                push_message(user_id, f"🤖 回答失敗：{type(e).__name__}")
+                ans = f"🤖 回答失敗：{type(e).__name__}"
+            push_text_with_qr(user_id, ans,
+                [("🔚 結束問答", "結束問答")])
         threading.Thread(target=_bg_qa, daemon=True).start()
         return
 
@@ -7158,21 +7188,22 @@ def handle_message(event):
     if text in ["說明","help","Help","?"]:
         reply_text(event.reply_token, HELP_MSG); return
 
-    # ══ AI 問答模式（v10.9.69）— 移到股票查詢之前，避免中文問題被 isalnum 誤判成股票代號 ══
-    qa_at = WAITING_AI_QA.get(user_id)
-    if qa_at and (time.time() - qa_at) < 300:
+    # ══ AI 問答模式（v10.9.74：連續對話，不自動結束，直到使用者點「結束問答」）══
+    # 移到股票查詢之前，避免中文問題被 isalnum 誤判成股票代號
+    if user_id in WAITING_AI_QA:
         # 純股票代號（4-6 位數字）仍走個股卡片；含中文 / 其他字元的問題才走 AI
         _t_check = text.upper().replace("查","").strip()
         if not (_t_check.isdigit() and 4 <= len(_t_check) <= 6):
-            WAITING_AI_QA[user_id] = time.time()  # 續期
-            dlog("HANDLER", f"→ AI 問答（模式）：{text[:30]}")
+            WAITING_AI_QA[user_id] = time.time()  # 更新活動時間
+            dlog("HANDLER", f"→ AI 問答（連續模式）：{text[:30]}")
             reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
             def _bg_qa_mode():
                 try:
                     ans = ai_qa_answer(user_id, text)
-                    push_message(user_id, ans)
                 except Exception as e:
-                    push_message(user_id, f"🤖 回答失敗：{type(e).__name__}")
+                    ans = f"🤖 回答失敗：{type(e).__name__}"
+                # v10.9.74：每次回答附「結束問答」浮標，可連續問下一題
+                push_text_with_qr(user_id, ans, [("🔚 結束問答", "結束問答")])
             threading.Thread(target=_bg_qa_mode, daemon=True).start()
             return
 
