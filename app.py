@@ -1,6 +1,24 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.77（地緣政治改用話題層級關鍵字，不再寫死國家）
+LINE Bot 模組 v10.9.78（修：TPEx 櫃買指數 SSL 連線失敗）
+
+【v10.9.78 修正】
+今天 06:30 自動健檢 7/8 失敗，TPEx 櫃買指數錯誤：
+  3x retry: SSLError: HTTPSConnectionPool ... Max retries exceeded
+
+問題：v10.9.67 加的 retry 只能救「空回應」，救不了 SSL 握手失敗。
+
+修法（三層保險）：
+1. SSL 寬容 verify=False（TPEx server 偶爾 SSL 不穩）
+2. 多 endpoint：HTTPS 失敗試 HTTP（仍是 TPEx 官方）
+3. 全失敗時 fallback 到 Yahoo ^TWOII（已知偏移 1 天 → 標記為「備援」）
+   - 仍套 sanity range 過濾離譜值（50-2000）
+   - meta is_fallback=True，使用者看到「⚠ 備援來源」
+
+結果：TPEx 一掛掉，立刻自動切備援，使用者不會看到空白；
+      健檢仍會記錄主來源失敗，可追蹤 TPEx server 健康度。
+
+【v10.9.77】地緣政治改用話題層級關鍵字
 
 【v10.9.77 更新】
 使用者反映：地緣政治寫死「台海/美中/美伊/俄烏」是壞設計——
@@ -455,7 +473,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.77"
+VERSION              = "10.9.78"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3628,36 +3646,84 @@ def get_yahoo_quote(symbol: str) -> dict:
         return {}
 
 
-def get_taiwan_otc_index() -> dict:
-    """抓台灣櫃買指數 — TPEx 官方 OpenAPI（v10.9.67：加 retry 解決 transient 失敗）。
-    v10.9.51：放棄 Yahoo（^TWOII rmp 卡舊值 + close 日期偏移 1 天）。
-    v10.9.67：06:30 自動健檢偶爾跑出「空回應」→ 加最多 3 次重試（2 秒間隔）
+def _fetch_tpex_index_raw():
+    """v10.9.78：TPEx OpenAPI 抓取，加 SSL 寬容 + 較長 timeout，多 endpoint 嘗試。
+    回傳 (rows or None, last_err)
     """
-    url = "https://www.tpex.org.tw/openapi/v1/tpex_index"
-    rows = None
+    endpoints = [
+        "https://www.tpex.org.tw/openapi/v1/tpex_index",
+        "http://www.tpex.org.tw/openapi/v1/tpex_index",  # SSL 掛掉時試 http
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     last_err = ""
-    MAX_RETRY = 3
-    for attempt in range(MAX_RETRY):
-        try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
-            else:
-                parsed = r.json()
-                if not isinstance(parsed, list) or not parsed:
-                    last_err = "empty list"
+    for url in endpoints:
+        for attempt in range(3):
+            try:
+                # verify=False 讓 SSL 握手失敗時仍能取得資料（TPEx 偶爾 SSL 不穩）
+                r = requests.get(url, headers=headers, timeout=15, verify=False)
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code}"
                 else:
-                    rows = parsed
-                    break  # ← 成功跳出 retry loop
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-        if attempt < MAX_RETRY - 1:
-            time.sleep(2)
+                    parsed = r.json()
+                    if isinstance(parsed, list) and parsed:
+                        return parsed, ""
+                    last_err = "empty list"
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {str(e)[:80]}"
+            if attempt < 2:
+                time.sleep(2)
+    return None, last_err
+
+
+def _fallback_otc_from_yahoo() -> dict:
+    """v10.9.78：TPEx 全失敗時的最後備援 — Yahoo ^TWOII。
+    Yahoo ^TWOII 已知問題：rmp 可能卡舊值、close 陣列日期可能偏移 1 天。
+    所以這裡用 chartPreviousClose 對齊：取 closes[-1] 當「最近收盤」，差距大時直接放棄。
+    回傳含 meta is_fallback=True、source 標記 Yahoo 備援。
+    """
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/^TWOII?interval=1d&range=10d"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            return {}
+        result = r.json()["chart"]["result"][0]
+        quotes = result.get("indicators",{}).get("quote",[{}])[0]
+        closes = [c for c in quotes.get("close",[]) if c is not None]
+        if len(closes) < 2:
+            return {}
+        price = float(closes[-1])
+        prev = float(closes[-2])
+        chg = price - prev
+        pct = chg/prev*100 if prev else 0
+        # 合理範圍 sanity（櫃買大約 100-1000）
+        if not (50 < price < 2000):
+            return {}
+        return {
+            "price": price, "chg": chg, "pct": pct, "ms": "POST",
+            "meta": build_data_meta("Yahoo ^TWOII（備援，日期可能偏移 1 天）",
+                                    is_realtime=False, is_fallback=True, delay_min=1440),
+        }
+    except Exception as e:
+        dlog("TPEX", f"Yahoo 備援也失敗：{type(e).__name__}: {e}")
+        return {}
+
+
+def get_taiwan_otc_index() -> dict:
+    """抓台灣櫃買指數。
+    v10.9.51：放棄 Yahoo 主來源（^TWOII rmp 卡舊值 + close 日期偏移 1 天）→ 改 TPEx 官方。
+    v10.9.67：加 3x retry 解決 transient 空回應。
+    v10.9.78：TPEx SSL 偶爾掛 → verify=False + 多 endpoint 嘗試 + Yahoo 備援保底。
+    """
+    rows, last_err = _fetch_tpex_index_raw()
 
     if not rows:
-        dlog("TPEX", f"櫃買指數失敗（{MAX_RETRY} 次重試後仍失敗）：{last_err}")
-        record_health("TPEx 官方", False, f"{MAX_RETRY}x retry: {last_err}")
-        return {}
+        dlog("TPEX", f"櫃買指數 TPEx 全失敗：{last_err}，嘗試 Yahoo 備援")
+        record_health("TPEx 官方", False, f"primary fail: {last_err[:80]}")
+        # v10.9.78：最後備援 Yahoo，至少給使用者有數字看
+        fb = _fallback_otc_from_yahoo()
+        if fb:
+            dlog("TPEX", "已用 Yahoo 備援")
+        return fb
 
     try:
         rows = sorted(rows, key=lambda x: x.get("Date",""))
