@@ -1,6 +1,18 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.76（新聞多來源 + 美股國際分開 + 修地緣政治 + 個股不重複）
+LINE Bot 模組 v10.9.77（地緣政治改用話題層級關鍵字，不再寫死國家）
+
+【v10.9.77 更新】
+使用者反映：地緣政治寫死「台海/美中/美伊/俄烏」是壞設計——
+未來新衝突出現時 query 會漏，依賴開發者人工更新。
+
+修法：改用話題層級關鍵字，Google News 自動抓今天熱門：
+- q1: 地緣政治 OR 國際衝突 OR 戰爭
+- q2: 制裁 OR 軍事行動 OR 外交危機 OR 邊境緊張
+- q3: 國安 OR 聯合國決議 OR 政變 OR 國際情勢
+三組聚合去重 → 全面覆蓋當下任何地緣熱點，不再依賴 hardcode。
+
+【v10.9.76】新聞多來源
 
 【v10.9.76 更新】
 使用者反映：美股=國際內容一樣、地緣政治沒訊息、個股新聞重複、全來自 Yahoo。
@@ -443,7 +455,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.76"
+VERSION              = "10.9.77"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5194,9 +5206,13 @@ def get_category_news(category: str, count: int = 10) -> list:
         return get_google_news_multi(
             "國際財經 歐洲股市 日本股市 全球經濟 油價 黃金 IMF", count=count)
     if category == "geo":
-        # 地緣政治：台海 / 美中 / 美伊中東 / 俄烏
-        return get_google_news_multi(
-            "台海 美中 美伊 以色列 中東 俄烏 地緣政治 制裁", count=count)
+        # v10.9.77：用「話題層級關鍵字」而非寫死國家/事件
+        # Google News 會自動抓「今天最熱的衝突/制裁/外交」，不用人工維護地點清單
+        # 多 query 聚合：覆蓋衝突、制裁、外交、軍事、政變、戰爭等通用面向
+        q1 = get_google_news_multi("地緣政治 OR 國際衝突 OR 戰爭", count=count)
+        q2 = get_google_news_multi("制裁 OR 軍事行動 OR 外交危機 OR 邊境緊張", count=count)
+        q3 = get_google_news_multi("國安 OR 聯合國決議 OR 政變 OR 國際情勢", count=count)
+        return _merge_dedup_news(q1, q2, q3, count=count)
     return []
 
 
