@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.101"
+VERSION              = "10.9.102"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -875,6 +875,7 @@ WAITING_SELL_IMPORT      = {}  # v10.9.81: user_id -> {"items":[{stock_id,shares
 WAITING_BUY_IMPORT       = {}  # v10.9.83: user_id -> {"items":[{stock_id,shares,buy_price}], "ts":ts}
 WAITING_FEE_INPUT        = {}  # v10.9.86: user_id -> ts（5 分鐘內任何訊息當手續費輸入）
 WAITING_AI_QA = {}  # v10.9.69: user_id -> set_at_ts（AI 問答模式，5 分鐘內任何訊息當問題）
+WAITING_DELETE_SELL = {}  # v10.9.102: user_id -> {"records":[...], "ts":ts}（管理賣出紀錄）
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 USER_SETTINGS_FILE = "/tmp/lumistock_user_settings.json"  # v10.9.82：手續費折數等
 NAME_CACHE         = {}
@@ -5229,6 +5230,36 @@ def read_sell_history_from_sheets(user_id: str) -> list:
         return []
 
 
+def delete_sell_record_from_sheets(user_id: str, date: str, symbol: str,
+                                    shares: int, price: float) -> tuple:
+    """v10.9.102：刪除特定一筆賣出紀錄。
+    用 (user_id, date, symbol, shares, price) 五個欄位精準比對。
+    Returns: (ok, msg)"""
+    try:
+        sheet = get_or_create_sheet("賣出紀錄",
+                                    headers=["時間","用戶ID","代號","名稱",
+                                             "股數","賣價","成本均價","已實現損益"])
+        if not sheet:
+            return False, "無法取得 Sheets 分頁"
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows, start=1):
+            if len(row) < 8: continue
+            if str(row[1]).strip() != user_id: continue
+            if (row[0] or "").strip() != date: continue
+            if (row[2] or "").strip() != symbol: continue
+            try:
+                if int(float(row[4])) != int(shares): continue
+                if abs(float(row[5]) - float(price)) > 0.01: continue
+            except: continue
+            sheet.delete_rows(i)
+            dlog("PORTFOLIO", f"刪除賣出紀錄 row {i}：{user_id[-6:]} {symbol} {shares}股 @ {price}")
+            return True, f"已刪除 row {i}"
+        return False, "找不到完全相符的紀錄（可能已刪除）"
+    except Exception as e:
+        dlog("PORTFOLIO", f"delete_sell_record 失敗：{type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
 def format_pnl_analysis(user_id: str) -> str:
     """v10.9.85：損益分析 — 已實現（Sheets）+ 未實現（即時持股）分開呈現。
     取代原本 get_portfolio_summary（與「我的持股」重複）。
@@ -9420,14 +9451,109 @@ def handle_message(event):
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text in ["損益分析", "我的損益", "損益總覽"]:
-        # v10.9.98：回到純文字版（v10.9.95 的 Flex carousel LINE 拒絕，silent fail）
-        # 文字版本來就會動，且包含已實現 + 未實現 + 警語完整資訊
+        # v10.9.98 文字版；v10.9.102 加管理浮標
+        msg_text = format_pnl_analysis(user_id)
+        qr = [("🗑️ 修改/刪除", "管理賣出"), ("📋 我的持股", "持股")]
         try:
-            reply_text(event.reply_token, format_pnl_analysis(user_id))
+            reply_text_with_qr(event.reply_token, msg_text, qr)
         except Exception as e:
             dlog("PNL", f"reply 失敗 → push：{type(e).__name__}: {e}")
-            try: push_message(user_id, format_pnl_analysis(user_id))
+            try: push_message(user_id, msg_text)
             except: pass
+        return
+
+    # v10.9.102：管理賣出紀錄（列表 + 選刪除）
+    if text in ["管理賣出", "修改賣出", "編輯賣出紀錄", "刪除賣出紀錄", "管理紀錄"]:
+        realized = read_sell_history_from_sheets(user_id)
+        if not realized:
+            reply_text(event.reply_token, "📕 尚無賣出紀錄可管理")
+            return
+        # LINE Quick Reply 上限 13 個（含取消按鈕），所以最多列 12 筆
+        records = realized[:12]
+        WAITING_DELETE_SELL[user_id] = {"records": records, "ts": time.time()}
+        lines = ["🗑️ 編輯/刪除賣出紀錄", "━━━━━━━━━━━━━━",
+                 "點下方浮標選要刪除的編號 👇"]
+        for i, r in enumerate(records, 1):
+            d = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
+            sign = "🟢" if r["pnl"] >= 0 else "🔴"
+            lines.append(f"#{i}  {d}")
+            lines.append(f"   {sign} {r['symbol']} {r['name']}")
+            lines.append(f"   賣 {r['shares']:,} @ {r['price']:,.2f}　{r['pnl']:+,.0f}")
+        if len(realized) > 12:
+            lines.append("")
+            lines.append(f"（只顯示最近 12 筆，另有 {len(realized)-12} 筆較早紀錄）")
+        lines.append("")
+        lines.append("💡 修改＝刪掉舊的後重新賣出（指令或截圖）")
+        qr = [(f"#{i}", f"刪除賣出#{i}") for i in range(1, len(records)+1)]
+        qr.append(("🚫 結束", "取消管理賣出"))
+        reply_text_with_qr(event.reply_token, "\n".join(lines), qr)
+        return
+
+    # 選定編號 → 顯示確認浮標
+    if text.startswith("刪除賣出#"):
+        rec = WAITING_DELETE_SELL.get(user_id)
+        if not rec or (time.time() - rec["ts"]) > 300:
+            reply_text(event.reply_token, "⏰ 管理已過期，請重新點「管理賣出」")
+            return
+        try: idx = int(text.split("#", 1)[1])
+        except:
+            reply_text(event.reply_token, "❌ 編號錯誤")
+            return
+        records = rec["records"]
+        if not (1 <= idx <= len(records)):
+            reply_text(event.reply_token, "❌ 編號超出範圍")
+            return
+        r = records[idx-1]
+        d = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
+        sign = "🟢" if r["pnl"] >= 0 else "🔴"
+        reply_text_with_qr(event.reply_token,
+            f"⚠ 確定要刪除這筆嗎？\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"{d}  {sign} {r['symbol']} {r['name']}\n"
+            f"賣 {r['shares']:,} 股 @ {r['price']:,.2f}\n"
+            f"成本均 {r['cost']:,.2f}\n"
+            f"已實現損益 {r['pnl']:+,.0f} 元\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"⚠ 此操作不可復原\n"
+            f"⚠ 持股股數不會自動回補（如要回補請用「重設」指令）",
+            [(f"✅ 確定刪除", f"確定刪除賣出#{idx}"),
+             ("🚫 取消", "取消管理賣出")])
+        return
+
+    # 確認刪除 → 真的刪 Sheets 那列
+    if text.startswith("確定刪除賣出#"):
+        rec = WAITING_DELETE_SELL.get(user_id)
+        if not rec or (time.time() - rec["ts"]) > 300:
+            reply_text(event.reply_token, "⏰ 已過期")
+            return
+        try: idx = int(text.split("#", 1)[1])
+        except:
+            reply_text(event.reply_token, "❌ 編號錯誤")
+            return
+        records = rec["records"]
+        if not (1 <= idx <= len(records)):
+            reply_text(event.reply_token, "❌ 範圍錯誤")
+            return
+        r = records[idx-1]
+        ok, msg = delete_sell_record_from_sheets(
+            user_id, r["date"], r["symbol"], r["shares"], r["price"])
+        WAITING_DELETE_SELL.pop(user_id, None)
+        if ok:
+            d = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
+            reply_text_with_qr(event.reply_token,
+                f"✅ 已刪除\n{d}  {r['symbol']}  {r['pnl']:+,.0f} 元",
+                [("📈 損益分析", "損益分析"),
+                 ("🗑️ 繼續管理", "管理賣出"),
+                 ("📋 我的持股", "持股")])
+        else:
+            reply_text(event.reply_token, f"❌ 刪除失敗：{msg}")
+        return
+
+    if text in ["取消管理賣出", "結束管理"]:
+        if WAITING_DELETE_SELL.pop(user_id, None):
+            reply_text(event.reply_token, "✅ 已結束管理，未做變更")
+        else:
+            reply_text(event.reply_token, "（沒有進行中的管理）")
         return
     if text=="查快取說明": reply_text(event.reply_token,"格式：查快取 代號\n例如：查快取 2330"); return
 
