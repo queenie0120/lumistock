@@ -1,6 +1,36 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.91（push_flex silent fail → 必 fallback 文字+浮標）
+LINE Bot 模組 v10.9.92（持股淨損益 + 含費/未含費匯入選項）
+
+【v10.9.92 更新】
+使用者反映：
+1. 截圖的持股成本不一定每家券商都已含手續費，要可選
+2. 「我的持股」的個股漲幅及損益應該扣賣出手續費+證交稅，否則不是真實損益
+
+改動：
+1. 庫存匯入 Flex 改用「雙確認」浮標（不再單一「確認」）：
+   - [✅ 已含費 — 直接匯入]（玫瑰紫）
+   - [➕ 未含費 — 加上手續費]（杏粉）
+   - [🚫 取消匯入]
+   說明文：大部分券商「均價」已含費；若是「成交均價」則未含費
+2. 確認匯入 handler 改吃兩種模式：
+   - 已含費：直接 save buy_price = OCR 均價
+   - 未含費：buy_price = (OCR均價*股數 + calc_buy_fee) / 股數
+   - 回應顯示「模式 + 加總費用」
+3. make_portfolio_flex_carousel 改用「淨損益」：
+   - 每張卡顯示：現價 / 含費成本 / 股數 / 毛損益 / 費+稅 / 淨損益
+   - 卡片 header 主數字改用淨損益
+   - 總覽 bubble 主數字改淨損益，下面顯示毛/費稅對照
+4. get_portfolio_summary 文字版同步改用淨損益
+5. Fallback 文字浮標也改三個按鈕
+
+公式：
+- 賣出手續費 = max(20, price*shares*0.1425%*折數)
+- 證交稅 = price*shares*0.3%（ETF 實際 0.1% 暫未區分）
+- 淨損益 = (現價-含費成本)*股數 - 賣出手續費 - 證交稅
+- 淨報酬率 = 淨損益 / (含費成本*股數) *100
+
+【v10.9.91】push_flex silent fail → 必 fallback 文字+浮標
 
 【v10.9.91 更新】
 使用者反映：傳賣出截圖後，「🔍 辨識中...」之後完全沒下文。
@@ -724,7 +754,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.91"
+VERSION              = "10.9.92"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5491,7 +5521,9 @@ def make_buy_preview_flex(items: list, user_id: str) -> dict:
 
 
 def make_holdings_preview_flex(items: list) -> dict:
-    """v10.9.89：庫存匯入預覽 Flex carousel — 帶確認/取消按鈕。"""
+    """v10.9.89：庫存匯入預覽 Flex carousel。
+    v10.9.92：截圖成本不一定都含手續費（不同券商不同），所以給兩個確認浮標：
+      [✅ 已含費（直接匯入）] [➕ 未含費（加上手續費）] [🚫 取消匯入]"""
     overview = {
         "type":"bubble","size":"mega",
         "header":{"type":"box","layout":"vertical","backgroundColor":"#C9B0DB","paddingAll":"14px",
@@ -5502,13 +5534,19 @@ def make_holdings_preview_flex(items: list) -> dict:
         "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"sm",
             "contents":[
                 {"type":"text","text":f"共 {len(items)} 檔","size":"sm","color":"#5B4040","weight":"bold"},
-                {"type":"text","text":"確認後一鍵儲存到「我的持股」","size":"xxs","color":"#A07560","margin":"sm"},
                 {"type":"separator","color":"#E8C4B4","margin":"md"},
-                {"type":"text","text":"⚠ 請核對辨識結果","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"}
+                {"type":"text","text":"❓ 截圖中的成本均價是否已含手續費？",
+                 "size":"xs","color":"#5B4040","weight":"bold","margin":"sm","wrap":True},
+                {"type":"text","text":"• 大部分券商「均價」欄位已含費（直接匯入）",
+                 "size":"xxs","color":"#9B6B5A","margin":"xs","wrap":True},
+                {"type":"text","text":"• 若顯示為「成交均價」可能未含費（請選未含費）",
+                 "size":"xxs","color":"#9B6B5A","wrap":True}
             ]},
         "footer":{"type":"box","layout":"vertical","spacing":"sm","paddingAll":"8px","contents":[
             {"type":"button","style":"primary","color":"#C9B0DB","height":"sm",
-             "action":{"type":"message","label":"✅ 確認匯入","text":"確認匯入"}},
+             "action":{"type":"message","label":"✅ 已含費 — 直接匯入","text":"確認匯入 已含費"}},
+            {"type":"button","style":"primary","color":"#E89B82","height":"sm",
+             "action":{"type":"message","label":"➕ 未含費 — 加上手續費","text":"確認匯入 未含費"}},
             {"type":"button","style":"secondary","height":"sm",
              "action":{"type":"message","label":"🚫 取消匯入","text":"取消匯入"}}
         ]}
@@ -7526,7 +7564,11 @@ def _fmt_exdiv_date(date_str: str) -> str:
 
 
 def make_portfolio_flex_carousel(user_id: str) -> dict:
-    """v10.9.62：持股 Flex carousel。每檔一張卡 + 開頭一張 overview 總損益。"""
+    """v10.9.62：持股 Flex carousel。每檔一張卡 + 開頭一張 overview 總損益。
+    v10.9.92：個股漲幅 / 損益改用「淨損益」— 扣賣出手續費 + 證交稅。
+      bp 假設為含費成本（v10.9.92 庫存匯入已強制要求使用者選擇含費/未含費）。
+      淨損益 = (現價 - bp) * 股數 - 賣出手續費 - 證交稅
+      淨報酬率 = 淨損益 / (bp * 股數) * 100"""
     portfolio = load_portfolio()
     up = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
     if not up:
@@ -7534,8 +7576,10 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
 
     # 先算每檔現價、損益
     rows = []
-    total_profit = 0
+    total_profit = 0       # 毛損益總和（顯示對照）
+    total_net_profit = 0   # 淨損益總和（扣賣出費稅）
     total_cost = 0
+    total_fee_tax = 0
     for key, data in up.items():
         symbol = _pf_symbol(key)  # v10.9.73：從複合 key 取 symbol
         sid = symbol.replace(".TW", "")
@@ -7552,21 +7596,34 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
             price = 0; name = sid
         shares = data["shares"]
         bp = data["buy_price"]
-        profit = (price - bp) * shares if price else 0
+        gross_profit = (price - bp) * shares if price else 0
         cost = bp * shares
-        pct = (price - bp) / bp * 100 if price and bp else 0
+        gross_pct = (price - bp) / bp * 100 if price and bp else 0
+        # v10.9.92：賣出費稅（台股有，美股無）
+        if sid.isdigit() and price:
+            fee, tax = calc_sell_fee_tax(price, shares, user_id)
+        else:
+            fee, tax = 0, 0
+        fee_tax = fee + tax
+        net_profit = gross_profit - fee_tax
+        net_pct = (net_profit / cost * 100) if cost else 0
         rows.append({
             "symbol": symbol, "sid": sid, "name": name,
             "price": price, "bp": bp, "shares": shares,
-            "profit": profit, "pct": pct, "cost": cost,
+            "gross_profit": gross_profit, "gross_pct": gross_pct,
+            "fee": fee, "tax": tax, "fee_tax": fee_tax,
+            "profit": net_profit, "pct": net_pct,   # 主要顯示用「淨」
+            "cost": cost,
         })
-        total_profit += profit
+        total_profit += gross_profit
+        total_net_profit += net_profit
+        total_fee_tax += fee_tax
         total_cost += cost
-    total_pct = (total_profit / total_cost * 100) if total_cost else 0
+    total_pct = (total_net_profit / total_cost * 100) if total_cost else 0
 
     bubbles = []
-    # Overview bubble
-    is_up = total_profit >= 0
+    # Overview bubble — v10.9.92：用「淨損益」（扣賣出費稅）為主數字
+    is_up = total_net_profit >= 0
     overview_color = "#D97A5C" if is_up else "#7AABBE"
     bubbles.append({
         "type": "bubble", "size": "kilo",
@@ -7582,11 +7639,24 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
         "body": {"type": "box", "layout": "vertical",
                  "backgroundColor": "#FDF6F0", "paddingAll": "16px", "spacing": "sm",
                  "contents": [
-                     {"type": "text", "text": "總損益", "size": "xs", "color": "#9B6B5A"},
-                     {"type": "text", "text": f"{total_profit:+,.0f}",
+                     {"type": "text", "text": "淨損益（扣賣出費稅）", "size": "xs", "color": "#9B6B5A"},
+                     {"type": "text", "text": f"{total_net_profit:+,.0f}",
                       "size": "3xl", "color": overview_color, "weight": "bold"},
                      {"type": "text", "text": f"{'▲' if is_up else '▼'} {total_pct:+.2f}%",
                       "size": "sm", "color": overview_color},
+                     {"type": "separator", "color": "#E8C4B4"},
+                     {"type": "box", "layout": "horizontal", "contents": [
+                         {"type": "text", "text": "毛損益", "size": "xxs",
+                          "color": "#9B6B5A", "flex": 2},
+                         {"type": "text", "text": f"{total_profit:+,.0f}",
+                          "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
+                     ]},
+                     {"type": "box", "layout": "horizontal", "contents": [
+                         {"type": "text", "text": "費+稅", "size": "xxs",
+                          "color": "#9B6B5A", "flex": 2},
+                         {"type": "text", "text": f"-{total_fee_tax:,}" if total_fee_tax else "—",
+                          "size": "xxs", "color": "#7AABBE", "align": "end", "flex": 3},
+                     ]},
                      {"type": "separator", "color": "#E8C4B4"},
                      {"type": "text", "text": "⚠ 系統建議僅供參考，非投資建議",
                       "size": "xxs", "color": "#C9A89A", "align": "center", "margin": "sm"},
@@ -7675,7 +7745,7 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
                               "align": "end", "flex": 3},
                          ]},
                          {"type": "box", "layout": "horizontal", "contents": [
-                             {"type": "text", "text": "成本", "size": "xxs",
+                             {"type": "text", "text": "含費成本", "size": "xxs",
                               "color": "#9B6B5A", "flex": 2},
                              {"type": "text", "text": f"{r['bp']:,.2f}",
                               "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
@@ -7685,6 +7755,30 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
                               "color": "#9B6B5A", "flex": 2},
                              {"type": "text", "text": f"{r['shares']:,}",
                               "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
+                         ]},
+                         # v10.9.92：毛 / 費稅 / 淨 損益拆分
+                         {"type": "separator", "color": "#E8C4B4", "margin": "sm"},
+                         {"type": "box", "layout": "horizontal", "contents": [
+                             {"type": "text", "text": "毛損益", "size": "xxs",
+                              "color": "#9B6B5A", "flex": 2},
+                             {"type": "text",
+                              "text": f"{r['gross_profit']:+,.0f}" if r['price'] else "—",
+                              "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
+                         ]},
+                         {"type": "box", "layout": "horizontal", "contents": [
+                             {"type": "text", "text": "費+稅", "size": "xxs",
+                              "color": "#9B6B5A", "flex": 2},
+                             {"type": "text",
+                              "text": f"-{r['fee_tax']:,}" if r['fee_tax'] else "—",
+                              "size": "xxs", "color": "#7AABBE", "align": "end", "flex": 3},
+                         ]},
+                         {"type": "box", "layout": "horizontal", "contents": [
+                             {"type": "text", "text": "淨損益", "size": "xs",
+                              "color": "#A05A48", "weight": "bold", "flex": 2},
+                             {"type": "text",
+                              "text": f"{r['profit']:+,.0f}" if r['price'] else "—",
+                              "size": "sm", "color": c, "weight": "bold",
+                              "align": "end", "flex": 3},
                          ]},
                          *advice_box,
                      ]},
@@ -7702,11 +7796,13 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
 
 
 def get_portfolio_summary(user_id:str)->str:
+    """v10.9.92：損益改用「淨」（扣賣出手續費 + 證交稅），與 Flex 版一致。"""
     portfolio=load_portfolio()
     up={k:v for k,v in portfolio.items() if v.get("user_id")==user_id}
     if not up:
         return "📋 持股清單是空的\n━━━━━━━━━━━━━━\n新增方式：\n　新增 2330 100 200\n　（代碼 股數 買入均價）"
-    msg="📋 我的持股\n━━━━━━━━━━━━━━\n"; total=0
+    msg="📋 我的持股（淨損益＝扣賣出費稅）\n━━━━━━━━━━━━━━\n"
+    total_net=0; total_gross=0; total_ft=0
     for key,data in up.items():
         symbol=_pf_symbol(key)  # v10.9.73：複合 key 取 symbol
         try:
@@ -7716,11 +7812,23 @@ def get_portfolio_summary(user_id:str)->str:
             else:
                 us=get_us_stock(symbol); price=us["price"] if us else 0; name=us["name"] if us else symbol
             shares=data["shares"]; bp=data["buy_price"]
-            profit=(price-bp)*shares; pct=(price-bp)/bp*100
-            icon="🟢" if profit>=0 else "🔴"; total+=profit
-            msg+=f"{icon} {symbol}｜{name}\n　現價 {price:.2f}　買入 {bp:.2f}\n　{shares}股　損益 {profit:+,.0f}（{pct:+.1f}%）\n\n"
+            gross=(price-bp)*shares
+            if sid.isdigit() and price:
+                fee, tax = calc_sell_fee_tax(price, shares, user_id); ft = fee+tax
+            else:
+                ft = 0
+            net = gross - ft
+            net_pct=(net/(bp*shares))*100 if bp*shares else 0
+            icon="🟢" if net>=0 else "🔴"
+            total_net+=net; total_gross+=gross; total_ft+=ft
+            msg+=(f"{icon} {symbol}｜{name}\n"
+                  f"　現價 {price:.2f}　含費成本 {bp:.2f}\n"
+                  f"　{shares}股　毛 {gross:+,.0f}　費稅 -{ft:,}\n"
+                  f"　淨 {net:+,.0f}（{net_pct:+.1f}%）\n\n")
         except: msg+=f"　{symbol}　查詢失敗\n\n"
-    msg+=f"━━━━━━━━━━━━━━\n{'🟢' if total>=0 else '🔴'} 總損益　{total:+,.0f}"
+    msg+=(f"━━━━━━━━━━━━━━\n"
+          f"{'🟢' if total_net>=0 else '🔴'} 總淨損益　{total_net:+,.0f}\n"
+          f"　毛 {total_gross:+,.0f}　費稅 -{total_ft:,}")
     return msg
 
 
@@ -8174,7 +8282,9 @@ def handle_image(event):
                     dlog("IMAGE", f"庫存 Flex builder 失敗：{type(e).__name__}: {e}")
                 if not ok:
                     push_text_with_qr(user_id, format_portfolio_import_preview(items),
-                                      [("✅ 確認匯入", "確認匯入"), ("🚫 取消匯入", "取消匯入")])
+                                      [("✅ 已含費", "確認匯入 已含費"),
+                                       ("➕ 未含費", "確認匯入 未含費"),
+                                       ("🚫 取消", "取消匯入")])
                 return
 
             if rtype == "sell" and items:
@@ -8834,31 +8944,50 @@ def handle_message(event):
             "例：新增 2330 500 2200")
         return
     # v10.9.64：持股截圖匯入確認
-    if text in ["確認匯入", "確認", "yes", "Yes", "YES"]:
+    # v10.9.92：庫存匯入支援「已含費 / 未含費」兩種確認
+    if text in ["確認匯入", "確認", "yes", "Yes", "YES",
+                "確認匯入 已含費", "確認匯入 未含費",
+                "已含費", "未含費", "未含費匯入", "未含費 加上手續費"]:
         record = WAITING_PORTFOLIO_IMPORT.get(user_id)
         if not record or (time.time() - record["ts"]) > 300:
             reply_text(event.reply_token, "⏰ 沒有待確認的匯入或已過期\n請重新傳截圖")
             return
+        # 判斷模式：「未含費」→ 系統幫加買進手續費；否則沿用 OCR 均價（視為已含費）
+        add_fee = "未含費" in text
         items = record["items"]
         portfolio = load_portfolio()
         added = 0
+        fee_total = 0
         for h in items:
             symbol = h["stock_id"]
+            shares = h["shares"]
+            raw_avg = h["avg_price"]
+            if add_fee and str(symbol).replace(".TW","").isdigit():
+                # 加上估算的買進手續費：含費均價 = (raw_avg*shares + fee) / shares
+                fee = calc_buy_fee(raw_avg, shares, user_id)
+                cost_avg = (raw_avg * shares + fee) / shares if shares else raw_avg
+                fee_total += fee
+            else:
+                cost_avg = raw_avg
             # v10.9.73：複合 key（多使用者隔離）
             portfolio[_pf_key(user_id, symbol)] = {
                 "user_id": user_id,
-                "shares": h["shares"],
-                "buy_price": h["avg_price"],
+                "shares": shares,
+                "buy_price": cost_avg,
             }
             try:
                 name = NAME_CACHE.get(symbol, symbol)
-                save_portfolio_to_sheets(user_id, symbol, name, "TW", h["shares"], h["avg_price"])
+                save_portfolio_to_sheets(user_id, symbol, name, "TW", shares, cost_avg)
             except: pass
             added += 1
         save_portfolio(portfolio)
         WAITING_PORTFOLIO_IMPORT.pop(user_id, None)
-        reply_text(event.reply_token,
-            f"✅ 已匯入 {added} 檔持股\n輸入「持股」查看完整清單")
+        mode_str = f"已加買進手續費 {fee_total:,} 元" if add_fee else "成本均價已含費（直接匯入）"
+        reply_text_with_qr(event.reply_token,
+            f"✅ 已匯入 {added} 檔持股\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"模式：{mode_str}",
+            [("📋 我的持股", "持股"), ("📈 損益分析", "損益分析")])
         return
     if text in ["取消匯入", "取消", "no", "No", "NO"]:
         if WAITING_PORTFOLIO_IMPORT.pop(user_id, None):
