@@ -1,6 +1,24 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.82（手續費設定 + 含費損益計算）
+LINE Bot 模組 v10.9.83（加碼 / 分批買進 + 買進截圖辨識）
+
+【v10.9.83 更新】
+使用者要求：分批買進需求。
+
+新增：
+1. process_buy(user_id, stock_id, shares, buy_price)：
+   - 既有部位 → 加權平均（保留原成本，加新買部位）
+     new_avg = (old_avg×old_shares + buy_price×shares + 手續費) / 總股數
+   - 新部位 → 等同新增（含費成本均價）
+2. 「加碼 代號 股數 買價」手動指令
+3. analyze_brokerage_screenshot 新增 type="buy" 偵測
+   - 「現買 / 買進 / 沖買 / ROD買」+ 已成交
+4. format_buy_import_preview：含預估加權均價
+5. WAITING_BUY_IMPORT state + 「確認加碼」/「取消加碼」
+6. 「📈 加碼登記」按鈕加進持股管理選單
+7. 「加碼說明」handler 介紹兩種方式 + 加碼 vs 新增差異
+
+【v10.9.82】手續費設定 + 含費損益計算
 
 【v10.9.82 更新】
 使用者要求：成本及損益應含買入手續費、賣出手續費、證交稅；
@@ -558,7 +576,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.82"
+VERSION              = "10.9.83"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -572,6 +590,7 @@ WAITING_SUGGESTION = set()
 WAITING_STOCK_NEWS = {}  # v10.9.58: user_id -> set_at_timestamp（5 分鐘內輸入股票代號 → 回新聞 carousel）
 WAITING_PORTFOLIO_IMPORT = {}  # v10.9.64: user_id -> {"items": [...], "ts": ts}（5 分鐘內確認）
 WAITING_SELL_IMPORT      = {}  # v10.9.81: user_id -> {"items":[{stock_id,shares,sell_price}], "ts":ts}
+WAITING_BUY_IMPORT       = {}  # v10.9.83: user_id -> {"items":[{stock_id,shares,buy_price}], "ts":ts}
 WAITING_AI_QA = {}  # v10.9.69: user_id -> set_at_ts（AI 問答模式，5 分鐘內任何訊息當問題）
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 USER_SETTINGS_FILE = "/tmp/lumistock_user_settings.json"  # v10.9.82：手續費折數等
@@ -3377,12 +3396,13 @@ def make_news_menu_flex() -> dict:
 
 def make_portfolio_menu_flex() -> dict:
     return make_menu_flex(
-        "📋 持股管理", "新增・查詢・賣出・損益", "#5B8B6B",
+        "📋 持股管理", "新增・加碼・賣出・損益", "#5B8B6B",
         [("📋 我的持股","持股"),                   # v10.9.72：合併（分析 + 可刪除）
          ("💗 立即持股警報","立即持股警報"),       # v10.9.68：手動 force 警報
          ("➕ 新增持股","新增持股說明"),
-         ("💸 賣出登記","賣出說明"),               # v10.9.81：賣出指令說明
-         ("💰 手續費設定","查手續費"),             # v10.9.82：手續費折數
+         ("📈 加碼登記","加碼說明"),               # v10.9.83：分批買進
+         ("💸 賣出登記","賣出說明"),
+         ("💰 手續費設定","查手續費"),
          ("📊 損益分析","損益分析"),
          ("🔴 停損提醒","停損提醒說明"),
          ("🎯 目標價提醒","目標價提醒說明")]
@@ -4480,24 +4500,28 @@ def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
 【類型 1：庫存頁】顯示「目前持有的股票」，欄位有股數、平均成本/均價、現價/損益等
 → 回傳 {"type":"holdings","items":[{"stock_id":"2330","shares":100,"avg_price":2010.0}, ...]}
 
-【類型 2：賣出/委成回】顯示「交易紀錄」，看到「賣出/現賣/沖賣/沖售」字樣
-→ 只取「已成交的賣出」筆數（不要當沖買、不要委託中、不要部份未成交的買單）
-→ 回傳 {"type":"sell","items":[{"stock_id":"6742","shares":1000,"sell_price":59.5}, ...]}
+【類型 2：賣出/委成回】顯示「賣出/現賣/沖賣/沖售」字樣，且為「已成交」
+→ 只取「已成交的賣出」（忽略委託中、買單、未成交）
+→ 回傳 {"type":"sell","items":[{"stock_id":"6742","shares":1000,"sell_price":59.5}]}
 
-【類型 3：無法判斷】
+【類型 3：買進/成交回報】顯示「買進/現買/沖買/ROD買」字樣，且為「已成交」
+→ 只取「已成交的買進」
+→ 回傳 {"type":"buy","items":[{"stock_id":"2330","shares":1000,"buy_price":2010.0}]}
+
+【類型 4：無法判斷】
 → 回傳 {"type":"unknown","items":[]}
+
+判斷優先序：
+- 同時混合買賣 → 看哪邊筆數多就回哪邊；但若使用者明顯只截某一邊（如標題顯示「賣出回報」）以該邊為準
+- 純庫存（沒交易動作字樣，多欄損益/現價）→ holdings
 
 規則：
 - stock_id：4-6 位字元（2330/00878/6446）
 - shares：統一換算成「股數」（張 × 1000）
-- 庫存的 avg_price = 平均成本；賣出的 sell_price = 成交價
+- 庫存 avg_price = 平均成本；買進 buy_price = 成交價；賣出 sell_price = 成交價
 - 看不清楚的整筆略過
 - 只回純 JSON，不要 markdown、不要其他文字
-
-提示：
-- 若同時有「現買」「現賣」混合，只挑「賣」相關
-- 若 status 顯示「委託中」「部份成交（買）」忽略，只取「成交（賣）」「全部成交（賣）」
-- 若版面是純庫存清單（沒看到交易動作字樣）→ holdings
+- 忽略「委託中」「部份成交（未完成）」等未實際成交的列
 """
 
     payload = {
@@ -4567,8 +4591,16 @@ def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
                     if price <= 0: continue
                     valid.append({"stock_id": sid, "shares": shares, "sell_price": price})
                 except: continue
+            elif t == "buy":
+                bp = h.get("buy_price")
+                if bp is None: continue
+                try:
+                    price = float(bp)
+                    if price <= 0: continue
+                    valid.append({"stock_id": sid, "shares": shares, "buy_price": price})
+                except: continue
         dlog("VISION", f"辨識：type={t}, raw {len(items)} → valid {len(valid)}")
-        if t not in ("holdings", "sell"):
+        if t not in ("holdings", "sell", "buy"):
             t = "unknown"
         return {"type": t, "items": valid}
     except Exception as e:
@@ -4742,6 +4774,129 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
     return {"ok": True, "msg": msg, "realized_pnl": realized_pnl,
             "remaining_shares": remaining, "name": name,
             "fee": fee, "tax": tax, "gross": gross, "net": net_proceeds}
+
+
+def process_buy(user_id: str, stock_id: str, buy_shares: int, buy_price: float) -> dict:
+    """v10.9.83：分批買進（加碼）— 既有部位做加權平均，新部位則建立。
+    含買入手續費納入成本均價。
+    回傳 {"ok": bool, "msg": str, "is_new": bool, ...}
+    """
+    norm = stock_id.replace(".TW", "")
+    portfolio = load_portfolio()
+
+    # 找該使用者既有部位
+    target_key = None
+    for k in (_pf_key(user_id, norm), _pf_key(user_id, stock_id),
+              norm, stock_id, stock_id + ".TW"):
+        v = portfolio.get(k)
+        if v and v.get("user_id") == user_id:
+            target_key = k
+            break
+
+    # 計算這次買入的手續費 + 真實成本
+    is_tw = norm.isdigit()
+    buy_fee = calc_buy_fee(buy_price, buy_shares, user_id) if is_tw else 0
+    new_cost_total = buy_price * buy_shares + buy_fee  # 含費總成本
+
+    if target_key:
+        # 加碼：加權平均
+        old = portfolio[target_key]
+        old_shares = int(old.get("shares", 0))
+        old_avg = float(old.get("buy_price", 0))
+        old_cost_total = old_avg * old_shares
+        total_shares = old_shares + buy_shares
+        new_avg = (old_cost_total + new_cost_total) / total_shares if total_shares else buy_price
+        # 統一搬到複合 key
+        if target_key != _pf_key(user_id, norm):
+            portfolio.pop(target_key, None)
+        portfolio[_pf_key(user_id, norm)] = {
+            "user_id": user_id,
+            "shares": total_shares,
+            "buy_price": new_avg,
+        }
+        is_new = False
+        sign = "📈"
+        action = "加碼"
+        change_str = (f"原 {old_shares:,} 股 ‧ 均價 {old_avg:,.2f}\n"
+                      f"加碼 {buy_shares:,} 股 @ {buy_price:,.2f}\n"
+                      f"手續費 {buy_fee:,}\n"
+                      f"加權後 {total_shares:,} 股 ‧ 均價 {new_avg:,.4f}")
+        msg_payload = {"total_shares": total_shares, "new_avg": new_avg}
+    else:
+        # 新部位
+        new_avg = new_cost_total / buy_shares if buy_shares else buy_price
+        portfolio[_pf_key(user_id, norm)] = {
+            "user_id": user_id,
+            "shares": buy_shares,
+            "buy_price": new_avg,
+        }
+        is_new = True
+        sign = "🆕"
+        action = "新增"
+        change_str = (f"新增 {buy_shares:,} 股 @ {buy_price:,.2f}\n"
+                      f"手續費 {buy_fee:,}\n"
+                      f"含費成本均價 {new_avg:,.4f}")
+        msg_payload = {"total_shares": buy_shares, "new_avg": new_avg}
+
+    save_portfolio(portfolio)
+    # Sheets 同步（用 append_row 紀錄這次交易；保留歷史）
+    try:
+        name = NAME_CACHE.get(norm, norm)
+        market = "台股" if is_tw else "美股"
+        save_portfolio_to_sheets(user_id, norm, name, market,
+                                 msg_payload["total_shares"], msg_payload["new_avg"])
+    except: pass
+
+    name = NAME_CACHE.get(norm, norm)
+    discount = get_user_fee_discount(user_id)
+    disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
+    msg = (f"{sign} {action}成功：{norm} {name}\n"
+           f"━━━━━━━━━━━━━━\n"
+           f"{change_str}\n"
+           f"（折數 {disc_str}）")
+    return {"ok": True, "msg": msg, "is_new": is_new, **msg_payload}
+
+
+def format_buy_import_preview(items: list, user_id: str) -> str:
+    """v10.9.83：買進截圖辨識結果預覽，含加碼後預估均價。"""
+    if not items:
+        return "❌ 沒有辨識到任何買進交易"
+    portfolio = load_portfolio()
+    discount = get_user_fee_discount(user_id)
+    disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
+    lines = ["📈 辨識結果 — 買進交易",
+             f"（手續費折數 {disc_str}）",
+             "━━━━━━━━━━━━━━"]
+    for i, h in enumerate(items, 1):
+        sid = h["stock_id"]; shares = h["shares"]; price = h["buy_price"]
+        norm = sid.replace(".TW", "")
+        name = NAME_CACHE.get(norm, "")
+        is_tw = norm.isdigit()
+        fee = calc_buy_fee(price, shares, user_id) if is_tw else 0
+        # 找既有部位
+        held = None
+        for k in (_pf_key(user_id, norm), _pf_key(user_id, sid), norm, sid, sid + ".TW"):
+            v = portfolio.get(k)
+            if v and v.get("user_id") == user_id:
+                held = v; break
+        lines.append(f"{i}. {sid} {name}".rstrip())
+        if held:
+            old_shares = int(held.get("shares", 0))
+            old_avg = float(held.get("buy_price", 0))
+            new_total = old_shares + shares
+            new_avg = (old_avg*old_shares + price*shares + fee) / new_total
+            lines.append(f"　🔁 加碼 {shares:,} 股 @ {price:,.2f}　費 {fee:,}")
+            lines.append(f"　原 {old_shares:,} 股 均 {old_avg:,.2f}")
+            lines.append(f"　→ {new_total:,} 股 均 {new_avg:,.4f}")
+        else:
+            new_avg = (price * shares + fee) / shares if shares else price
+            lines.append(f"　🆕 新增 {shares:,} 股 @ {price:,.2f}　費 {fee:,}")
+            lines.append(f"　→ 含費均價 {new_avg:,.4f}")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("　• 輸入「確認加碼」執行")
+    lines.append("　• 輸入「取消加碼」放棄")
+    lines.append("　• 5 分鐘後自動取消")
+    return "\n".join(lines)
 
 
 def format_sell_import_preview(items: list, user_id: str) -> str:
@@ -7336,16 +7491,23 @@ def handle_image(event):
                 push_message(user_id, format_sell_import_preview(items, user_id))
                 return
 
+            if rtype == "buy" and items:
+                WAITING_BUY_IMPORT[user_id] = {"items": items, "ts": time.time()}
+                push_message(user_id, format_buy_import_preview(items, user_id))
+                return
+
             push_message(user_id,
-                "❌ 無法辨識任何持股 / 賣出資料\n"
+                "❌ 無法辨識任何持股 / 買進 / 賣出資料\n"
                 "可能原因：\n"
                 "　• 截圖不清楚 / 字太小\n"
-                "　• 不是券商庫存頁、也不是賣出回報\n"
+                "　• 不是券商庫存頁、也不是交易回報\n"
                 "　• AI 服務暫時忙碌\n\n"
                 "庫存：請截「庫存查詢 / 股票庫存」頁\n"
+                "買進：請截「成交回報（買）」頁\n"
                 "賣出：請截「成交回報（賣）」頁\n"
                 "或手動：\n"
-                "　・新增 代號 股數 均價\n"
+                "　・新增 代號 股數 均價（新部位）\n"
+                "　・加碼 代號 股數 買價（既有部位加碼）\n"
                 "　・賣出 代號 股數 賣價")
         except Exception as e:
             dlog("IMAGE", f"處理圖片失敗：{type(e).__name__}: {e}")
@@ -7941,8 +8103,25 @@ def handle_message(event):
             "　AI 自動辨識 → 預估已實現損益 → 確認賣出\n\n"
             "系統會自動：\n"
             "　• 從庫存扣股數（成本均價不變）\n"
-            "　• 計算已實現損益\n"
+            "　• 計算已實現損益（含手續費 + 證交稅）\n"
             "　• 寫入 Google Sheets「賣出紀錄」")
+        return
+    if text=="加碼說明":
+        reply_text(event.reply_token,
+            "📈 加碼 / 分批買進 — 兩種方式\n━━━━━━━━━━━━━━\n"
+            "1️⃣ 手動輸入\n"
+            "　格式：加碼 代碼 股數 買價\n"
+            "　例如：加碼 2330 500 2200\n\n"
+            "2️⃣ 截圖辨識 ✨\n"
+            "　傳券商「成交回報（買）」截圖\n"
+            "　AI 自動辨識 → 預估加權均價 → 確認加碼\n\n"
+            "說明：\n"
+            "　• 既有部位 → 自動加權平均成本，不覆蓋\n"
+            "　• 新部位 → 等同新增\n"
+            "　• 含手續費納入成本均價\n\n"
+            "加碼 vs 新增：\n"
+            "　・新增：覆蓋既有持股（重設）\n"
+            "　・加碼：保留既有，加權平均（推薦用這個）")
         return
     # v10.9.64：持股截圖匯入確認
     if text in ["確認匯入", "確認", "yes", "Yes", "YES"]:
@@ -8007,6 +8186,57 @@ def handle_message(event):
             reply_text(event.reply_token, "✅ 已取消賣出，原資料未變動")
         else:
             reply_text(event.reply_token, "⏰ 沒有待確認的賣出")
+        return
+    # v10.9.83：加碼截圖確認 / 取消
+    if text in ["確認加碼"]:
+        record = WAITING_BUY_IMPORT.get(user_id)
+        if not record or (time.time() - record["ts"]) > 300:
+            reply_text(event.reply_token, "⏰ 沒有待確認的加碼，或已過期\n請重新傳截圖或用「加碼 代號 股數 買價」")
+            return
+        items = record["items"]
+        ok_n = 0
+        lines = ["✅ 加碼/新增執行結果", "━━━━━━━━━━━━━━"]
+        for h in items:
+            r = process_buy(user_id, h["stock_id"], int(h["shares"]), float(h["buy_price"]))
+            if r["ok"]:
+                ok_n += 1
+                tag = "🆕 新增" if r.get("is_new") else "📈 加碼"
+                lines.append(f"{tag} {h['stock_id']}")
+                lines.append(f"　{h['shares']:,} 股 @ {h['buy_price']:,.2f}")
+                lines.append(f"　→ {r['total_shares']:,} 股 均價 {r['new_avg']:,.4f}")
+            else:
+                lines.append(f"❌ {h['stock_id']}：{r['msg'].split(chr(10))[0]}")
+        WAITING_BUY_IMPORT.pop(user_id, None)
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append(f"完成：{ok_n}/{len(items)} 筆")
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+    if text in ["取消加碼"]:
+        if WAITING_BUY_IMPORT.pop(user_id, None):
+            reply_text(event.reply_token, "✅ 已取消加碼，原資料未變動")
+        else:
+            reply_text(event.reply_token, "⏰ 沒有待確認的加碼")
+        return
+    # v10.9.83：手動「加碼 代號 股數 買價」
+    if text.startswith("加碼 "):
+        parts = text.split()
+        if len(parts) == 4:
+            try:
+                stock_id = parts[1].upper()
+                shares = int(parts[2])
+                buy_price = float(parts[3])
+                if shares <= 0 or buy_price <= 0:
+                    raise ValueError("invalid")
+                r = process_buy(user_id, stock_id, shares, buy_price)
+                reply_text(event.reply_token, r["msg"])
+            except Exception:
+                reply_text(event.reply_token,
+                    "格式錯誤\n範例：加碼 2330 500 2200\n　（代號 股數 買價）")
+        else:
+            reply_text(event.reply_token,
+                "格式：加碼 代號 股數 買價\n範例：加碼 2330 500 2200\n\n"
+                "說明：\n　• 既有部位：自動加權平均成本（不覆蓋）\n"
+                "　• 新部位：等同新增")
         return
     # v10.9.81：手動「賣出 代號 股數 賣價」
     if text.startswith("賣出 "):
