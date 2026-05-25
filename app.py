@@ -1,6 +1,27 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.88（意見回饋升級 Flex 卡片 + 簡化入口）
+LINE Bot 模組 v10.9.89（截圖預覽 Flex 卡片 + 內嵌浮標確認）
+
+【v10.9.89 更新】
+使用者反映：
+1. 「能用卡片顯示就盡量用卡片」（截圖辨識後的賣出/買進/庫存預覽目前是純文字）
+2. 「確認賣出 / 取消賣出 這種再確認的事不要自行輸入而是用浮標的方式讓用戶點擊」
+   → 不要打字，所有再確認都要浮標（除非像手續費折數那種人人不同的值）
+
+改動：
+1. 新增 make_sell_preview_flex(items, user_id)
+   - 總覽 bubble（珊瑚粉 header）+ 個股 bubble（顯示 毛/費/稅/淨/成本/淨損益）
+   - Footer 浮標：[✅ 確認賣出] [🚫 取消賣出]（message action，免打字）
+2. 新增 make_buy_preview_flex(items, user_id)
+   - 總覽 bubble（綠 header）+ 個股 bubble（新部位 / 加碼後新均價）
+   - Footer 浮標：[✅ 確認加碼] [🚫 取消加碼]
+3. 新增 make_holdings_preview_flex(items)
+   - 薰衣草粉 header + 警告「將覆蓋既有部位」
+   - Footer 浮標：[✅ 確認匯入] [🚫 取消匯入]
+4. 圖片 handler 改用 push_flex，Flex 失敗 fallback 原文字版（不會修壞）
+5. 既有的文字版 format_*_preview 保留作 fallback（不刪除）
+
+【v10.9.88】意見回饋升級 Flex 卡片 + 簡化入口
 
 【v10.9.88 更新】
 使用者反映：
@@ -667,7 +688,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.88"
+VERSION              = "10.9.89"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5200,6 +5221,250 @@ def process_buy(user_id: str, stock_id: str, buy_shares: int, buy_price: float) 
     return {"ok": True, "msg": msg, "is_new": is_new, **msg_payload}
 
 
+def make_sell_preview_flex(items: list, user_id: str) -> dict:
+    """v10.9.89：賣出預覽 Flex carousel — 帶確認/取消按鈕，使用者不用打字。"""
+    portfolio = load_portfolio()
+    discount = get_user_fee_discount(user_id)
+    disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
+    parsed = []
+    total_pnl = 0
+    can_process = 0
+    for h in items:
+        sid = h["stock_id"]; shares = h["shares"]; price = h["sell_price"]
+        norm = sid.replace(".TW", "")
+        name = NAME_CACHE.get(norm, "")
+        held = None
+        for k in (_pf_key(user_id, norm), _pf_key(user_id, sid), norm, sid, sid + ".TW"):
+            v = portfolio.get(k)
+            if v and v.get("user_id") == user_id:
+                held = v; break
+        rec = {"sid": sid, "name": name, "shares": shares, "price": price, "error": None}
+        if held:
+            cost = float(held.get("buy_price", 0))
+            held_n = int(held.get("shares", 0))
+            if shares <= held_n:
+                gross = price * shares
+                fee, tax = calc_sell_fee_tax(price, shares, user_id)
+                net = gross - fee - tax
+                pnl = net - cost * shares
+                rec.update({"cost": cost, "gross": gross, "fee": fee, "tax": tax,
+                            "net": net, "pnl": pnl, "held": held_n})
+                total_pnl += pnl
+                can_process += 1
+            else:
+                rec["error"] = f"持有僅 {held_n:,} 股"
+        else:
+            rec["error"] = "持股清單沒這檔"
+        parsed.append(rec)
+
+    pnl_color = "#D97A5C" if total_pnl >= 0 else "#7AABBE"
+    pnl_sign = "🟢 賺" if total_pnl >= 0 else "🔴 虧"
+    overview = {
+        "type": "bubble", "size": "mega",
+        "header": {"type":"box","layout":"vertical","backgroundColor":"#E89B82","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"💸 賣出預覽","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":f"手續費 {disc_str} ‧ 證交稅 0.3%","size":"xxs","color":"#FDF6F0","margin":"xs"}
+            ]},
+        "body": {"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"sm",
+            "contents":[
+                {"type":"text","text":"預估合計淨損益","size":"xs","color":"#9B6B5A"},
+                {"type":"text","text":f"{pnl_sign}　{total_pnl:+,.0f} 元",
+                 "size":"xl","color":pnl_color,"weight":"bold"},
+                {"type":"text","text":f"{can_process}/{len(items)} 筆可處理",
+                 "size":"xs","color":"#A07560","margin":"sm"},
+                {"type":"separator","color":"#E8C4B4","margin":"md"},
+                {"type":"text","text":"⚠ 請確認後按下方按鈕","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"}
+            ]},
+        "footer": {"type":"box","layout":"vertical","spacing":"sm","paddingAll":"8px","contents":[
+            {"type":"button","style":"primary","color":"#D97A5C","height":"sm",
+             "action":{"type":"message","label":"✅ 確認賣出","text":"確認賣出"}},
+            {"type":"button","style":"secondary","height":"sm",
+             "action":{"type":"message","label":"🚫 取消賣出","text":"取消賣出"}}
+        ]}
+    }
+
+    bubbles = [overview]
+    for i, r in enumerate(parsed[:11], 1):
+        if r["error"]:
+            header_color = "#C9B0DB"
+            body_contents = [
+                {"type":"text","text":f"{r['sid']} {r['name']}".rstrip(),"size":"sm","color":"#5B4040","weight":"bold","wrap":True},
+                {"type":"text","text":f"賣 {r['shares']:,} 股 @ {r['price']:,.2f}","size":"xs","color":"#9B6B5A","margin":"sm"},
+                {"type":"separator","color":"#E8C4B4","margin":"md"},
+                {"type":"text","text":f"⚠ {r['error']}","size":"xs","color":"#D97A5C","weight":"bold","margin":"sm","wrap":True}
+            ]
+        else:
+            pnl_c = "#D97A5C" if r["pnl"] >= 0 else "#7AABBE"
+            pnl_s = "🟢" if r["pnl"] >= 0 else "🔴"
+            header_color = pnl_c
+            body_contents = [
+                {"type":"text","text":f"{r['sid']} {r['name']}".rstrip(),"size":"sm","color":"#5B4040","weight":"bold","wrap":True},
+                {"type":"text","text":f"賣 {r['shares']:,} 股 @ {r['price']:,.2f}","size":"xs","color":"#9B6B5A","margin":"sm"},
+                {"type":"separator","color":"#E8C4B4","margin":"sm"},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"毛","size":"xxs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"{r['gross']:,.0f}","size":"xxs","color":"#5B4040","flex":2,"align":"end"}]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"費","size":"xxs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"-{r['fee']}","size":"xxs","color":"#7AABBE","flex":2,"align":"end"}]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"稅","size":"xxs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"-{r['tax']}","size":"xxs","color":"#7AABBE","flex":2,"align":"end"}]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"淨","size":"xxs","color":"#9B6B5A","flex":1,"weight":"bold"},
+                    {"type":"text","text":f"{r['net']:,.0f}","size":"xs","color":"#5B4040","weight":"bold","flex":2,"align":"end"}]},
+                {"type":"separator","color":"#E8C4B4","margin":"sm"},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"成本均","size":"xxs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"{r['cost']:,.2f}","size":"xxs","color":"#5B4040","flex":2,"align":"end"}]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"淨損益","size":"xs","color":"#A05A48","flex":1,"weight":"bold"},
+                    {"type":"text","text":f"{pnl_s} {r['pnl']:+,.0f}","size":"sm","color":pnl_c,"weight":"bold","flex":2,"align":"end"}]}
+            ]
+        bubbles.append({
+            "type":"bubble","size":"kilo",
+            "header":{"type":"box","layout":"horizontal","backgroundColor":header_color,"paddingAll":"10px",
+                "contents":[{"type":"text","text":f"#{i}","size":"sm","color":"#FFFFFF","weight":"bold"}]},
+            "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"12px","spacing":"xs",
+                "contents":body_contents}
+        })
+    return {"type":"carousel","contents":bubbles}
+
+
+def make_buy_preview_flex(items: list, user_id: str) -> dict:
+    """v10.9.89：買進預覽 Flex carousel — 帶確認/取消按鈕。"""
+    portfolio = load_portfolio()
+    discount = get_user_fee_discount(user_id)
+    disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
+    parsed = []
+    for h in items:
+        sid = h["stock_id"]; shares = h["shares"]; price = h["buy_price"]
+        norm = sid.replace(".TW", "")
+        name = NAME_CACHE.get(norm, "")
+        is_tw = norm.isdigit()
+        fee = calc_buy_fee(price, shares, user_id) if is_tw else 0
+        held = None
+        for k in (_pf_key(user_id, norm), _pf_key(user_id, sid), norm, sid, sid + ".TW"):
+            v = portfolio.get(k)
+            if v and v.get("user_id") == user_id:
+                held = v; break
+        rec = {"sid": sid, "name": name, "shares": shares, "price": price, "fee": fee}
+        if held:
+            old_shares = int(held.get("shares", 0))
+            old_avg = float(held.get("buy_price", 0))
+            new_total = old_shares + shares
+            new_avg = (old_avg*old_shares + price*shares + fee) / new_total
+            rec.update({"is_new": False, "old_shares": old_shares, "old_avg": old_avg,
+                        "new_total": new_total, "new_avg": new_avg})
+        else:
+            new_avg = (price * shares + fee) / shares if shares else price
+            rec.update({"is_new": True, "new_avg": new_avg, "new_total": shares})
+        parsed.append(rec)
+
+    overview = {
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#5B8B6B","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"📈 買進預覽","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":f"手續費 {disc_str}","size":"xxs","color":"#FDF6F0","margin":"xs"}
+            ]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"sm",
+            "contents":[
+                {"type":"text","text":f"共 {len(parsed)} 筆","size":"sm","color":"#5B4040","weight":"bold"},
+                {"type":"text","text":"既有部位 → 自動加權平均，新部位 → 建立","size":"xxs","color":"#A07560","margin":"sm","wrap":True},
+                {"type":"separator","color":"#E8C4B4","margin":"md"},
+                {"type":"text","text":"⚠ 請確認後按下方按鈕","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"}
+            ]},
+        "footer":{"type":"box","layout":"vertical","spacing":"sm","paddingAll":"8px","contents":[
+            {"type":"button","style":"primary","color":"#5B8B6B","height":"sm",
+             "action":{"type":"message","label":"✅ 確認加碼","text":"確認加碼"}},
+            {"type":"button","style":"secondary","height":"sm",
+             "action":{"type":"message","label":"🚫 取消加碼","text":"取消加碼"}}
+        ]}
+    }
+    bubbles = [overview]
+    for i, r in enumerate(parsed[:11], 1):
+        tag = "🆕 新增" if r["is_new"] else "📈 加碼"
+        header_color = "#E89B82" if r["is_new"] else "#5B8B6B"
+        body_contents = [
+            {"type":"text","text":f"{r['sid']} {r['name']}".rstrip(),"size":"sm","color":"#5B4040","weight":"bold","wrap":True},
+            {"type":"text","text":f"{tag} {r['shares']:,} 股 @ {r['price']:,.2f}","size":"xs","color":"#9B6B5A","margin":"sm"},
+            {"type":"text","text":f"手續費 {r['fee']:,}","size":"xxs","color":"#9B6B5A"},
+            {"type":"separator","color":"#E8C4B4","margin":"sm"},
+        ]
+        if r["is_new"]:
+            body_contents += [
+                {"type":"text","text":"建立新部位","size":"xxs","color":"#A05A48","weight":"bold"},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"含費均價","size":"xxs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"{r['new_avg']:,.4f}","size":"sm","color":"#A05A48","weight":"bold","flex":2,"align":"end"}]},
+            ]
+        else:
+            body_contents += [
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"原","size":"xxs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"{r['old_shares']:,} 股均 {r['old_avg']:,.2f}","size":"xxs","color":"#5B4040","flex":3,"align":"end"}]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"→ 新","size":"xxs","color":"#A05A48","flex":1,"weight":"bold"},
+                    {"type":"text","text":f"{r['new_total']:,} 股均 {r['new_avg']:,.4f}","size":"xs","color":"#A05A48","weight":"bold","flex":3,"align":"end"}]},
+            ]
+        bubbles.append({
+            "type":"bubble","size":"kilo",
+            "header":{"type":"box","layout":"horizontal","backgroundColor":header_color,"paddingAll":"10px",
+                "contents":[{"type":"text","text":f"#{i}","size":"sm","color":"#FFFFFF","weight":"bold"}]},
+            "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"12px","spacing":"xs",
+                "contents":body_contents}
+        })
+    return {"type":"carousel","contents":bubbles}
+
+
+def make_holdings_preview_flex(items: list) -> dict:
+    """v10.9.89：庫存匯入預覽 Flex carousel — 帶確認/取消按鈕。"""
+    overview = {
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#C9B0DB","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"📋 庫存匯入預覽","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":"⚠ 將覆蓋既有部位（重設用）","size":"xxs","color":"#FDF6F0","margin":"xs"}
+            ]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"sm",
+            "contents":[
+                {"type":"text","text":f"共 {len(items)} 檔","size":"sm","color":"#5B4040","weight":"bold"},
+                {"type":"text","text":"確認後一鍵儲存到「我的持股」","size":"xxs","color":"#A07560","margin":"sm"},
+                {"type":"separator","color":"#E8C4B4","margin":"md"},
+                {"type":"text","text":"⚠ 請核對辨識結果","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"}
+            ]},
+        "footer":{"type":"box","layout":"vertical","spacing":"sm","paddingAll":"8px","contents":[
+            {"type":"button","style":"primary","color":"#C9B0DB","height":"sm",
+             "action":{"type":"message","label":"✅ 確認匯入","text":"確認匯入"}},
+            {"type":"button","style":"secondary","height":"sm",
+             "action":{"type":"message","label":"🚫 取消匯入","text":"取消匯入"}}
+        ]}
+    }
+    bubbles = [overview]
+    for i, h in enumerate(items[:11], 1):
+        sid = h["stock_id"]; shares = h["shares"]; price = h["avg_price"]
+        name = NAME_CACHE.get(sid, "")
+        bubbles.append({
+            "type":"bubble","size":"kilo",
+            "header":{"type":"box","layout":"horizontal","backgroundColor":"#E8B8A8","paddingAll":"10px",
+                "contents":[{"type":"text","text":f"#{i}","size":"sm","color":"#FFFFFF","weight":"bold"}]},
+            "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"12px","spacing":"xs",
+                "contents":[
+                    {"type":"text","text":f"{sid} {name}".rstrip(),"size":"sm","color":"#5B4040","weight":"bold","wrap":True},
+                    {"type":"separator","color":"#E8C4B4","margin":"sm"},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"股數","size":"xxs","color":"#9B6B5A","flex":1},
+                        {"type":"text","text":f"{shares:,}","size":"sm","color":"#5B4040","weight":"bold","flex":2,"align":"end"}]},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"均價","size":"xxs","color":"#9B6B5A","flex":1},
+                        {"type":"text","text":f"{price:,.2f}","size":"sm","color":"#A05A48","weight":"bold","flex":2,"align":"end"}]},
+                ]}
+        })
+    return {"type":"carousel","contents":bubbles}
+
+
 def format_buy_import_preview(items: list, user_id: str) -> str:
     """v10.9.83：買進截圖辨識結果預覽，含加碼後預估均價。"""
     if not items:
@@ -7829,17 +8094,35 @@ def handle_image(event):
 
             if rtype == "holdings" and items:
                 WAITING_PORTFOLIO_IMPORT[user_id] = {"items": items, "ts": time.time()}
-                push_message(user_id, format_portfolio_import_preview(items))
+                # v10.9.89：改用 Flex 卡片預覽 + 內嵌浮標確認/取消
+                try:
+                    flex = make_holdings_preview_flex(items)
+                    push_flex(user_id, flex, alt_text="庫存匯入預覽")
+                except Exception as e:
+                    dlog("IMAGE", f"庫存 Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
+                    push_message(user_id, format_portfolio_import_preview(items))
                 return
 
             if rtype == "sell" and items:
                 WAITING_SELL_IMPORT[user_id] = {"items": items, "ts": time.time()}
-                push_message(user_id, format_sell_import_preview(items, user_id))
+                # v10.9.89：改用 Flex 卡片預覽 + 內嵌浮標確認/取消
+                try:
+                    flex = make_sell_preview_flex(items, user_id)
+                    push_flex(user_id, flex, alt_text="賣出預覽")
+                except Exception as e:
+                    dlog("IMAGE", f"賣出 Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
+                    push_message(user_id, format_sell_import_preview(items, user_id))
                 return
 
             if rtype == "buy" and items:
                 WAITING_BUY_IMPORT[user_id] = {"items": items, "ts": time.time()}
-                push_message(user_id, format_buy_import_preview(items, user_id))
+                # v10.9.89：改用 Flex 卡片預覽 + 內嵌浮標確認/取消
+                try:
+                    flex = make_buy_preview_flex(items, user_id)
+                    push_flex(user_id, flex, alt_text="買進預覽")
+                except Exception as e:
+                    dlog("IMAGE", f"買進 Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
+                    push_message(user_id, format_buy_import_preview(items, user_id))
                 return
 
             push_message(user_id,
