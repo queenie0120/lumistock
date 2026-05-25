@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.97"
+VERSION              = "10.9.98"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -7972,12 +7972,10 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
     # else "custom" → 不動，維持 dict insertion order
 
     bubbles = []
-    # Overview bubble — v10.9.92：用「淨損益」（扣賣出費稅）為主數字
+    # Overview bubble — v10.9.98 簡化：回到 v10.9.91 那個會動的結構
+    #   只顯示「淨損益」一個主數字 + 一行警語。沒有毛/費稅/排序/footer。
     is_up = total_net_profit >= 0
     overview_color = "#D97A5C" if is_up else "#7AABBE"
-    # v10.9.94：排序狀態（給卡片底部顯示）
-    sort_label = {"custom":"自訂順序", "symbol":"代號", "net_profit":"淨損益",
-                  "pct":"漲跌幅"}.get(sort_mode, "自訂順序")
     bubbles.append({
         "type": "bubble", "size": "kilo",
         "header": {"type": "box", "layout": "vertical",
@@ -7992,42 +7990,16 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
         "body": {"type": "box", "layout": "vertical",
                  "backgroundColor": "#FDF6F0", "paddingAll": "16px", "spacing": "sm",
                  "contents": [
-                     {"type": "text", "text": "淨損益（扣賣出費稅）", "size": "xs", "color": "#9B6B5A"},
+                     {"type": "text", "text": "總損益（已扣賣出費稅）",
+                      "size": "xs", "color": "#9B6B5A"},
                      {"type": "text", "text": f"{total_net_profit:+,.0f}",
                       "size": "3xl", "color": overview_color, "weight": "bold"},
                      {"type": "text", "text": f"{'▲' if is_up else '▼'} {total_pct:+.2f}%",
                       "size": "sm", "color": overview_color},
                      {"type": "separator", "color": "#E8C4B4"},
-                     {"type": "box", "layout": "horizontal", "contents": [
-                         {"type": "text", "text": "毛損益", "size": "xxs",
-                          "color": "#9B6B5A", "flex": 2},
-                         {"type": "text", "text": f"{total_profit:+,.0f}",
-                          "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
-                     ]},
-                     {"type": "box", "layout": "horizontal", "contents": [
-                         {"type": "text", "text": "費+稅", "size": "xxs",
-                          "color": "#9B6B5A", "flex": 2},
-                         {"type": "text", "text": f"-{total_fee_tax:,}" if total_fee_tax else "—",
-                          "size": "xxs", "color": "#7AABBE", "align": "end", "flex": 3},
-                     ]},
-                     {"type": "separator", "color": "#E8C4B4"},
-                     {"type": "box", "layout": "horizontal", "contents": [
-                         {"type": "text", "text": "排序", "size": "xxs",
-                          "color": "#9B6B5A", "flex": 2},
-                         {"type": "text", "text": sort_label,
-                          "size": "xxs", "color": "#A05A48", "weight": "bold",
-                          "align": "end", "flex": 3},
-                     ]},
                      {"type": "text", "text": "⚠ 系統建議僅供參考，非投資建議",
                       "size": "xxs", "color": "#C9A89A", "align": "center", "margin": "sm"},
                  ]},
-        # v10.9.94：總覽 bubble footer 加排序浮標（一鍵切換）
-        "footer": {"type": "box", "layout": "vertical", "spacing": "xs", "paddingAll": "6px",
-                   "contents": [
-                       {"type": "button", "style": "secondary", "height": "sm",
-                        "action": {"type": "message", "label": "📐 變更排序",
-                                   "text": "排序持股"}},
-                   ]},
     })
 
     # 每檔股票一張卡
@@ -8101,6 +8073,8 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
                             "text": f"{arrow} {profit:+,.0f}　{sign}{pct:.1f}%",
                             "size": "md", "color": "#FFFFFF", "weight": "bold", "margin": "xs"},
                        ]},
+            # v10.9.98 簡化：回到 v10.9.91 結構（3 行 + 系統建議）
+            #   header 上的數字已經是「淨損益」，body 不再重複拆毛/費稅/淨
             "body": {"type": "box", "layout": "vertical",
                      "backgroundColor": "#FDF6F0", "paddingAll": "12px", "spacing": "xs",
                      "contents": [
@@ -8122,30 +8096,6 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
                               "color": "#9B6B5A", "flex": 2},
                              {"type": "text", "text": f"{r['shares']:,}",
                               "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
-                         ]},
-                         # v10.9.92：毛 / 費稅 / 淨 損益拆分
-                         {"type": "separator", "color": "#E8C4B4", "margin": "sm"},
-                         {"type": "box", "layout": "horizontal", "contents": [
-                             {"type": "text", "text": "毛損益", "size": "xxs",
-                              "color": "#9B6B5A", "flex": 2},
-                             {"type": "text",
-                              "text": f"{r['gross_profit']:+,.0f}" if r['price'] else "—",
-                              "size": "xs", "color": "#5B4040", "align": "end", "flex": 3},
-                         ]},
-                         {"type": "box", "layout": "horizontal", "contents": [
-                             {"type": "text", "text": "費+稅", "size": "xxs",
-                              "color": "#9B6B5A", "flex": 2},
-                             {"type": "text",
-                              "text": f"-{r['fee_tax']:,}" if r['fee_tax'] else "—",
-                              "size": "xxs", "color": "#7AABBE", "align": "end", "flex": 3},
-                         ]},
-                         {"type": "box", "layout": "horizontal", "contents": [
-                             {"type": "text", "text": "淨損益", "size": "xs",
-                              "color": "#A05A48", "weight": "bold", "flex": 2},
-                             {"type": "text",
-                              "text": f"{r['profit']:+,.0f}" if r['price'] else "—",
-                              "size": "sm", "color": c, "weight": "bold",
-                              "align": "end", "flex": 3},
                          ]},
                          *advice_box,
                      ]},
@@ -9495,18 +9445,14 @@ def handle_message(event):
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text in ["損益分析", "我的損益", "損益總覽"]:
-        # v10.9.96：用 reply_flex_safe — Flex 失敗自動 push 文字 fallback
+        # v10.9.98：回到純文字版（v10.9.95 的 Flex carousel LINE 拒絕，silent fail）
+        # 文字版本來就會動，且包含已實現 + 未實現 + 警語完整資訊
         try:
-            flex = make_pnl_analysis_flex(user_id)
+            reply_text(event.reply_token, format_pnl_analysis(user_id))
         except Exception as e:
-            dlog("PNL", f"build Flex 失敗：{type(e).__name__}: {e}")
-            flex = None
-        fallback = format_pnl_analysis(user_id)
-        if flex:
-            reply_flex_safe(event.reply_token, user_id, flex, "損益分析", fallback)
-        else:
-            try: reply_text(event.reply_token, fallback)
-            except: push_message(user_id, fallback)
+            dlog("PNL", f"reply 失敗 → push：{type(e).__name__}: {e}")
+            try: push_message(user_id, format_pnl_analysis(user_id))
+            except: pass
         return
     if text=="查快取說明": reply_text(event.reply_token,"格式：查快取 代號\n例如：查快取 2330"); return
 
