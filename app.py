@@ -1,6 +1,29 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.80（觀察清單專業 AI 分析）
+LINE Bot 模組 v10.9.81（賣出指令 + 截圖辨識賣出）
+
+【v10.9.81 更新】
+使用者要求：要有賣出指令計算已實現損益，且要能傳賣出截圖辨識。
+
+新增：
+1. analyze_brokerage_screenshot()：統一辨識券商截圖
+   - 自動判斷類型：holdings（庫存）/ sell（賣出回報）/ unknown
+   - 嚴格只取「已成交賣單」，忽略委託中/部份買單
+2. process_sell(user_id, stock_id, shares, sell_price)：
+   - 從持股扣股數，成本均價不變
+   - 計算已實現損益（賣價 - 成本）× 股數
+   - 寫入 Sheets「賣出紀錄」
+3. save_sell_to_sheets()：紀錄欄位 date/user/symbol/name/shares/price/cost/pnl
+4. format_sell_import_preview()：截圖辨識結果含預估損益
+5. 手動指令「賣出 代號 股數 賣價」
+6. 截圖確認流程：「確認賣出」/「取消賣出」（WAITING_SELL_IMPORT state）
+7. 「💸 賣出登記」按鈕加進持股管理選單
+8. 「賣出說明」handler 介紹兩種方式
+
+合規：均不影響成本均價（賣出不改變剩餘部位的平均成本）。
+       若賣超過持有量會擋下，不會出現負股數。
+
+【v10.9.80】觀察清單專業 AI 分析
 
 【v10.9.80 更新】
 使用者要求：推薦股要給出專業分析原因及理由。
@@ -510,7 +533,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.80"
+VERSION              = "10.9.81"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -523,6 +546,7 @@ handler       = WebhookHandler(CHANNEL_SECRET)
 WAITING_SUGGESTION = set()
 WAITING_STOCK_NEWS = {}  # v10.9.58: user_id -> set_at_timestamp（5 分鐘內輸入股票代號 → 回新聞 carousel）
 WAITING_PORTFOLIO_IMPORT = {}  # v10.9.64: user_id -> {"items": [...], "ts": ts}（5 分鐘內確認）
+WAITING_SELL_IMPORT      = {}  # v10.9.81: user_id -> {"items":[{stock_id,shares,sell_price}], "ts":ts}
 WAITING_AI_QA = {}  # v10.9.69: user_id -> set_at_ts（AI 問答模式，5 分鐘內任何訊息當問題）
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 NAME_CACHE         = {}
@@ -3232,10 +3256,11 @@ def make_news_menu_flex() -> dict:
 
 def make_portfolio_menu_flex() -> dict:
     return make_menu_flex(
-        "📋 持股管理", "新增・查詢・損益分析", "#5B8B6B",
+        "📋 持股管理", "新增・查詢・賣出・損益", "#5B8B6B",
         [("📋 我的持股","持股"),                   # v10.9.72：合併（分析 + 可刪除）
          ("💗 立即持股警報","立即持股警報"),       # v10.9.68：手動 force 警報
          ("➕ 新增持股","新增持股說明"),
+         ("💸 賣出登記","賣出說明"),               # v10.9.81：賣出指令說明
          ("📊 損益分析","損益分析"),
          ("🔴 停損提醒","停損提醒說明"),
          ("🎯 目標價提醒","目標價提醒說明")]
@@ -4313,6 +4338,123 @@ def groq_chat(messages: list, max_tokens: int = 1500, temperature: float = 0.2, 
         return ""
 
 
+def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
+    """v10.9.81：統一辨識券商截圖（庫存 OR 賣出回報）。
+    回傳：
+      {"type":"holdings", "items":[{stock_id, shares, avg_price}]}  ← 庫存頁
+      {"type":"sell",     "items":[{stock_id, shares, sell_price}]}  ← 賣出/委成回（只取已成交賣單）
+      {"type":"unknown",  "items":[]}                                 ← 無法判斷
+    """
+    if not GROQ_AVAILABLE:
+        return {"type": "unknown", "items": []}
+    try:
+        b64 = base64.b64encode(image_bytes).decode()
+    except Exception as e:
+        dlog("VISION", f"base64 失敗：{e}")
+        return {"type": "unknown", "items": []}
+
+    prompt = """這是台灣證券戶的截圖。請判斷類型並辨識資料。
+
+【類型 1：庫存頁】顯示「目前持有的股票」，欄位有股數、平均成本/均價、現價/損益等
+→ 回傳 {"type":"holdings","items":[{"stock_id":"2330","shares":100,"avg_price":2010.0}, ...]}
+
+【類型 2：賣出/委成回】顯示「交易紀錄」，看到「賣出/現賣/沖賣/沖售」字樣
+→ 只取「已成交的賣出」筆數（不要當沖買、不要委託中、不要部份未成交的買單）
+→ 回傳 {"type":"sell","items":[{"stock_id":"6742","shares":1000,"sell_price":59.5}, ...]}
+
+【類型 3：無法判斷】
+→ 回傳 {"type":"unknown","items":[]}
+
+規則：
+- stock_id：4-6 位字元（2330/00878/6446）
+- shares：統一換算成「股數」（張 × 1000）
+- 庫存的 avg_price = 平均成本；賣出的 sell_price = 成交價
+- 看不清楚的整筆略過
+- 只回純 JSON，不要 markdown、不要其他文字
+
+提示：
+- 若同時有「現買」「現賣」混合，只挑「賣」相關
+- 若 status 顯示「委託中」「部份成交（買）」忽略，只取「成交（賣）」「全部成交（賣）」
+- 若版面是純庫存清單（沒看到交易動作字樣）→ holdings
+"""
+
+    payload = {
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            ]
+        }],
+        "max_tokens": 2048,
+        "temperature": 0.0,
+    }
+
+    try:
+        r = requests.post(GROQ_API_URL, headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }, json=payload, timeout=30)
+        if r.status_code != 200:
+            dlog("VISION", f"vision HTTP {r.status_code}: {r.text[:200]}")
+            record_health("Groq AI", False, f"vision HTTP {r.status_code}")
+            return {"type": "unknown", "items": []}
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        record_health("Groq AI", True)
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        try:
+            obj = json.loads(text)
+        except Exception as e:
+            dlog("VISION", f"JSON 解析失敗：{e} / raw={text[:200]}")
+            return {"type": "unknown", "items": []}
+        if not isinstance(obj, dict):
+            return {"type": "unknown", "items": []}
+        t = obj.get("type", "unknown")
+        items = obj.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        # 過濾驗證
+        valid = []
+        for h in items:
+            if not isinstance(h, dict): continue
+            sid = str(h.get("stock_id", "")).strip().upper()
+            if not re.match(r"^[0-9]{4,6}[A-Z]?$", sid): continue
+            sh = h.get("shares")
+            if sh is None: continue
+            try:
+                shares = int(float(sh))
+                if shares <= 0: continue
+            except: continue
+            if t == "holdings":
+                bp = h.get("avg_price")
+                if bp is None: continue
+                try:
+                    price = float(bp)
+                    if price <= 0: continue
+                    valid.append({"stock_id": sid, "shares": shares, "avg_price": price})
+                except: continue
+            elif t == "sell":
+                sp = h.get("sell_price")
+                if sp is None: continue
+                try:
+                    price = float(sp)
+                    if price <= 0: continue
+                    valid.append({"stock_id": sid, "shares": shares, "sell_price": price})
+                except: continue
+        dlog("VISION", f"辨識：type={t}, raw {len(items)} → valid {len(valid)}")
+        if t not in ("holdings", "sell"):
+            t = "unknown"
+        return {"type": t, "items": valid}
+    except Exception as e:
+        dlog("VISION", f"vision 例外：{type(e).__name__}: {e}")
+        record_health("Groq AI", False, f"vision {type(e).__name__}")
+        return {"type": "unknown", "items": []}
+
+
 def analyze_portfolio_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -> list:
     """v10.9.64：用 Groq Llama 4 Scout vision 辨識券商庫存截圖。
     回傳 [{"stock_id":"2330","shares":100,"avg_price":2010.0}, ...]
@@ -4396,6 +4538,122 @@ def analyze_portfolio_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
         dlog("VISION", f"vision 例外：{type(e).__name__}: {e}")
         record_health("Groq AI", False, f"vision {type(e).__name__}")
         return []
+
+
+def save_sell_to_sheets(user_id, symbol, name, sell_shares, sell_price, cost_avg, realized_pnl):
+    """v10.9.81：賣出紀錄寫入 Google Sheets「賣出紀錄」分頁。"""
+    try:
+        sheet = get_sheet("賣出紀錄")
+        if sheet:
+            now = now_taipei().strftime("%Y-%m-%d %H:%M")
+            sheet.append_row([now, user_id, symbol, name,
+                              sell_shares, sell_price, cost_avg, realized_pnl])
+    except Exception as e:
+        dlog("PORTFOLIO", f"save_sell_to_sheets 失敗：{e}")
+
+
+def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: float) -> dict:
+    """v10.9.81：處理賣出 — 從持股扣股數、算已實現損益、寫 Sheets。
+    回傳 {"ok": bool, "msg": str, "realized_pnl": float, "remaining_shares": int, "name": str}
+    """
+    portfolio = load_portfolio()
+    # 找對應持股（複合 key + 相容舊 key）
+    norm = stock_id.replace(".TW", "")
+    candidates = [
+        _pf_key(user_id, norm),
+        _pf_key(user_id, stock_id),
+        norm, stock_id, stock_id + ".TW",
+    ]
+    target_key = None
+    for k in candidates:
+        if k in portfolio:
+            v = portfolio[k]
+            if v.get("user_id") == user_id:
+                target_key = k
+                break
+    if not target_key:
+        return {"ok": False, "msg": f"❌ 持股清單裡找不到 {norm}\n請先確認你有持有這檔，或用「新增 代號 股數 均價」建立"}
+
+    data = portfolio[target_key]
+    held_shares = int(data.get("shares", 0))
+    cost_avg = float(data.get("buy_price", 0))
+
+    if sell_shares > held_shares:
+        return {"ok": False,
+                "msg": f"❌ 賣出股數 {sell_shares:,} 超過持有 {held_shares:,} 股\n請確認"}
+
+    realized_pnl = (sell_price - cost_avg) * sell_shares
+    remaining = held_shares - sell_shares
+    name = NAME_CACHE.get(norm, norm)
+
+    if remaining > 0:
+        portfolio[target_key] = {
+            "user_id": user_id,
+            "shares": remaining,
+            "buy_price": cost_avg,  # 賣出不影響成本均價
+        }
+    else:
+        del portfolio[target_key]
+
+    save_portfolio(portfolio)
+    save_sell_to_sheets(user_id, norm, name, sell_shares, sell_price, cost_avg, realized_pnl)
+
+    sign = "🟢 賺" if realized_pnl >= 0 else "🔴 虧"
+    pct = (sell_price - cost_avg) / cost_avg * 100 if cost_avg else 0
+    msg = (f"✅ 賣出完成：{norm} {name}\n"
+           f"━━━━━━━━━━━━━━\n"
+           f"　賣出 {sell_shares:,} 股 @ {sell_price:,.2f}\n"
+           f"　成本均價 {cost_avg:,.2f}\n"
+           f"　{sign}　{realized_pnl:+,.0f} 元（{pct:+.2f}%）\n"
+           f"　剩餘庫存 {remaining:,} 股")
+    return {"ok": True, "msg": msg, "realized_pnl": realized_pnl,
+            "remaining_shares": remaining, "name": name}
+
+
+def format_sell_import_preview(items: list, user_id: str) -> str:
+    """v10.9.81：賣出截圖辨識結果預覽，含預估已實現損益。"""
+    if not items:
+        return "❌ 沒有辨識到任何賣出交易"
+    portfolio = load_portfolio()
+    lines = ["💸 辨識結果 — 賣出交易",
+             "━━━━━━━━━━━━━━"]
+    total_pnl = 0
+    can_process = 0
+    for i, h in enumerate(items, 1):
+        sid = h["stock_id"]
+        shares = h["shares"]
+        price = h["sell_price"]
+        name = NAME_CACHE.get(sid, "")
+        # 查現有持股算預估損益
+        norm = sid.replace(".TW", "")
+        held = None
+        for k in (_pf_key(user_id, norm), _pf_key(user_id, sid), norm, sid, sid + ".TW"):
+            v = portfolio.get(k)
+            if v and v.get("user_id") == user_id:
+                held = v; break
+        lines.append(f"{i}. {sid} {name}".rstrip())
+        lines.append(f"　賣出 {shares:,} 股 @ {price:,.2f}")
+        if held:
+            cost = float(held.get("buy_price", 0))
+            held_n = int(held.get("shares", 0))
+            if shares <= held_n:
+                pnl = (price - cost) * shares
+                total_pnl += pnl
+                sign = "🟢" if pnl >= 0 else "🔴"
+                lines.append(f"　成本 {cost:,.2f} ‧ {sign} 預估 {pnl:+,.0f} 元")
+                can_process += 1
+            else:
+                lines.append(f"　⚠ 持有僅 {held_n:,} 股，無法賣出 {shares:,}")
+        else:
+            lines.append(f"　⚠ 持股清單沒這檔")
+    lines.append("━━━━━━━━━━━━━━")
+    if can_process:
+        sign = "🟢" if total_pnl >= 0 else "🔴"
+        lines.append(f"預估合計：{sign} {total_pnl:+,.0f} 元（{can_process} 筆可處理）")
+    lines.append("　• 輸入「確認賣出」執行")
+    lines.append("　• 輸入「取消賣出」放棄")
+    lines.append("　• 5 分鐘後自動取消")
+    return "\n".join(lines)
 
 
 def format_portfolio_import_preview(items: list) -> str:
@@ -6920,18 +7178,32 @@ def handle_image(event):
             with ApiClient(configuration) as api_client:
                 blob_api = MessagingApiBlob(api_client)
                 content = blob_api.get_message_content(message_id=msg_id)
-            holdings = analyze_portfolio_screenshot(content, mime="image/jpeg")
-            if not holdings:
-                push_message(user_id,
-                    "❌ 無法辨識任何持股\n"
-                    "可能原因：\n"
-                    "　• 截圖不清楚 / 字太小\n"
-                    "　• 不是券商庫存頁\n"
-                    "　• AI 服務暫時忙碌\n\n"
-                    "建議重新拍攝或手動「新增 代號 股數 均價」")
+            # v10.9.81：統一辨識 — 庫存頁 OR 賣出回報
+            result = analyze_brokerage_screenshot(content, mime="image/jpeg")
+            rtype = result.get("type", "unknown")
+            items = result.get("items", [])
+
+            if rtype == "holdings" and items:
+                WAITING_PORTFOLIO_IMPORT[user_id] = {"items": items, "ts": time.time()}
+                push_message(user_id, format_portfolio_import_preview(items))
                 return
-            WAITING_PORTFOLIO_IMPORT[user_id] = {"items": holdings, "ts": time.time()}
-            push_message(user_id, format_portfolio_import_preview(holdings))
+
+            if rtype == "sell" and items:
+                WAITING_SELL_IMPORT[user_id] = {"items": items, "ts": time.time()}
+                push_message(user_id, format_sell_import_preview(items, user_id))
+                return
+
+            push_message(user_id,
+                "❌ 無法辨識任何持股 / 賣出資料\n"
+                "可能原因：\n"
+                "　• 截圖不清楚 / 字太小\n"
+                "　• 不是券商庫存頁、也不是賣出回報\n"
+                "　• AI 服務暫時忙碌\n\n"
+                "庫存：請截「庫存查詢 / 股票庫存」頁\n"
+                "賣出：請截「成交回報（賣）」頁\n"
+                "或手動：\n"
+                "　・新增 代號 股數 均價\n"
+                "　・賣出 代號 股數 賣價")
         except Exception as e:
             dlog("IMAGE", f"處理圖片失敗：{type(e).__name__}: {e}")
             push_message(user_id, f"❌ 處理圖片失敗：{type(e).__name__}")
@@ -7510,10 +7782,24 @@ def handle_message(event):
             "1️⃣ 手動輸入\n"
             "　格式：新增 代碼 股數 買入價\n"
             "　例如：新增 2330 100 2010\n\n"
-            "2️⃣ 截圖辨識（v10.9.64 新功能）✨\n"
-            "　直接傳券商庫存截圖給我\n"
-            "　AI 自動辨識 → 確認 → 一鍵匯入\n"
-            "　⚠ 截圖會送雲端辨識，建議先遮蔽帳號餘額")
+            "2️⃣ 截圖辨識 ✨\n"
+            "　直接傳券商「庫存查詢」頁截圖\n"
+            "　AI 自動辨識 → 確認匯入 → 一鍵儲存\n"
+            "　⚠ 截圖會送雲端，建議先遮蔽帳號餘額")
+        return
+    if text=="賣出說明":
+        reply_text(event.reply_token,
+            "💸 登記賣出 — 兩種方式\n━━━━━━━━━━━━━━\n"
+            "1️⃣ 手動輸入\n"
+            "　格式：賣出 代碼 股數 賣價\n"
+            "　例如：賣出 6742 1000 59.5\n\n"
+            "2️⃣ 截圖辨識 ✨\n"
+            "　傳券商「成交回報（賣）」截圖\n"
+            "　AI 自動辨識 → 預估已實現損益 → 確認賣出\n\n"
+            "系統會自動：\n"
+            "　• 從庫存扣股數（成本均價不變）\n"
+            "　• 計算已實現損益\n"
+            "　• 寫入 Google Sheets「賣出紀錄」")
         return
     # v10.9.64：持股截圖匯入確認
     if text in ["確認匯入", "確認", "yes", "Yes", "YES"]:
@@ -7547,6 +7833,56 @@ def handle_message(event):
             reply_text(event.reply_token, "✅ 已取消匯入，原資料未變動")
         else:
             reply_text(event.reply_token, "⏰ 沒有待確認的匯入")
+        return
+    # v10.9.81：賣出截圖確認 / 取消
+    if text in ["確認賣出"]:
+        record = WAITING_SELL_IMPORT.get(user_id)
+        if not record or (time.time() - record["ts"]) > 300:
+            reply_text(event.reply_token, "⏰ 沒有待確認的賣出，或已過期\n請重新傳截圖或用「賣出 代號 股數 賣價」")
+            return
+        items = record["items"]
+        ok_n = 0; total_pnl = 0
+        lines = ["✅ 賣出執行結果", "━━━━━━━━━━━━━━"]
+        for h in items:
+            r = process_sell(user_id, h["stock_id"], int(h["shares"]), float(h["sell_price"]))
+            if r["ok"]:
+                ok_n += 1
+                total_pnl += r["realized_pnl"]
+                lines.append(f"✅ {h['stock_id']} {r.get('name','')}")
+                lines.append(f"　{h['shares']:,} 股 @ {h['sell_price']:,.2f}　{r['realized_pnl']:+,.0f} 元")
+                lines.append(f"　剩餘 {r['remaining_shares']:,} 股")
+            else:
+                lines.append(f"❌ {h['stock_id']}：{r['msg'].split(chr(10))[0]}")
+        WAITING_SELL_IMPORT.pop(user_id, None)
+        lines.append("━━━━━━━━━━━━━━")
+        sign = "🟢" if total_pnl >= 0 else "🔴"
+        lines.append(f"合計已實現損益：{sign} {total_pnl:+,.0f} 元（{ok_n}/{len(items)} 筆成功）")
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+    if text in ["取消賣出"]:
+        if WAITING_SELL_IMPORT.pop(user_id, None):
+            reply_text(event.reply_token, "✅ 已取消賣出，原資料未變動")
+        else:
+            reply_text(event.reply_token, "⏰ 沒有待確認的賣出")
+        return
+    # v10.9.81：手動「賣出 代號 股數 賣價」
+    if text.startswith("賣出 "):
+        parts = text.split()
+        if len(parts) == 4:
+            try:
+                stock_id = parts[1].upper()
+                shares = int(parts[2])
+                sell_price = float(parts[3])
+                if shares <= 0 or sell_price <= 0:
+                    raise ValueError("invalid")
+                r = process_sell(user_id, stock_id, shares, sell_price)
+                reply_text(event.reply_token, r["msg"])
+            except Exception:
+                reply_text(event.reply_token,
+                    "格式錯誤\n範例：賣出 6742 1000 59.5\n　（代號 股數 賣價）")
+        else:
+            reply_text(event.reply_token,
+                "格式：賣出 代號 股數 賣價\n範例：賣出 6742 1000 59.5")
         return
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
