@@ -1,6 +1,24 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.84（「新增」改為智能模式：既有部位自動加碼）
+LINE Bot 模組 v10.9.85（損益分析：已實現 vs 未實現分離）
+
+【v10.9.85 更新】
+使用者反映：損益分析跟我的持股顯示一樣，浪費；應該分開呈現
+已實現/未實現，且兩者不合計（會計上意義不同）。
+
+改動：
+1. 新增 read_sell_history_from_sheets(user_id)：讀「賣出紀錄」分頁
+2. 新增 format_pnl_analysis(user_id)：完整損益報告
+   - 📕 已實現損益（從 Sheets）：每筆細節 + 合計
+   - 📘 未實現損益（即時報價）：每檔細節 + 合計
+   - **明確標示「不合計」**
+3. 「損益分析」改用新函式；「我的損益」「損益總覽」同義
+4. 我的持股 Flex 維持不變（仍是 carousel + 系統建議 + 刪除按鈕）
+
+已實現 = Sheets 賣出紀錄（含手續費 + 證交稅扣除）
+未實現 = 即時持股 ×（現價 - 含費均價）
+
+【v10.9.84】「新增」改為智能模式：既有部位自動加碼
 
 【v10.9.84 更新】
 使用者反映：沒有賣出又再買進不就是加碼嗎？系統應該自動分辨。
@@ -592,7 +610,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.84"
+VERSION              = "10.9.85"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4710,6 +4728,115 @@ def analyze_portfolio_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
         return []
 
 
+def read_sell_history_from_sheets(user_id: str) -> list:
+    """v10.9.85：讀 Sheets「賣出紀錄」分頁，取該使用者所有賣出紀錄。
+    欄位順序（append_row 寫入時）：時間、用戶ID、代號、名稱、賣股數、賣價、成本均價、已實現損益
+    回傳 [{date, symbol, name, shares, price, cost, pnl}, ...]，依時間 desc 排序。
+    """
+    try:
+        sheet = get_sheet("賣出紀錄")
+        if not sheet: return []
+        rows = sheet.get_all_values()
+        if not rows or len(rows) < 2: return []
+        out = []
+        for row in rows[1:]:
+            if len(row) < 8: continue
+            if str(row[1]).strip() != user_id: continue
+            try:
+                out.append({
+                    "date": (row[0] or "").strip(),
+                    "symbol": (row[2] or "").strip(),
+                    "name": (row[3] or "").strip(),
+                    "shares": int(float(row[4])),
+                    "price": float(row[5]),
+                    "cost": float(row[6]),
+                    "pnl": float(row[7]),
+                })
+            except: continue
+        out.sort(key=lambda r: r["date"], reverse=True)
+        return out
+    except Exception as e:
+        dlog("PORTFOLIO", f"讀賣出紀錄失敗：{e}")
+        return []
+
+
+def format_pnl_analysis(user_id: str) -> str:
+    """v10.9.85：損益分析 — 已實現（Sheets）+ 未實現（即時持股）分開呈現。
+    取代原本 get_portfolio_summary（與「我的持股」重複）。
+    """
+    realized = read_sell_history_from_sheets(user_id)
+    portfolio = load_portfolio()
+    up = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
+
+    lines = ["📈 損益分析", "━━━━━━━━━━━━━━"]
+
+    # ── 已實現損益（從 Sheets 賣出紀錄） ──
+    lines.append("")
+    lines.append("📕 已實現損益（賣出紀錄）")
+    if not realized:
+        lines.append("　（尚無賣出紀錄）")
+    else:
+        total_realized = 0
+        for r in realized:
+            total_realized += r["pnl"]
+        # 顯示最近 10 筆細節
+        for r in realized[:10]:
+            sign = "🟢" if r["pnl"] >= 0 else "🔴"
+            d_short = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
+            lines.append(f"　{d_short}　{sign} {r['symbol']} {r['name']}")
+            lines.append(f"　　賣 {r['shares']:,} 股 @ {r['price']:,.2f}　{r['pnl']:+,.0f} 元")
+        if len(realized) > 10:
+            lines.append(f"　... 另有 {len(realized)-10} 筆較早紀錄")
+        sign = "🟢" if total_realized >= 0 else "🔴"
+        lines.append("")
+        lines.append(f"　合計（{len(realized)} 筆）：{sign} {total_realized:+,.0f} 元")
+
+    # ── 未實現損益（從目前持股 + 即時報價） ──
+    lines.append("")
+    lines.append("📘 未實現損益（目前持股）")
+    if not up:
+        lines.append("　（持股清單是空的）")
+    else:
+        total_unrealized = 0
+        ok_count = 0
+        for k, data in up.items():
+            symbol = _pf_symbol(k)
+            sid = symbol.replace(".TW", "")
+            try:
+                if sid.isdigit():
+                    tw = get_tw_stock(sid)
+                    price = tw["price"] if tw else 0
+                    name = tw["name"] if tw else sid
+                else:
+                    us = get_us_stock(symbol)
+                    price = us["price"] if us else 0
+                    name = us["name"] if us else symbol
+                shares = int(data.get("shares", 0))
+                bp = float(data.get("buy_price", 0))
+                if price > 0 and bp > 0:
+                    pnl = (price - bp) * shares
+                    pct = (price - bp) / bp * 100
+                    sign = "🟢" if pnl >= 0 else "🔴"
+                    lines.append(f"　{sign} {sid} {name}（{shares:,} 股）")
+                    lines.append(f"　　均 {bp:,.2f} → 現 {price:,.2f}　{pnl:+,.0f}（{pct:+.2f}%）")
+                    total_unrealized += pnl
+                    ok_count += 1
+                else:
+                    lines.append(f"　⚠ {sid} 報價暫無")
+            except: pass
+        if ok_count:
+            sign = "🟢" if total_unrealized >= 0 else "🔴"
+            lines.append("")
+            lines.append(f"　合計（{ok_count} 檔）：{sign} {total_unrealized:+,.0f} 元")
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("⚠ 已實現與未實現分開計算，不合計")
+    lines.append("　未實現用即時報價（可能延遲 15 分）")
+    lines.append("　已實現已扣手續費 + 證交稅")
+    return "\n".join(lines)
+
+
 def save_sell_to_sheets(user_id, symbol, name, sell_shares, sell_price, cost_avg, realized_pnl):
     """v10.9.81：賣出紀錄寫入 Google Sheets「賣出紀錄」分頁。"""
     try:
@@ -8282,7 +8409,9 @@ def handle_message(event):
         return
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
-    if text=="損益分析": reply_text(event.reply_token, get_portfolio_summary(user_id)); return
+    if text in ["損益分析", "我的損益", "損益總覽"]:
+        # v10.9.85：已實現 + 未實現分開（取代原本與「我的持股」重複的文字版）
+        reply_text(event.reply_token, format_pnl_analysis(user_id)); return
     if text=="查快取說明": reply_text(event.reply_token,"格式：查快取 代號\n例如：查快取 2330"); return
 
     # ══ 查股票子選單 ══
