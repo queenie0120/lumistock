@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.96"
+VERSION              = "10.9.97"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2350,9 +2350,17 @@ def init_name_cache():
     except Exception as e:
         dlog("HEALTHCHECK-AUTO", f"❌ 排程器啟動失敗：{e}")
 
+    # v10.9.97：用 atomic file create dedupe — gunicorn 多 worker / worker timeout 重啟
+    # 都不會再重複 push。同一 VERSION 在 /tmp 還在期間只 push 一次。
+    boot_flag = f"/tmp/.boot_{VERSION}.flag"
     try:
-        push_to_owner(f"✅ Lumistock 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
-    except: pass
+        fd = os.open(boot_flag, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        push_to_owner(f"✅ Lumistock v{VERSION} 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
+    except FileExistsError:
+        dlog("BOOT", f"v{VERSION} 已通知過，跳過重複通知")
+    except Exception as e:
+        dlog("BOOT", f"啟動通知失敗：{e}")
 
 
 # ══════════════════════════════════════════════════════════
