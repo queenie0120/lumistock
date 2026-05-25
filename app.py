@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.100"
+VERSION              = "10.9.101"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5233,76 +5233,36 @@ def format_pnl_analysis(user_id: str) -> str:
     """v10.9.85：損益分析 — 已實現（Sheets）+ 未實現（即時持股）分開呈現。
     取代原本 get_portfolio_summary（與「我的持股」重複）。
     """
+    # v10.9.101：使用者要求只顯示已實現損益（未實現在「我的持股」卡片裡每檔都有）
     realized = read_sell_history_from_sheets(user_id)
-    portfolio = load_portfolio()
-    up = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
 
-    lines = ["📈 損益分析", "━━━━━━━━━━━━━━"]
+    lines = ["📈 損益分析 — 已實現", "━━━━━━━━━━━━━━"]
 
-    # ── 已實現損益（從 Sheets 賣出紀錄） ──
-    lines.append("")
-    lines.append("📕 已實現損益（賣出紀錄）")
     if not realized:
-        lines.append("　（尚無賣出紀錄）")
-    else:
-        total_realized = 0
-        for r in realized:
-            total_realized += r["pnl"]
-        # 顯示最近 10 筆細節
-        for r in realized[:10]:
-            sign = "🟢" if r["pnl"] >= 0 else "🔴"
-            d_short = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
-            lines.append(f"　{d_short}　{sign} {r['symbol']} {r['name']}")
-            lines.append(f"　　賣 {r['shares']:,} 股 @ {r['price']:,.2f}　{r['pnl']:+,.0f} 元")
-        if len(realized) > 10:
-            lines.append(f"　... 另有 {len(realized)-10} 筆較早紀錄")
-        sign = "🟢" if total_realized >= 0 else "🔴"
+        lines.append("📕 尚無賣出紀錄")
         lines.append("")
-        lines.append(f"　合計（{len(realized)} 筆）：{sign} {total_realized:+,.0f} 元")
+        lines.append("（賣出之後會自動寫到 Sheets「賣出紀錄」分頁）")
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append("💡 想看每檔現價漲跌？點「我的持股」")
+        return "\n".join(lines)
 
-    # ── 未實現損益（從目前持股 + 即時報價） ──
-    lines.append("")
-    lines.append("📘 未實現損益（目前持股）")
-    if not up:
-        lines.append("　（持股清單是空的）")
-    else:
-        total_unrealized = 0
-        ok_count = 0
-        for k, data in up.items():
-            symbol = _pf_symbol(k)
-            sid = symbol.replace(".TW", "")
-            try:
-                if sid.isdigit():
-                    tw = get_tw_stock(sid)
-                    price = tw["price"] if tw else 0
-                    name = tw["name"] if tw else sid
-                else:
-                    us = get_us_stock(symbol)
-                    price = us["price"] if us else 0
-                    name = us["name"] if us else symbol
-                shares = int(data.get("shares", 0))
-                bp = float(data.get("buy_price", 0))
-                if price > 0 and bp > 0:
-                    pnl = (price - bp) * shares
-                    pct = (price - bp) / bp * 100
-                    sign = "🟢" if pnl >= 0 else "🔴"
-                    lines.append(f"　{sign} {sid} {name}（{shares:,} 股）")
-                    lines.append(f"　　均 {bp:,.2f} → 現 {price:,.2f}　{pnl:+,.0f}（{pct:+.2f}%）")
-                    total_unrealized += pnl
-                    ok_count += 1
-                else:
-                    lines.append(f"　⚠ {sid} 報價暫無")
-            except: pass
-        if ok_count:
-            sign = "🟢" if total_unrealized >= 0 else "🔴"
-            lines.append("")
-            lines.append(f"　合計（{ok_count} 檔）：{sign} {total_unrealized:+,.0f} 元")
-
+    total_realized = sum(r["pnl"] for r in realized)
+    # 顯示最近 20 筆細節（從 10 拉到 20 因為這頁專心顯示已實現）
+    for r in realized[:20]:
+        sign = "🟢" if r["pnl"] >= 0 else "🔴"
+        d_short = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
+        lines.append(f"　{d_short}　{sign} {r['symbol']} {r['name']}")
+        lines.append(f"　　賣 {r['shares']:,} 股 @ {r['price']:,.2f}　{r['pnl']:+,.0f} 元")
+    if len(realized) > 20:
+        lines.append(f"　... 另有 {len(realized)-20} 筆較早紀錄")
+    sign = "🟢" if total_realized >= 0 else "🔴"
     lines.append("")
     lines.append("━━━━━━━━━━━━━━")
-    lines.append("⚠ 已實現與未實現分開計算，不合計")
-    lines.append("　未實現用即時報價（可能延遲 15 分）")
-    lines.append("　已實現已扣手續費 + 證交稅")
+    lines.append(f"合計（{len(realized)} 筆）：{sign} {total_realized:+,.0f} 元")
+    lines.append("")
+    lines.append("⚠ 已扣手續費 + 證交稅")
+    lines.append("💡 想看每檔現價漲跌？點「我的持股」")
     return "\n".join(lines)
 
 
