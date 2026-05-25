@@ -1,6 +1,42 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.92（持股淨損益 + 含費/未含費匯入選項）
+LINE Bot 模組 v10.9.93（修兩個 regression：持股消失 + 手續費還是 60%）
+
+【v10.9.93 更新】
+使用者反映：
+1. 「我的持股」點進去沒有任何東西，連最早會有的持股都沒了
+2. 手續費設了無折扣 100% 之後，賣出截圖預覽還是顯示 60%
+
+Root cause（兩個都是 silent edge case）：
+1. _bg_init 開機 sleep 15s 才 restore_portfolio_from_sheets。
+   若使用者剛部署完馬上點 持股 → /tmp 是空的 → 空清單。
+   即使 _bg_init 跑完，若中間 LINE 訊息進來，handler 不會主動 retry。
+2. restore_user_settings_from_sheets 無腦 `rows[1:]` 跳過 header。
+   但 get_or_create_sheet 建立新分頁時，append_row(headers) 偶爾失敗
+   （新建分頁需要 API propagation 時間）→ header 沒寫成功 →
+   使用者的資料剛好被當 header 跳掉 → restore 永遠拉不到。
+   set_user_fee_discount 也用同樣 enumerate(records[1:], start=2)
+   錯誤跳過策略 → 同一個使用者會被 append 第 N 次而不是 update。
+
+改動：
+1. restore_user_settings_from_sheets：
+   - 不再跳過 row[0]
+   - 改用 「row[0] 以 U 開頭且長度 >= 30」判斷是不是 user_id
+   - 同時驗證 disc 在 0.01~1.0 之間
+2. set_user_fee_discount：
+   - 同樣不跳過 header，直接掃所有列
+   - 找到 user_id 就 update，找不到才 append
+   - 補上成功/失敗 dlog
+3. 「持股」handler：
+   - 若 /tmp 是空的 → 主動觸發 restore（不再依賴 _bg_init）
+   - 三層 fallback：Flex → 文字 reply → push_message
+   - 任何一步炸都 log，至少使用者會看到東西
+4. 新增診斷指令 「持股狀態」/「持股debug」：
+   - 顯示 /tmp 持股 key 總數、我的檔數、目前折數、原始清單
+   - Quick Reply 浮標 [🔄 強制 restore] [📋 我的持股]
+5. 新增 「強制restore持股」指令：直接呼叫兩個 restore
+
+【v10.9.92】持股淨損益 + 含費/未含費匯入選項
 
 【v10.9.92 更新】
 使用者反映：
@@ -754,7 +790,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.92"
+VERSION              = "10.9.93"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3340,48 +3376,60 @@ def set_user_fee_discount(user_id: str, discount: float) -> None:
     s = USER_SETTINGS.setdefault(user_id, {})
     s["fee_discount"] = round(float(discount), 4)
     _save_user_settings(USER_SETTINGS)
-    # v10.9.90：分頁不存在時自動建立 + 失敗有 log（之前 except: pass 會悄悄丟）
+    # v10.9.90/93：分頁不存在自動建立 + 失敗 log + 用 user_id 而非 row index 找列
     try:
         sheet = get_or_create_sheet("使用者設定",
                                     headers=["用戶ID", "手續費折數", "更新時間"])
         if not sheet:
-            dlog("SETTINGS", f"無法取得/建立「使用者設定」分頁，{user_id} 折數僅存在記憶體")
+            dlog("SETTINGS", f"無法取得/建立「使用者設定」分頁，{user_id[-6:]} 折數僅存在記憶體")
             return
         records = sheet.get_all_values()
         updated = False
-        for i, row in enumerate(records[1:], start=2):
-            if row and row[0] == user_id:
+        # v10.9.93：不再跳過 row[0]（header 可能寫入失敗）。
+        # 改：掃所有列，找到 row[0]==user_id 就更新；找不到就 append。
+        for i, row in enumerate(records, start=1):
+            if row and (row[0] or "").strip() == user_id:
                 sheet.update_cell(i, 2, s["fee_discount"])
-                sheet.update_cell(i, 3, now_taipei().strftime("%Y-%m-%d %H:%M"))
+                if len(row) >= 3:
+                    sheet.update_cell(i, 3, now_taipei().strftime("%Y-%m-%d %H:%M"))
                 updated = True
+                dlog("SETTINGS", f"Sheets 更新 row {i}：{user_id[-6:]} = {s['fee_discount']}")
                 break
         if not updated:
             sheet.append_row([user_id, s["fee_discount"],
                               now_taipei().strftime("%Y-%m-%d %H:%M")])
-        dlog("SETTINGS", f"已寫入 Sheets 使用者設定：{user_id[-6:]} = {s['fee_discount']}")
+            dlog("SETTINGS", f"Sheets append：{user_id[-6:]} = {s['fee_discount']}")
     except Exception as e:
         dlog("SETTINGS", f"寫入使用者設定到 Sheets 失敗：{type(e).__name__}: {e}")
 
 def restore_user_settings_from_sheets() -> int:
     """v10.9.82：開機從 Sheets 還原使用者設定（手續費折數）。
-    v10.9.90：分頁不存在時自動建立空表，下次寫入才不會再 silent fail。"""
+    v10.9.90：分頁不存在時自動建立空表。
+    v10.9.93：不再無腦跳過 row[0]（之前若 header 寫入失敗，使用者資料會被當 header 跳掉）。
+              改用「row[0] 看起來像 user_id 才採用」的判斷。"""
     try:
         sheet = get_or_create_sheet("使用者設定",
                                     headers=["用戶ID", "手續費折數", "更新時間"])
         if not sheet: return 0
         rows = sheet.get_all_values()
-        if not rows or len(rows) < 2: return 0
-        for row in rows[1:]:
+        if not rows: return 0
+        count = 0
+        for row in rows:
             if len(row) < 2: continue
             uid = (row[0] or "").strip()
+            # LINE user_id 格式：U + 32 hex chars
+            if not uid.startswith("U") or len(uid) < 30:
+                continue
             try: disc = float(row[1])
             except: continue
-            if uid:
+            if 0.01 < disc <= 1.0:
                 USER_SETTINGS.setdefault(uid, {})["fee_discount"] = disc
+                count += 1
         _save_user_settings(USER_SETTINGS)
-        return len(USER_SETTINGS)
+        if count: dlog("SETTINGS", f"還原 {count} 位使用者折數")
+        return count
     except Exception as e:
-        dlog("SETTINGS", f"還原使用者設定失敗：{e}")
+        dlog("SETTINGS", f"還原使用者設定失敗：{type(e).__name__}: {e}")
         return 0
 
 def parse_fee_discount_input(text: str):
@@ -9223,30 +9271,103 @@ def handle_message(event):
     # ══ 持股管理指令 ══
     if text=="持股":
         # v10.9.62：Flex carousel（含系統建議停損/目標 + 下次除權息）
+        # v10.9.93：若 /tmp 是空的（剛重啟還沒等到 _bg_init 跑完）→ 即時 restore 一次
+        try:
+            portfolio = load_portfolio()
+            mine = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
+            if not mine:
+                try:
+                    n = restore_portfolio_from_sheets()
+                    dlog("PORTFOLIO", f"持股指令觸發 restore：{n} 檔")
+                except Exception as e:
+                    dlog("PORTFOLIO", f"即時 restore 失敗：{type(e).__name__}: {e}")
+        except Exception as e:
+            dlog("PORTFOLIO", f"持股 pre-check 失敗：{type(e).__name__}: {e}")
         try:
             flex = make_portfolio_flex_carousel(user_id)
             if flex:
                 reply_flex(event.reply_token, flex, "我的持股")
                 return
         except Exception as e:
-            dlog("PORTFOLIO", f"Flex 失敗 fallback 文字：{e}")
-        reply_text(event.reply_token, get_portfolio_summary(user_id)); return
+            dlog("PORTFOLIO", f"Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
+        try:
+            reply_text(event.reply_token, get_portfolio_summary(user_id))
+        except Exception as e:
+            dlog("PORTFOLIO", f"文字 reply 也失敗：{type(e).__name__}: {e}")
+            try: push_message(user_id, get_portfolio_summary(user_id))
+            except: pass
+        return
     if text=="持股文字":
         # v10.9.62 保留純文字版（debug 用）
         reply_text(event.reply_token, get_portfolio_summary(user_id)); return
 
+    # v10.9.93：診斷指令 — 列出 /tmp 持股原始狀態（給 owner 用）
+    if text in ["持股debug", "持股狀態", "debug持股"]:
+        try:
+            portfolio = load_portfolio()
+            mine = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
+            all_n = len(portfolio); my_n = len(mine)
+            disc = get_user_fee_discount(user_id)
+            disc_str = f"{int(disc*100)}%" if disc < 1.0 else "100%（無折扣）"
+            lines = [
+                "🔧 持股 / 設定診斷",
+                "━━━━━━━━━━━━━━",
+                f"我的 user_id：…{user_id[-8:]}",
+                f"/tmp 全部持股 key 數：{all_n}",
+                f"我的持股檔數：{my_n}",
+                f"目前手續費折數：{disc_str}",
+                "─" * 14,
+                "我的持股清單："
+            ]
+            for k, v in mine.items():
+                lines.append(f"  {_pf_symbol(k)} — {v.get('shares')} 股 @ {v.get('buy_price')}")
+            if not mine:
+                lines.append("  （無）")
+            lines.append("─" * 14)
+            lines.append("如果這裡是空的但 Sheets 有資料")
+            lines.append("→ 請按下方「強制 restore」")
+            reply_text_with_qr(event.reply_token, "\n".join(lines),
+                [("🔄 強制 restore", "強制restore持股"),
+                 ("📋 我的持股", "持股")])
+        except Exception as e:
+            reply_text(event.reply_token, f"診斷失敗：{type(e).__name__}: {e}")
+        return
+    if text in ["強制restore持股", "強制 restore", "強制restore"]:
+        try:
+            n = restore_portfolio_from_sheets()
+            ns = restore_user_settings_from_sheets()
+            reply_text_with_qr(event.reply_token,
+                f"✅ 已強制 restore\n持股總計：{n} 檔\n使用者設定：{ns} 位",
+                [("📋 我的持股", "持股"), ("🔧 持股狀態", "持股狀態")])
+        except Exception as e:
+            reply_text(event.reply_token, f"強制 restore 失敗：{type(e).__name__}: {e}")
+        return
+
     # v10.9.25：可點選刪除的持股清單
     if text in ["我的持股", "持股清單"]:
         # v10.9.72：合併為豐富卡片（含分析 + 刪除按鈕），與「持股」同一個 view
+        # v10.9.93：同 持股 — 空就即時 restore + 確保一定回應
         dlog("HANDLER", "→ 持股清單（合併版）")
+        try:
+            portfolio = load_portfolio()
+            mine = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
+            if not mine:
+                try: restore_portfolio_from_sheets()
+                except Exception as e: dlog("PORTFOLIO", f"restore 失敗：{e}")
+        except: pass
         try:
             flex = make_portfolio_flex_carousel(user_id)
             if flex:
                 reply_flex(event.reply_token, flex, "我的持股")
                 return
         except Exception as e:
-            dlog("PORTFOLIO", f"Flex 失敗 fallback：{e}")
-        reply_text(event.reply_token, get_portfolio_summary(user_id))
+            dlog("PORTFOLIO", f"Flex 失敗 fallback：{type(e).__name__}: {e}")
+        try:
+            reply_text(event.reply_token, get_portfolio_summary(user_id))
+        except Exception as e:
+            dlog("PORTFOLIO", f"文字 reply 也失敗：{e}")
+            try: push_message(user_id, get_portfolio_summary(user_id))
+            except: pass
         return
 
     # v10.9.25：黑名單清單（管理者用）
