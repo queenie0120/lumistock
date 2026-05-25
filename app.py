@@ -1,6 +1,27 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.95（賣出紀錄持久化修復 + 損益分析卡片）
+LINE Bot 模組 v10.9.96（修 reply_flex 三連 silent fail）
+
+【v10.9.96 更新】
+使用者反映：按「損益分析」沒任何後續。
+
+Root cause：
+- v10.9.95 用 reply_flex → LINE API 拒絕 Flex 結構
+- reply_token 已被消耗（被 LINE 計 1 次失敗）
+- 外層 except 跳到 reply_text fallback → reply_token already used → 又失敗
+- 三層 silent fail 全吞掉 → 使用者看不到任何回應
+- 本地 FlexContainer.from_dict 驗證是 OK 的，所以是 LINE 服務端拒絕
+
+修法：
+1. 新增 reply_flex_safe(reply_token, user_id, flex, alt, fallback_text)
+   - Step 1：本地用 FlexContainer.from_dict 預驗證；失敗 → reply_text
+   - Step 2：reply_flex；失敗 → push_message（reply_token 可能已用，所以改用 push）
+   - 任何階段失敗都有 dlog
+2. 把「損益分析」改用 reply_flex_safe
+3. 把「持股」/「我的持股」也改用 reply_flex_safe
+   （之前的 try/except 不夠，reply_token 已用的情況沒處理）
+
+【v10.9.95】賣出紀錄持久化修復 + 損益分析卡片
 
 【v10.9.95 更新】
 使用者反映：
@@ -837,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.95"
+VERSION              = "10.9.96"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -8381,6 +8402,35 @@ def reply_flex_with_qr(reply_token, flex_content, alt_text, qr_items):
                     contents=FlexContainer.from_dict(flex_content),
                     quick_reply=qr)]))
 
+def reply_flex_safe(reply_token, user_id, flex_content, alt_text, fallback_text):
+    """v10.9.96：穩健的 Flex 回覆 — 三層 fallback 防 silent fail。
+    Why: reply_flex 一旦呼到 LINE API，reply_token 就可能被消耗。
+         所以結構錯就用 reply_text，已消耗 token 就用 push_message。
+    Returns: True 成功，False 全部失敗。"""
+    # Step 1：本地預檢 Flex 結構
+    try:
+        FlexContainer.from_dict(flex_content)
+    except Exception as e:
+        dlog("FLEX", f"本地驗證失敗 → reply_text fallback：{type(e).__name__}: {str(e)[:200]}")
+        try:
+            reply_text(reply_token, fallback_text)
+            return False
+        except Exception as e2:
+            dlog("FLEX", f"reply_text 也失敗 → push：{e2}")
+            try: push_message(user_id, fallback_text)
+            except: pass
+            return False
+    # Step 2：reply_flex
+    try:
+        reply_flex(reply_token, flex_content, alt_text)
+        return True
+    except Exception as e:
+        dlog("FLEX", f"LINE API 拒絕 Flex → push fallback：{type(e).__name__}: {str(e)[:200]}")
+        # reply_token 可能已被消耗，直接 push
+        try: push_message(user_id, fallback_text)
+        except Exception as e2: dlog("FLEX", f"push 也失敗：{e2}")
+        return False
+
 
 @app.route("/",methods=["GET"])
 def index():
@@ -9437,21 +9487,18 @@ def handle_message(event):
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text in ["損益分析", "我的損益", "損益總覽"]:
-        # v10.9.85：已實現 + 未實現分開
-        # v10.9.95：優先 Flex carousel；失敗 fallback 文字
+        # v10.9.96：用 reply_flex_safe — Flex 失敗自動 push 文字 fallback
         try:
             flex = make_pnl_analysis_flex(user_id)
-            if flex:
-                reply_flex(event.reply_token, flex, "損益分析")
-                return
         except Exception as e:
-            dlog("PNL", f"Flex 失敗 fallback：{type(e).__name__}: {e}")
-        try:
-            reply_text(event.reply_token, format_pnl_analysis(user_id))
-        except Exception as e:
-            dlog("PNL", f"reply 也失敗：{e}")
-            try: push_message(user_id, format_pnl_analysis(user_id))
-            except: pass
+            dlog("PNL", f"build Flex 失敗：{type(e).__name__}: {e}")
+            flex = None
+        fallback = format_pnl_analysis(user_id)
+        if flex:
+            reply_flex_safe(event.reply_token, user_id, flex, "損益分析", fallback)
+        else:
+            try: reply_text(event.reply_token, fallback)
+            except: push_message(user_id, fallback)
         return
     if text=="查快取說明": reply_text(event.reply_token,"格式：查快取 代號\n例如：查快取 2330"); return
 
@@ -9574,32 +9621,28 @@ def handle_message(event):
 
     # ══ 持股管理指令 ══
     if text=="持股":
-        # v10.9.62：Flex carousel（含系統建議停損/目標 + 下次除權息）
-        # v10.9.93：若 /tmp 是空的（剛重啟還沒等到 _bg_init 跑完）→ 即時 restore 一次
+        # v10.9.62：Flex carousel
+        # v10.9.93：/tmp 空時即時 restore（不等 _bg_init）
+        # v10.9.96：reply_flex_safe — silent fail 自動 push fallback
         try:
             portfolio = load_portfolio()
             mine = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
             if not mine:
-                try:
-                    n = restore_portfolio_from_sheets()
-                    dlog("PORTFOLIO", f"持股指令觸發 restore：{n} 檔")
-                except Exception as e:
-                    dlog("PORTFOLIO", f"即時 restore 失敗：{type(e).__name__}: {e}")
+                try: restore_portfolio_from_sheets()
+                except Exception as e: dlog("PORTFOLIO", f"即時 restore 失敗：{e}")
         except Exception as e:
-            dlog("PORTFOLIO", f"持股 pre-check 失敗：{type(e).__name__}: {e}")
+            dlog("PORTFOLIO", f"持股 pre-check 失敗：{e}")
         try:
             flex = make_portfolio_flex_carousel(user_id)
-            if flex:
-                reply_flex(event.reply_token, flex, "我的持股")
-                return
         except Exception as e:
-            dlog("PORTFOLIO", f"Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
-        try:
-            reply_text(event.reply_token, get_portfolio_summary(user_id))
-        except Exception as e:
-            dlog("PORTFOLIO", f"文字 reply 也失敗：{type(e).__name__}: {e}")
-            try: push_message(user_id, get_portfolio_summary(user_id))
-            except: pass
+            dlog("PORTFOLIO", f"build Flex 失敗：{type(e).__name__}: {e}")
+            flex = None
+        fallback = get_portfolio_summary(user_id)
+        if flex:
+            reply_flex_safe(event.reply_token, user_id, flex, "我的持股", fallback)
+        else:
+            try: reply_text(event.reply_token, fallback)
+            except: push_message(user_id, fallback)
         return
     if text=="持股文字":
         # v10.9.62 保留純文字版（debug 用）
@@ -9690,8 +9733,7 @@ def handle_message(event):
 
     # v10.9.25：可點選刪除的持股清單
     if text in ["我的持股", "持股清單"]:
-        # v10.9.72：合併為豐富卡片（含分析 + 刪除按鈕），與「持股」同一個 view
-        # v10.9.93：同 持股 — 空就即時 restore + 確保一定回應
+        # v10.9.72/93/96：同 持股 — 空就即時 restore + reply_flex_safe
         dlog("HANDLER", "→ 持股清單（合併版）")
         try:
             portfolio = load_portfolio()
@@ -9702,17 +9744,15 @@ def handle_message(event):
         except: pass
         try:
             flex = make_portfolio_flex_carousel(user_id)
-            if flex:
-                reply_flex(event.reply_token, flex, "我的持股")
-                return
         except Exception as e:
-            dlog("PORTFOLIO", f"Flex 失敗 fallback：{type(e).__name__}: {e}")
-        try:
-            reply_text(event.reply_token, get_portfolio_summary(user_id))
-        except Exception as e:
-            dlog("PORTFOLIO", f"文字 reply 也失敗：{e}")
-            try: push_message(user_id, get_portfolio_summary(user_id))
-            except: pass
+            dlog("PORTFOLIO", f"build Flex 失敗：{e}")
+            flex = None
+        fallback = get_portfolio_summary(user_id)
+        if flex:
+            reply_flex_safe(event.reply_token, user_id, flex, "我的持股", fallback)
+        else:
+            try: reply_text(event.reply_token, fallback)
+            except: push_message(user_id, fallback)
         return
 
     # v10.9.25：黑名單清單（管理者用）
