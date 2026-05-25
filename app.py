@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.103"
+VERSION              = "10.9.104"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -876,6 +876,8 @@ WAITING_BUY_IMPORT       = {}  # v10.9.83: user_id -> {"items":[{stock_id,shares
 WAITING_FEE_INPUT        = {}  # v10.9.86: user_id -> ts（5 分鐘內任何訊息當手續費輸入）
 WAITING_AI_QA = {}  # v10.9.69: user_id -> set_at_ts（AI 問答模式，5 分鐘內任何訊息當問題）
 WAITING_DELETE_SELL = {}  # v10.9.102: user_id -> {"records":[...], "ts":ts}（管理賣出紀錄）
+WAITING_RESTORE_SHARES = {}  # v10.9.104: user_id -> {"symbol","shares","cost","date","ts"}
+                              # 剛刪掉的賣出紀錄等待確認是否加回股數
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
 USER_SETTINGS_FILE = "/tmp/lumistock_user_settings.json"  # v10.9.82：手續費折數等
 NAME_CACHE         = {}
@@ -5230,6 +5232,52 @@ def read_sell_history_from_sheets(user_id: str) -> list:
         return []
 
 
+def restore_sell_to_portfolio(user_id: str, symbol: str, restored_shares: int,
+                               cost_avg: float) -> tuple:
+    """v10.9.104：刪除賣出紀錄後把股數加回持股。
+    - 若該股票還在 → shares += restored，成本均價維持原樣（賣出本來就不改均）
+    - 若該股票已全賣光不在了 → 用 cost_avg 重新建立部位
+    Returns: (new_shares, new_avg, was_existing)"""
+    portfolio = load_portfolio()
+    norm = symbol.replace(".TW", "")
+    target = None
+    for k in (_pf_key(user_id, norm), _pf_key(user_id, symbol),
+              norm, symbol, symbol + ".TW"):
+        v = portfolio.get(k)
+        if v and v.get("user_id") == user_id:
+            target = k; break
+    if target:
+        old_shares = int(portfolio[target].get("shares", 0))
+        existing_avg = float(portfolio[target].get("buy_price", cost_avg))
+        new_total = old_shares + restored_shares
+        portfolio[target] = {
+            "user_id": user_id,
+            "shares": new_total,
+            "buy_price": existing_avg,
+        }
+        was_existing = True
+        final_avg = existing_avg
+    else:
+        portfolio[_pf_key(user_id, norm)] = {
+            "user_id": user_id,
+            "shares": restored_shares,
+            "buy_price": cost_avg,
+        }
+        new_total = restored_shares
+        final_avg = cost_avg
+        was_existing = False
+    save_portfolio(portfolio)
+    try:
+        name = NAME_CACHE.get(norm, norm)
+        market = "台股" if norm.isdigit() else "美股"
+        save_portfolio_to_sheets(user_id, norm, name, market, new_total, final_avg)
+    except Exception as e:
+        dlog("PORTFOLIO", f"restore 後同步 Sheets 失敗：{type(e).__name__}: {e}")
+    dlog("PORTFOLIO",
+         f"加回 {restored_shares} 股 {symbol} → 總 {new_total} (was_existing={was_existing})")
+    return new_total, final_avg, was_existing
+
+
 def delete_sell_record_from_sheets(user_id: str, date: str, symbol: str,
                                     shares: int, price: float) -> tuple:
     """v10.9.102：刪除特定一筆賣出紀錄。
@@ -7987,9 +8035,12 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
                          ]},
                          *advice_box,
                      ]},
-            # v10.9.72：每張卡片加刪除按鈕（合併「我的持股」功能）
-            "footer": {"type": "box", "layout": "vertical", "paddingAll": "8px",
+            # v10.9.72：每張卡片加刪除按鈕；v10.9.104：加重設股數浮標按鈕
+            "footer": {"type": "box", "layout": "vertical", "spacing": "xs", "paddingAll": "8px",
                        "contents": [
+                           {"type": "button", "style": "primary", "color": "#C9B0DB", "height": "sm",
+                            "action": {"type": "postback", "label": "🔄 重設股數",
+                                       "data": f"action=reset_shares&symbol={r['symbol']}"}},
                            {"type": "button", "style": "secondary", "height": "sm",
                             "action": {"type": "postback", "label": "🗑️ 刪除這檔",
                                        "data": f"action=del_portfolio&symbol={r['symbol']}"}}
@@ -8467,6 +8518,43 @@ def handle_postback(event):
                     reply_text(event.reply_token, f"✅ 已刪除持股：{symbol}")
                 else:
                     reply_text(event.reply_token, f"❌ 找不到持股或無權限")
+            return
+
+        # v10.9.104：重設股數 — 點 [🔄 重設股數] 後彈浮標選股數
+        if action == "reset_shares":
+            symbol = params.get("symbol", "")
+            if not symbol:
+                reply_text(event.reply_token, "❌ 找不到股票代號")
+                return
+            norm = symbol.replace(".TW","") if symbol.replace(".TW","").isdigit() else symbol
+            p = load_portfolio()
+            target_data = None
+            for k in (_pf_key(user_id, norm), _pf_key(user_id, symbol),
+                      norm, symbol, symbol + ".TW"):
+                v = p.get(k)
+                if v and v.get("user_id") == user_id:
+                    target_data = v; break
+            if not target_data:
+                reply_text(event.reply_token, f"❌ 找不到 {symbol} 持股")
+                return
+            current_shares = int(target_data.get("shares", 0))
+            current_cost = float(target_data.get("buy_price", 0))
+            name = NAME_CACHE.get(norm, "")
+            # 浮標：常見股數選項
+            common = [100, 500, 1000, 2000, 3000, 5000, 10000]
+            qr = []
+            for n in common:
+                qr.append((f"{n:,} 股", f"重設股數 {norm} {n}"))
+            qr.append(("🚫 取消", "取消重設"))
+            reply_text_with_qr(event.reply_token,
+                f"🔄 重設股數 — {norm} {name}\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"目前股數：{current_shares:,}\n"
+                f"成本均價：{current_cost:,.4f}\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"點下方選新股數（成本均價保留不變）\n"
+                f"💡 想改成本：打字「重設 {norm} 股數 成本」",
+                qr[:13])
             return
 
         # 未知 action
@@ -9434,13 +9522,54 @@ def handle_message(event):
         WAITING_DELETE_SELL.pop(user_id, None)
         if ok:
             d = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
+            # v10.9.104：把該筆刪掉的紀錄 stash 起來，問使用者要不要加回股數
+            WAITING_RESTORE_SHARES[user_id] = {
+                "symbol": r["symbol"], "shares": int(r["shares"]),
+                "cost": float(r["cost"]), "date": d, "name": r.get("name",""),
+                "ts": time.time()
+            }
             reply_text_with_qr(event.reply_token,
-                f"✅ 已刪除\n{d}  {r['symbol']}  {r['pnl']:+,.0f} 元",
-                [("📈 損益分析", "損益分析"),
-                 ("🗑️ 繼續管理", "管理賣出"),
-                 ("📋 我的持股", "持股")])
+                f"✅ 已刪除這筆賣出紀錄\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"{d}  {r['symbol']} {r['name']}\n"
+                f"賣 {r['shares']:,} 股  {r['pnl']:+,.0f} 元\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"❓ 要把這 {r['shares']:,} 股加回「我的持股」嗎？\n"
+                f"（若這筆是重複紀錄、實際沒賣 → 點加回）\n"
+                f"（若這筆是真的賣了、只是改 → 點不用）",
+                [(f"✅ 加回 {r['shares']:,} 股", "加回股數"),
+                 ("🚫 不用加回", "不加回股數"),
+                 ("🗑️ 繼續管理", "管理賣出")])
         else:
             reply_text(event.reply_token, f"❌ 刪除失敗：{msg}")
+        return
+
+    # v10.9.104：使用者決定是否加回股數
+    if text == "加回股數":
+        rec = WAITING_RESTORE_SHARES.get(user_id)
+        if not rec or (time.time() - rec["ts"]) > 300:
+            reply_text(event.reply_token, "⏰ 已過期，找不到剛剛刪除的紀錄")
+            return
+        new_total, final_avg, was_existing = restore_sell_to_portfolio(
+            user_id, rec["symbol"], rec["shares"], rec["cost"])
+        WAITING_RESTORE_SHARES.pop(user_id, None)
+        action_str = "加回到既有部位" if was_existing else "重新建立部位（原已賣光）"
+        reply_text_with_qr(event.reply_token,
+            f"✅ 已加回 {rec['shares']:,} 股 {rec['symbol']} {rec['name']}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"模式：{action_str}\n"
+            f"目前總股數：{new_total:,}\n"
+            f"成本均價：{final_avg:,.4f}",
+            [("📋 我的持股", "持股"), ("📈 損益分析", "損益分析")])
+        return
+    if text == "不加回股數":
+        rec = WAITING_RESTORE_SHARES.pop(user_id, None)
+        if rec:
+            reply_text_with_qr(event.reply_token,
+                "✅ 已保留現有持股，未做加回",
+                [("📋 我的持股", "持股")])
+        else:
+            reply_text(event.reply_token, "（沒有待處理的加回）")
         return
 
     if text in ["取消管理賣出", "結束管理"]:
@@ -9740,6 +9869,58 @@ def handle_message(event):
                 "說明：\n　• 既有部位 → 自動加碼（加權平均）\n"
                 "　• 新部位 → 建立\n"
                 "　• 強制覆蓋請用「重設」")
+        return
+
+    # v10.9.104：浮標版「重設股數 代號 股數」 — 保留現有成本均價，不改 cost
+    if text.startswith("重設股數 "):
+        parts = text.split()
+        if len(parts) == 3:
+            try:
+                stock_id = parts[1].upper()
+                shares = int(parts[2])
+                if shares <= 0:
+                    raise ValueError("shares must be > 0")
+                norm = stock_id.replace(".TW", "")
+                p = load_portfolio()
+                target = None
+                for k in (_pf_key(user_id, norm), _pf_key(user_id, stock_id),
+                          norm, stock_id, stock_id + ".TW"):
+                    v = p.get(k)
+                    if v and v.get("user_id") == user_id:
+                        target = k; break
+                if not target:
+                    reply_text(event.reply_token,
+                        f"❌ 找不到 {norm} 持股\n（沒持有的話請用「新增」）")
+                    return
+                old_shares = int(p[target].get("shares", 0))
+                cost_avg = float(p[target].get("buy_price", 0))
+                # 統一搬到複合 key + 寫入
+                if target != _pf_key(user_id, norm):
+                    p.pop(target, None)
+                p[_pf_key(user_id, norm)] = {
+                    "user_id": user_id, "shares": shares, "buy_price": cost_avg,
+                }
+                save_portfolio(p)
+                # 同步 Sheets
+                try:
+                    name = NAME_CACHE.get(norm, norm)
+                    market = "台股" if norm.isdigit() else "美股"
+                    save_portfolio_to_sheets(user_id, norm, name, market, shares, cost_avg)
+                except Exception as e:
+                    dlog("PORTFOLIO", f"重設股數同步 Sheets 失敗：{e}")
+                reply_text_with_qr(event.reply_token,
+                    f"🔄 重設成功（成本均價未變動）\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"　{norm} {NAME_CACHE.get(norm,'')}\n"
+                    f"　{old_shares:,} 股 → {shares:,} 股\n"
+                    f"　成本均價 {cost_avg:,.4f}",
+                    [("📋 我的持股", "持股")])
+            except Exception:
+                reply_text(event.reply_token,
+                    "❌ 格式錯誤\n範例：重設股數 2330 1000")
+        return
+    if text == "取消重設":
+        reply_text(event.reply_token, "✅ 已取消重設，未做變更")
         return
 
     # v10.9.84：「重設」明確強制覆蓋既有部位（少用，用於資料錯誤想重設）
