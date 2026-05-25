@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.99"
+VERSION              = "10.9.100"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5557,6 +5557,14 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
 
     save_portfolio(portfolio)
     save_sell_to_sheets(user_id, norm, name, sell_shares, sell_price, cost_avg, realized_pnl)
+    # v10.9.100：賣出後也要把「自選股」分頁同步到新股數！
+    # 否則 Render 重啟 → restore 從 Sheets 讀回舊的股數 → 賣出像沒發生
+    # （append 新一筆，restore 取每個 key 的最後一筆，所以新狀態會勝出）
+    try:
+        market = "台股" if norm.isdigit() else "美股"
+        save_portfolio_to_sheets(user_id, norm, name, market, remaining, cost_avg)
+    except Exception as e:
+        dlog("PORTFOLIO", f"賣出後同步「自選股」失敗：{type(e).__name__}: {e}")
 
     sign = "🟢 賺" if realized_pnl >= 0 else "🔴 虧"
     pct = realized_pnl / cost_total * 100 if cost_total else 0
