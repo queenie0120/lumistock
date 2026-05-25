@@ -1,6 +1,28 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.93（修兩個 regression：持股消失 + 手續費還是 60%）
+LINE Bot 模組 v10.9.94（持股排序 + OCR 按視覺順序）
+
+【v10.9.94 更新】
+使用者反映：「我的持股不能按照我原本傳給你的順序嗎？還是他會自動換位置？」
+
+說明：系統原本就保留 dict 插入順序（custom），但兩個地方會造成順序看起來不對：
+1. OCR 不一定按截圖視覺由上到下吐 items
+2. 沒提供使用者主動排序選項
+
+改動：
+1. OCR prompt 加最後一條：
+   「★ items 陣列順序：嚴格按圖片中視覺由上到下的順序輸出」
+2. 新增 get_user_portfolio_sort / set_user_portfolio_sort
+   存在 USER_SETTINGS（/tmp + 不寫 Sheets，個人偏好不必跨裝置同步）
+   選項：custom（預設）/ symbol / net_profit / pct
+3. make_portfolio_flex_carousel 末段加 rows.sort()，照 sort_mode 排
+4. 總覽 bubble body 多顯示「排序：xxx」一行
+5. 總覽 bubble footer 加 [📐 變更排序] 浮標
+6. 新增「排序持股」/「持股排序」/「排序」指令 → 4 個浮標：
+   [📋 自訂順序] [🔢 按代號] [💰 按淨損益] [📈 按漲跌幅]
+7. 各排序確認指令選完後直接回新排序的 carousel
+
+【v10.9.93】修兩個 regression：持股消失 + 手續費還是 60%
 
 【v10.9.93 更新】
 使用者反映：
@@ -790,7 +812,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.93"
+VERSION              = "10.9.94"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3372,6 +3394,21 @@ def get_user_fee_discount(user_id: str) -> float:
         return max(0.1, min(1.0, d))
     except: return DEFAULT_FEE_DISCOUNT
 
+# v10.9.94：持股排序方式（記憶體 + 寫 /tmp，不必同步 Sheets）
+PORTFOLIO_SORT_OPTIONS = ("custom", "symbol", "net_profit", "pct")
+def get_user_portfolio_sort(user_id: str) -> str:
+    s = USER_SETTINGS.get(user_id, {})
+    v = s.get("portfolio_sort", "custom")
+    return v if v in PORTFOLIO_SORT_OPTIONS else "custom"
+
+def set_user_portfolio_sort(user_id: str, sort: str) -> None:
+    if sort not in PORTFOLIO_SORT_OPTIONS:
+        sort = "custom"
+    s = USER_SETTINGS.setdefault(user_id, {})
+    s["portfolio_sort"] = sort
+    _save_user_settings(USER_SETTINGS)
+    dlog("SETTINGS", f"持股排序：{user_id[-6:]} = {sort}")
+
 def set_user_fee_discount(user_id: str, discount: float) -> None:
     s = USER_SETTINGS.setdefault(user_id, {})
     s["fee_discount"] = round(float(discount), 4)
@@ -4926,6 +4963,7 @@ def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
 - 看不清楚的整筆略過
 - 只回純 JSON，不要 markdown、不要其他文字
 - 忽略「委託中」「部份成交（未完成）」等未實際成交的列
+- ★ items 陣列順序：嚴格按「圖片中視覺由上到下」的順序輸出（v10.9.94 要求）
 """
 
     payload = {
@@ -7669,10 +7707,27 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
         total_cost += cost
     total_pct = (total_net_profit / total_cost * 100) if total_cost else 0
 
+    # v10.9.94：套用使用者選定的排序方式（custom 即原插入順序，不動）
+    sort_mode = get_user_portfolio_sort(user_id)
+    if sort_mode == "symbol":
+        # 台股代號數字優先，美股代號字母接後面
+        def _sort_key(r):
+            sid = r["sid"]
+            return (0, int(sid)) if sid.isdigit() else (1, sid)
+        rows.sort(key=_sort_key)
+    elif sort_mode == "net_profit":
+        rows.sort(key=lambda r: r["profit"], reverse=True)  # 賺最多在前
+    elif sort_mode == "pct":
+        rows.sort(key=lambda r: r["pct"], reverse=True)
+    # else "custom" → 不動，維持 dict insertion order
+
     bubbles = []
     # Overview bubble — v10.9.92：用「淨損益」（扣賣出費稅）為主數字
     is_up = total_net_profit >= 0
     overview_color = "#D97A5C" if is_up else "#7AABBE"
+    # v10.9.94：排序狀態（給卡片底部顯示）
+    sort_label = {"custom":"自訂順序", "symbol":"代號", "net_profit":"淨損益",
+                  "pct":"漲跌幅"}.get(sort_mode, "自訂順序")
     bubbles.append({
         "type": "bubble", "size": "kilo",
         "header": {"type": "box", "layout": "vertical",
@@ -7706,9 +7761,23 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
                           "size": "xxs", "color": "#7AABBE", "align": "end", "flex": 3},
                      ]},
                      {"type": "separator", "color": "#E8C4B4"},
+                     {"type": "box", "layout": "horizontal", "contents": [
+                         {"type": "text", "text": "排序", "size": "xxs",
+                          "color": "#9B6B5A", "flex": 2},
+                         {"type": "text", "text": sort_label,
+                          "size": "xxs", "color": "#A05A48", "weight": "bold",
+                          "align": "end", "flex": 3},
+                     ]},
                      {"type": "text", "text": "⚠ 系統建議僅供參考，非投資建議",
                       "size": "xxs", "color": "#C9A89A", "align": "center", "margin": "sm"},
                  ]},
+        # v10.9.94：總覽 bubble footer 加排序浮標（一鍵切換）
+        "footer": {"type": "box", "layout": "vertical", "spacing": "xs", "paddingAll": "6px",
+                   "contents": [
+                       {"type": "button", "style": "secondary", "height": "sm",
+                        "action": {"type": "message", "label": "📐 變更排序",
+                                   "text": "排序持股"}},
+                   ]},
     })
 
     # 每檔股票一張卡
@@ -9332,6 +9401,47 @@ def handle_message(event):
         except Exception as e:
             reply_text(event.reply_token, f"診斷失敗：{type(e).__name__}: {e}")
         return
+    # v10.9.94：持股排序選單
+    if text in ["排序持股", "持股排序", "排序"]:
+        current = get_user_portfolio_sort(user_id)
+        cur_label = {"custom":"自訂順序（匯入/新增順序）",
+                     "symbol":"按代號（小→大）",
+                     "net_profit":"按淨損益（多→少）",
+                     "pct":"按漲跌幅（高→低）"}.get(current, "自訂順序")
+        reply_text_with_qr(event.reply_token,
+            f"📐 持股排序\n━━━━━━━━━━━━━━\n"
+            f"目前：{cur_label}\n\n"
+            f"點下方浮標切換：",
+            [("📋 自訂順序", "排序 自訂"),
+             ("🔢 按代號", "排序 代號"),
+             ("💰 按淨損益", "排序 淨損益"),
+             ("📈 按漲跌幅", "排序 漲跌幅")])
+        return
+    # 各排序確認
+    _sort_map = {
+        "排序 自訂": "custom", "排序自訂": "custom",
+        "排序 代號": "symbol", "排序代號": "symbol",
+        "排序 淨損益": "net_profit", "排序淨損益": "net_profit", "排序損益": "net_profit",
+        "排序 漲跌幅": "pct", "排序漲跌幅": "pct", "排序漲幅": "pct",
+    }
+    if text in _sort_map:
+        mode = _sort_map[text]
+        set_user_portfolio_sort(user_id, mode)
+        label = {"custom":"自訂順序", "symbol":"代號小→大",
+                 "net_profit":"淨損益多→少", "pct":"漲跌幅高→低"}[mode]
+        # 直接回 Flex carousel（用新排序）
+        try:
+            flex = make_portfolio_flex_carousel(user_id)
+            if flex:
+                reply_flex(event.reply_token, flex, f"我的持股 — {label}")
+                return
+        except Exception as e:
+            dlog("PORTFOLIO", f"排序後 Flex 失敗：{type(e).__name__}: {e}")
+        reply_text_with_qr(event.reply_token,
+            f"✅ 排序已切到「{label}」",
+            [("📋 我的持股", "持股")])
+        return
+
     if text in ["強制restore持股", "強制 restore", "強制restore"]:
         try:
             n = restore_portfolio_from_sheets()
