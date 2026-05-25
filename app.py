@@ -1,6 +1,27 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.79（未註冊者全面阻擋所有功能）
+LINE Bot 模組 v10.9.80（觀察清單專業 AI 分析）
+
+【v10.9.80 更新】
+使用者要求：推薦股要給出專業分析原因及理由。
+
+新增：
+1. ai_analyze_top_picks_batch(stocks, mkt)：批次 Groq 分析 top 5 候選股
+   - 一次 API call 處理 5 檔，節省配額
+   - 嚴格 grounding：只能根據資料分析，不可編造
+   - 用詞合規：禁「建議買進賣出/保證/明牌」，改「偏多/觀察重點/留意」
+   - 輸出 JSON：reason / tech / chip / news / style / risk / confidence
+2. build_and_push_recommendation 整合 AI 分析 + 計算支撐/壓力/停損/目標
+   - 支撐 = 近 60 天最低點；壓力 = 近 60 天最高點
+   - 停損 = 支撐 × 0.95；目標 = 壓力 × 1.05
+3. make_rec_card 完整重設計：
+   - 入選理由（AI 寫的具體 1 句）
+   - 三面觀察：技術/籌碼/消息（AI 寫的）
+   - 價位區間：支撐/壓力/停損/目標
+   - 風險提醒（AI）+ 適合操作風格 + AI 信心
+   - 評分條 + 免責聲明
+
+【v10.9.79】未註冊者全面阻擋
 
 【v10.9.79 更新】
 使用者：未註冊的人完全不能點擊功能，不是只有查股票無法使用。
@@ -489,7 +510,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.79"
+VERSION              = "10.9.80"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5970,11 +5991,23 @@ def get_market_summary()->str:
 #  觀察清單 Flex
 # ══════════════════════════════════════════
 def make_rec_card(rank:int, s:dict)->dict:
+    """v10.9.80：觀察清單卡片 — AI 深度分析版。"""
     is_up=s["pct"]>=0; color="#D97A5C" if is_up else "#7AABBE"
     arrow="▲" if is_up else "▼"; pct_str=f"{arrow} {abs(s['pct']):.2f}%"
     filled=s["score"]//10; bar="█"*filled+"░"*(10-filled)
-    tech_sig="　".join(s.get("tech_signals",[])[:2]) or "--"
-    chip_sig="　".join(s.get("chip_signals",[])[:2]) or "--"
+    ai = s.get("ai") or {}
+    # AI 分析 fallback：若 AI 未回，用 signals 拼湊
+    reason = ai.get("reason") or "—（AI 分析暫缺）"
+    tech_txt = ai.get("tech") or ("、".join(s.get("tech_signals",[])[:3]) or "—")
+    chip_txt = ai.get("chip") or ("、".join(s.get("chip_signals",[])[:3]) or "—")
+    news_txt = ai.get("news") or s.get("sentiment","中性")
+    style = ai.get("style", "波段")
+    risk = ai.get("risk") or "短線波動仍需留意大盤與國際雜訊"
+    confidence = ai.get("confidence", "中")
+    # 價位區間（v10.9.80 新增）
+    sl = s.get("stop_loss"); tg = s.get("target")
+    sup = s.get("support"); res = s.get("resistance")
+    has_levels = bool(sl and tg)
     return {
         "type":"bubble","size":"mega",
         "header":{"type":"box","layout":"horizontal","backgroundColor":"#E89B82","paddingAll":"12px",
@@ -5984,32 +6017,60 @@ def make_rec_card(rank:int, s:dict)->dict:
                 {"type":"box","layout":"vertical","flex":1,"paddingStart":"10px",
                  "contents":[
                      {"type":"text","text":f"{s['sid']} {s['name']}","size":"md","color":"#FFFFFF","weight":"bold","wrap":True},
-                     {"type":"text","text":s.get("category","綜合評估"),"size":"xs","color":"#F0D0C0"}
+                     {"type":"text","text":f"{s.get('category','綜合')} ‧ 適合 {style}","size":"xs","color":"#F0D0C0"}
                  ]}
             ]},
         "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"12px","spacing":"sm",
             "contents":[
+                # 價格 + 漲跌
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":f"{s['price']:.2f}","size":"xxl","weight":"bold","color":color,"flex":1},
                     {"type":"text","text":pct_str,"size":"sm","color":color,"align":"end","flex":1,"gravity":"bottom"}
                 ]},
                 {"type":"separator","color":"#E8C4B4"},
-                {"type":"box","layout":"horizontal","spacing":"xs","contents":[
-                    {"type":"text","text":"📊 技術","size":"xxs","color":"#9B6B5A","flex":2},
-                    {"type":"text","text":tech_sig,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
-                ]},
-                {"type":"box","layout":"horizontal","spacing":"xs","contents":[
-                    {"type":"text","text":"💰 籌碼","size":"xxs","color":"#9B6B5A","flex":2},
-                    {"type":"text","text":chip_sig,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
-                ]},
-                {"type":"box","layout":"horizontal","spacing":"xs","contents":[
-                    {"type":"text","text":"📰 新聞","size":"xxs","color":"#9B6B5A","flex":2},
-                    {"type":"text","text":s.get("sentiment","中性"),"size":"xxs","color":"#5B4040","flex":5}
-                ]},
+                # 入選理由（AI）
+                {"type":"text","text":"💡 入選理由","size":"xxs","color":"#A05A48","weight":"bold"},
+                {"type":"text","text":reason,"size":"xs","color":"#5B4040","wrap":True},
                 {"type":"separator","color":"#E8C4B4"},
+                # 三面觀察（AI）
+                {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"📊 技術","size":"xxs","color":"#9B6B5A","flex":2},
+                        {"type":"text","text":tech_txt,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
+                    ]},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"💰 籌碼","size":"xxs","color":"#9B6B5A","flex":2},
+                        {"type":"text","text":chip_txt,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
+                    ]},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"📰 消息","size":"xxs","color":"#9B6B5A","flex":2},
+                        {"type":"text","text":news_txt,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
+                    ]},
+                ]},
+                # 支撐 / 壓力 / 停損 / 目標
+                *([{"type":"separator","color":"#E8C4B4"},
+                   {"type":"text","text":"📍 價位區間（近 60 天）","size":"xxs","color":"#A05A48","weight":"bold"},
+                   {"type":"box","layout":"horizontal","contents":[
+                       {"type":"text","text":"支撐","size":"xxs","color":"#9B6B5A","flex":1},
+                       {"type":"text","text":f"{sup:.0f}","size":"xxs","color":"#5B8DB8","flex":2,"weight":"bold"},
+                       {"type":"text","text":"壓力","size":"xxs","color":"#9B6B5A","flex":1},
+                       {"type":"text","text":f"{res:.0f}","size":"xxs","color":"#D97A5C","flex":2,"weight":"bold","align":"end"},
+                   ]},
+                   {"type":"box","layout":"horizontal","contents":[
+                       {"type":"text","text":"停損","size":"xxs","color":"#9B6B5A","flex":1},
+                       {"type":"text","text":f"{sl:.0f}","size":"xxs","color":"#7AABBE","flex":2,"weight":"bold"},
+                       {"type":"text","text":"目標","size":"xxs","color":"#9B6B5A","flex":1},
+                       {"type":"text","text":f"{tg:.0f}","size":"xxs","color":"#E89B82","flex":2,"weight":"bold","align":"end"},
+                   ]}] if has_levels else []),
+                # 風險
+                {"type":"separator","color":"#E8C4B4"},
+                {"type":"box","layout":"horizontal","backgroundColor":"#FAE6DE","cornerRadius":"6px","paddingAll":"6px","contents":[
+                    {"type":"text","text":f"⚠ {risk}","size":"xxs","color":"#A05A48","wrap":True}
+                ]},
+                # 評分 + AI 信心
                 {"type":"box","layout":"horizontal","contents":[
-                    {"type":"text","text":"評分","size":"xxs","color":"#9B6B5A","flex":1},
-                    {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#E89B82","weight":"bold","flex":5}
+                    {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#E89B82","weight":"bold","flex":3},
+                    {"type":"text","text":f"AI 信心 {confidence}","size":"xxs","color":"#9B6B5A","align":"end","flex":2}
                 ]},
                 {"type":"text","text":"⚠ 僅供參考，非投資建議","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"}
             ]}
@@ -6055,6 +6116,83 @@ def make_rec_flex(scored:list, mkt:dict, source_note:str)->dict:
     bubbles=[overview]+[make_rec_card(i+1,s) for i,s in enumerate(scored[:5])]
     return {"type":"carousel","contents":bubbles}
 
+def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
+    """v10.9.80：批次 AI 分析 top 5 候選股，回傳 {sid: {reason, tech, chip, news, style, risk, confidence}}
+    一次 Groq call 處理 5 檔，節省 API 配額。
+    嚴格 grounding：只能根據提供的資料分析，不可編造。
+    """
+    if not GROQ_AVAILABLE or not stocks:
+        return {}
+    # 組資料區
+    lines = [f"【市場狀態】{mkt.get('str', '')}", "", "【候選股資料】"]
+    for i, s in enumerate(stocks, 1):
+        tech_sig = "、".join(s.get("tech_signals", [])[:3]) or "--"
+        chip_sig = "、".join(s.get("chip_signals", [])[:3]) or "--"
+        news_titles = "、".join([t for t, _ in s.get("news_list", [])[:3]]) or "--"
+        rng_str = ""
+        if s.get("support") and s.get("resistance"):
+            rng_str = f" 近 60 天區間 {s['support']:.0f}-{s['resistance']:.0f}"
+        lines.append(f"{i}. {s['sid']} {s['name']}")
+        lines.append(f"   現價 {s['price']:.2f}（{s['pct']:+.2f}%）{rng_str}")
+        lines.append(f"   技術訊號：{tech_sig}")
+        lines.append(f"   籌碼訊號：{chip_sig}")
+        lines.append(f"   近期新聞標題：{news_titles}")
+        lines.append(f"   分類：{s.get('category', '綜合')}　評分 {s.get('score', 0)}/100")
+    data_block = "\n".join(lines)
+
+    system_prompt = """你是台股觀察清單分析師。對每檔候選股做專業觀察分析。
+
+【最高原則：不可編造】
+- 只能根據「候選股資料」分析，不可虛構數字、新聞、財報。
+- 資料不足就說「資料不足」。
+
+【用詞合規】
+- 禁用：建議買進、建議賣出、保證、明牌、必賺、一定漲跌
+- 改用：偏多、偏空、觀察重點、需留意、可考慮觀察
+- 不預測股價。
+
+【輸出格式：純 JSON array，沒有 markdown 包裝】
+[
+  {
+    "sid": "2330",
+    "reason": "入選理由 1 句（為何在觀察清單，需具體）",
+    "tech": "技術面觀察 1-2 句",
+    "chip": "籌碼面觀察 1-2 句",
+    "news": "消息面觀察 1 句",
+    "style": "短線/波段/長期 其中一種",
+    "risk": "主要風險 1 句",
+    "confidence": "高/中/低"
+  },
+  ...
+]
+
+順序需與輸入相同。每欄位簡潔但具體，避免空泛。
+"""
+    user_msg = data_block + "\n\n請依規則輸出每檔的分析（JSON array）。"
+    answer = groq_chat(
+        messages=[{"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_msg}],
+        max_tokens=2500, temperature=0.3, timeout=30)
+    if not answer:
+        return {}
+    # 嘗試解析 JSON
+    try:
+        cleaned = re.sub(r"^```(?:json)?\s*", "", answer.strip())
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        arr = json.loads(cleaned)
+        if not isinstance(arr, list):
+            return {}
+        out = {}
+        for item in arr:
+            if isinstance(item, dict) and item.get("sid"):
+                out[str(item["sid"])] = item
+        dlog("REC", f"AI 批次分析：{len(out)} 檔 OK")
+        return out
+    except Exception as e:
+        dlog("REC", f"AI 分析 JSON 解析失敗：{e} / raw={answer[:200]}")
+        return {}
+
+
 def build_and_push_recommendation(user_id:str):
     try:
         mkt=get_market_status()
@@ -6076,14 +6214,35 @@ def build_and_push_recommendation(user_id:str):
             nl=get_tw_stock_news(sid,tw["name"],count=3); sentiment=analyze_news_sentiment(nl)
             ts=tech["score"]+chip["score"]+sentiment["score"]
             if not mkt["ok"]: ts=int(ts*0.8)
-            scored.append({"sid":sid,"name":tw["name"],"price":tw["price"],"pct":tw["pct"],
-                           "sentiment":sentiment["label"],"tech_signals":tech.get("signals",[]),
-                           "chip_signals":chip.get("signals",[]),"category":classify_stock(tech,chip,tw["pct"]),
-                           "score":ts,"support":"--","resistance":"--","stop_loss":"--"})
+            # v10.9.80：加支撐壓力停損目標（從近 60 天動態範圍）
+            support = resistance = stop_loss = target = None
+            try:
+                if closes and len(closes) >= 5:
+                    recent = closes[-60:]
+                    lo, hi = min(recent), max(recent)
+                    support, resistance = lo, hi
+                    stop_loss = lo * 0.95
+                    target    = hi * 1.05
+            except: pass
+            scored.append({
+                "sid": sid, "name": tw["name"], "price": tw["price"], "pct": tw["pct"],
+                "sentiment": sentiment["label"],
+                "tech_signals": tech.get("signals", []),
+                "chip_signals": chip.get("signals", []),
+                "news_list": nl,
+                "category": classify_stock(tech, chip, tw["pct"]),
+                "score": ts,
+                "support": support, "resistance": resistance,
+                "stop_loss": stop_loss, "target": target,
+            })
         scored.sort(key=lambda x:x["score"],reverse=True)
         top5=scored[:5]
         if not top5:
             push_message(user_id,"⭐ 觀察清單\n━━━━━━━━━━━━━━\n　目前無符合條件個股"); return
+        # v10.9.80：AI 批次分析 top5
+        ai_map = ai_analyze_top_picks_batch(top5, mkt)
+        for s in top5:
+            s["ai"] = ai_map.get(s["sid"], {})
         push_flex(user_id,make_rec_flex(top5,mkt,source_note),"慧股觀察榜")
     except Exception as e:
         dlog("REC", f"觀察清單運算失敗：{e}")
