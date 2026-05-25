@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.98"
+VERSION              = "10.9.99"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -8360,8 +8360,9 @@ def reply_flex_with_qr(reply_token, flex_content, alt_text, qr_items):
                     contents=FlexContainer.from_dict(flex_content),
                     quick_reply=qr)]))
 
-def reply_flex_safe(reply_token, user_id, flex_content, alt_text, fallback_text):
+def reply_flex_safe(reply_token, user_id, flex_content, alt_text, fallback_text, qr_items=None):
     """v10.9.96：穩健的 Flex 回覆 — 三層 fallback 防 silent fail。
+    v10.9.99：加 qr_items 參數，可附 Quick Reply 浮標（不改 Flex 結構）。
     Why: reply_flex 一旦呼到 LINE API，reply_token 就可能被消耗。
          所以結構錯就用 reply_text，已消耗 token 就用 push_message。
     Returns: True 成功，False 全部失敗。"""
@@ -8371,16 +8372,22 @@ def reply_flex_safe(reply_token, user_id, flex_content, alt_text, fallback_text)
     except Exception as e:
         dlog("FLEX", f"本地驗證失敗 → reply_text fallback：{type(e).__name__}: {str(e)[:200]}")
         try:
-            reply_text(reply_token, fallback_text)
+            if qr_items:
+                reply_text_with_qr(reply_token, fallback_text, qr_items)
+            else:
+                reply_text(reply_token, fallback_text)
             return False
         except Exception as e2:
             dlog("FLEX", f"reply_text 也失敗 → push：{e2}")
             try: push_message(user_id, fallback_text)
             except: pass
             return False
-    # Step 2：reply_flex
+    # Step 2：reply_flex（含 Quick Reply 版本）
     try:
-        reply_flex(reply_token, flex_content, alt_text)
+        if qr_items:
+            reply_flex_with_qr(reply_token, flex_content, alt_text, qr_items)
+        else:
+            reply_flex(reply_token, flex_content, alt_text)
         return True
     except Exception as e:
         dlog("FLEX", f"LINE API 拒絕 Flex → push fallback：{type(e).__name__}: {str(e)[:200]}")
@@ -9592,10 +9599,12 @@ def handle_message(event):
             dlog("PORTFOLIO", f"build Flex 失敗：{type(e).__name__}: {e}")
             flex = None
         fallback = get_portfolio_summary(user_id)
+        # v10.9.99：附 Quick Reply 浮標讓你不用打字也能切換排序
+        qr = [("📐 排序", "排序持股"), ("📊 損益分析", "損益分析")]
         if flex:
-            reply_flex_safe(event.reply_token, user_id, flex, "我的持股", fallback)
+            reply_flex_safe(event.reply_token, user_id, flex, "我的持股", fallback, qr)
         else:
-            try: reply_text(event.reply_token, fallback)
+            try: reply_text_with_qr(event.reply_token, fallback, qr)
             except: push_message(user_id, fallback)
         return
     if text=="持股文字":
@@ -9702,10 +9711,12 @@ def handle_message(event):
             dlog("PORTFOLIO", f"build Flex 失敗：{e}")
             flex = None
         fallback = get_portfolio_summary(user_id)
+        # v10.9.99：同 持股 — 附 Quick Reply 浮標
+        qr = [("📐 排序", "排序持股"), ("📊 損益分析", "損益分析")]
         if flex:
-            reply_flex_safe(event.reply_token, user_id, flex, "我的持股", fallback)
+            reply_flex_safe(event.reply_token, user_id, flex, "我的持股", fallback, qr)
         else:
-            try: reply_text(event.reply_token, fallback)
+            try: reply_text_with_qr(event.reply_token, fallback, qr)
             except: push_message(user_id, fallback)
         return
 
