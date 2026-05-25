@@ -1,6 +1,31 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.94（持股排序 + OCR 按視覺順序）
+LINE Bot 模組 v10.9.95（賣出紀錄持久化修復 + 損益分析卡片）
+
+【v10.9.95 更新】
+使用者反映：
+1. 剛賣完 6742，損益分析卻顯示「尚無賣出紀錄」
+2. 損益分析可以用卡片方式呈現嗎？
+
+Root cause：
+- save_sell_to_sheets 用 get_sheet("賣出紀錄")，分頁不存在回 None 直接 silent skip
+  （和 v10.9.90 的「使用者設定」分頁同種 bug）
+- read_sell_history_from_sheets 也用 get_sheet + rows[1:] 跳 header
+  → header 寫失敗時資料被當 header 跳掉
+
+改動：
+1. save_sell_to_sheets 改用 get_or_create_sheet（自動建分頁 + 寫 header）
+   失敗有 dlog，不再 silent
+2. read_sell_history_from_sheets：
+   - 改用 get_or_create_sheet
+   - 不再 rows[1:]，改用「row[1] 以 U 開頭 + len>=30」識別有效列
+3. 新增 make_pnl_analysis_flex(user_id) carousel：
+   - Bubble 1（總覽，薰衣草粉）：已實現 + 未實現分區顯示 + 警語
+   - Bubble 2（已實現，依正負紅藍）：最近 10 筆細節 + 合計
+   - Bubble 3（未實現，依正負紅藍）：每檔淨損益（毛/費稅/淨/%）
+4. 損益分析 handler 三層 fallback：Flex → reply 文字 → push 文字
+
+【v10.9.94】持股排序 + OCR 按視覺順序
 
 【v10.9.94 更新】
 使用者反映：「我的持股不能按照我原本傳給你的順序嗎？還是他會自動換位置？」
@@ -812,7 +837,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.94"
+VERSION              = "10.9.95"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5138,18 +5163,25 @@ def analyze_portfolio_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
 
 def read_sell_history_from_sheets(user_id: str) -> list:
     """v10.9.85：讀 Sheets「賣出紀錄」分頁，取該使用者所有賣出紀錄。
-    欄位順序（append_row 寫入時）：時間、用戶ID、代號、名稱、賣股數、賣價、成本均價、已實現損益
-    回傳 [{date, symbol, name, shares, price, cost, pnl}, ...]，依時間 desc 排序。
+    欄位順序：時間、用戶ID、代號、名稱、賣股數、賣價、成本均價、已實現損益
+    v10.9.95：分頁不存在自動建立；不再 rows[1:] 無腦跳 header
+              （header 寫入失敗時會把使用者第一筆當 header 跳掉）
+              改用「row[1] 以 U 開頭且 row[7] 可轉 float」識別有效列。
     """
     try:
-        sheet = get_sheet("賣出紀錄")
+        sheet = get_or_create_sheet("賣出紀錄",
+                                    headers=["時間","用戶ID","代號","名稱",
+                                             "股數","賣價","成本均價","已實現損益"])
         if not sheet: return []
         rows = sheet.get_all_values()
-        if not rows or len(rows) < 2: return []
+        if not rows: return []
         out = []
-        for row in rows[1:]:
+        for row in rows:
             if len(row) < 8: continue
-            if str(row[1]).strip() != user_id: continue
+            uid = str(row[1]).strip()
+            if not uid.startswith("U") or len(uid) < 30:
+                continue
+            if uid != user_id: continue
             try:
                 out.append({
                     "date": (row[0] or "").strip(),
@@ -5164,7 +5196,7 @@ def read_sell_history_from_sheets(user_id: str) -> list:
         out.sort(key=lambda r: r["date"], reverse=True)
         return out
     except Exception as e:
-        dlog("PORTFOLIO", f"讀賣出紀錄失敗：{e}")
+        dlog("PORTFOLIO", f"讀賣出紀錄失敗：{type(e).__name__}: {e}")
         return []
 
 
@@ -5245,16 +5277,205 @@ def format_pnl_analysis(user_id: str) -> str:
     return "\n".join(lines)
 
 
+def make_pnl_analysis_flex(user_id: str) -> dict:
+    """v10.9.95：損益分析 Flex carousel。
+    結構：
+      Bubble 1（總覽 mega）：已實現 + 未實現 + 警語
+      Bubble 2（已實現 mega）：最近 N 筆賣出 + 合計
+      Bubble 3（未實現 mega）：目前持股每檔淨損益 + 合計
+    """
+    realized = read_sell_history_from_sheets(user_id)
+    portfolio = load_portfolio()
+    up = {k: v for k, v in portfolio.items() if v.get("user_id") == user_id}
+
+    # ── 已實現 ──
+    total_realized = sum(r["pnl"] for r in realized) if realized else 0
+
+    # ── 未實現（用淨損益，扣賣出費稅）──
+    unreal_rows = []
+    total_unreal = 0
+    for k, data in up.items():
+        symbol = _pf_symbol(k); sid = symbol.replace(".TW","")
+        try:
+            if sid.isdigit():
+                tw = get_tw_stock(sid)
+                price = tw["price"] if tw else 0
+                name = tw["name"] if tw else sid
+            else:
+                us = get_us_stock(symbol)
+                price = us["price"] if us else 0
+                name = us["name"] if us else symbol
+        except:
+            price = 0; name = sid
+        shares = int(data.get("shares", 0))
+        bp = float(data.get("buy_price", 0))
+        if price > 0 and bp > 0:
+            gross = (price - bp) * shares
+            if sid.isdigit():
+                fee, tax = calc_sell_fee_tax(price, shares, user_id)
+            else:
+                fee, tax = 0, 0
+            net = gross - fee - tax
+            pct = (net / (bp * shares) * 100) if bp*shares else 0
+            unreal_rows.append({
+                "sid": sid, "name": name, "shares": shares,
+                "bp": bp, "price": price,
+                "gross": gross, "fee_tax": fee+tax, "net": net, "pct": pct
+            })
+            total_unreal += net
+
+    bubbles = []
+
+    # ── Bubble 1：總覽 ──
+    r_color = "#D97A5C" if total_realized >= 0 else "#7AABBE"
+    r_sign = "🟢" if total_realized >= 0 else "🔴"
+    u_color = "#D97A5C" if total_unreal >= 0 else "#7AABBE"
+    u_sign = "🟢" if total_unreal >= 0 else "🔴"
+    bubbles.append({
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#C9B0DB","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"📈 損益分析","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":f"{now_taipei().strftime('%m/%d %H:%M')} ‧ 已實現 vs 未實現",
+                 "size":"xxs","color":"#FDF6F0","margin":"xs"}
+            ]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"16px","spacing":"md",
+            "contents":[
+                # 已實現
+                {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                    {"type":"text","text":"📕 已實現（賣出紀錄）","size":"xs","color":"#9B6B5A","weight":"bold"},
+                    {"type":"text","text":f"{r_sign} {total_realized:+,.0f} 元",
+                     "size":"xl","color":r_color,"weight":"bold"},
+                    {"type":"text","text":f"{len(realized)} 筆","size":"xxs","color":"#A07560"},
+                ]},
+                {"type":"separator","color":"#E8C4B4"},
+                # 未實現
+                {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                    {"type":"text","text":"📘 未實現（目前持股淨）","size":"xs","color":"#9B6B5A","weight":"bold"},
+                    {"type":"text","text":f"{u_sign} {total_unreal:+,.0f} 元",
+                     "size":"xl","color":u_color,"weight":"bold"},
+                    {"type":"text","text":f"{len(unreal_rows)} 檔","size":"xxs","color":"#A07560"},
+                ]},
+                {"type":"separator","color":"#E8C4B4"},
+                {"type":"text","text":"⚠ 已實現 / 未實現分開計算，不合計",
+                 "size":"xxs","color":"#C9A89A","align":"center","margin":"sm","wrap":True},
+                {"type":"text","text":"未實現＝若現在賣出可拿回的淨損益",
+                 "size":"xxs","color":"#C9A89A","align":"center","wrap":True},
+            ]},
+    })
+
+    # ── Bubble 2：已實現詳細 ──
+    realized_contents = [
+        {"type":"text","text":f"合計 {len(realized)} 筆",
+         "size":"sm","color":"#5B4040","weight":"bold"},
+        {"type":"text","text":f"{r_sign} {total_realized:+,.0f} 元",
+         "size":"xl","color":r_color,"weight":"bold","margin":"xs"},
+        {"type":"separator","color":"#E8C4B4","margin":"md"},
+    ]
+    if not realized:
+        realized_contents.append({"type":"text","text":"（尚無賣出紀錄）",
+            "size":"sm","color":"#A07560","margin":"md","align":"center"})
+    else:
+        for r in realized[:10]:
+            sign = "🟢" if r["pnl"] >= 0 else "🔴"
+            sc = "#D97A5C" if r["pnl"] >= 0 else "#7AABBE"
+            d_short = r["date"][:10] if len(r["date"]) >= 10 else r["date"]
+            realized_contents.append({"type":"box","layout":"vertical","margin":"sm","contents":[
+                {"type":"text",
+                 "text":f"{d_short}　{r['symbol']} {r['name']}".rstrip(),
+                 "size":"xs","color":"#5B4040","weight":"bold","wrap":True},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text",
+                     "text":f"賣 {r['shares']:,} @ {r['price']:,.2f}",
+                     "size":"xxs","color":"#9B6B5A","flex":3},
+                    {"type":"text","text":f"{sign} {r['pnl']:+,.0f}",
+                     "size":"xs","color":sc,"weight":"bold","flex":2,"align":"end"},
+                ]},
+                {"type":"separator","color":"#F0DDD2","margin":"xs"},
+            ]})
+        if len(realized) > 10:
+            realized_contents.append({"type":"text",
+                "text":f"… 另 {len(realized)-10} 筆較早紀錄",
+                "size":"xxs","color":"#A07560","margin":"sm"})
+    bubbles.append({
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":r_color,"paddingAll":"12px",
+            "contents":[{"type":"text","text":"📕 已實現損益","size":"md","color":"#FFFFFF","weight":"bold"}]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"xs",
+            "contents":realized_contents},
+    })
+
+    # ── Bubble 3：未實現詳細 ──
+    unreal_contents = [
+        {"type":"text","text":f"持股 {len(unreal_rows)} 檔",
+         "size":"sm","color":"#5B4040","weight":"bold"},
+        {"type":"text","text":f"{u_sign} {total_unreal:+,.0f} 元",
+         "size":"xl","color":u_color,"weight":"bold","margin":"xs"},
+        {"type":"text","text":"（若現在賣出可拿回的淨）",
+         "size":"xxs","color":"#A07560"},
+        {"type":"separator","color":"#E8C4B4","margin":"md"},
+    ]
+    if not unreal_rows:
+        unreal_contents.append({"type":"text","text":"（持股清單是空的）",
+            "size":"sm","color":"#A07560","margin":"md","align":"center"})
+    else:
+        for r in unreal_rows[:10]:
+            sign = "🟢" if r["net"] >= 0 else "🔴"
+            sc = "#D97A5C" if r["net"] >= 0 else "#7AABBE"
+            unreal_contents.append({"type":"box","layout":"vertical","margin":"sm","contents":[
+                {"type":"text",
+                 "text":f"{r['sid']} {r['name']}".rstrip(),
+                 "size":"xs","color":"#5B4040","weight":"bold","wrap":True},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text",
+                     "text":f"{r['shares']:,} 股 ‧ {r['bp']:,.2f}→{r['price']:,.2f}",
+                     "size":"xxs","color":"#9B6B5A","flex":3},
+                    {"type":"text","text":f"{sign} {r['net']:+,.0f}",
+                     "size":"xs","color":sc,"weight":"bold","flex":2,"align":"end"},
+                ]},
+                {"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":f"  毛 {r['gross']:+,.0f} ‧ 費稅 -{r['fee_tax']:,}",
+                     "size":"xxs","color":"#C9A89A","flex":3},
+                    {"type":"text","text":f"{r['pct']:+.1f}%",
+                     "size":"xxs","color":sc,"flex":2,"align":"end"},
+                ]},
+                {"type":"separator","color":"#F0DDD2","margin":"xs"},
+            ]})
+        if len(unreal_rows) > 10:
+            unreal_contents.append({"type":"text",
+                "text":f"… 另 {len(unreal_rows)-10} 檔",
+                "size":"xxs","color":"#A07560","margin":"sm"})
+    bubbles.append({
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":u_color,"paddingAll":"12px",
+            "contents":[{"type":"text","text":"📘 未實現損益","size":"md","color":"#FFFFFF","weight":"bold"}]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"xs",
+            "contents":unreal_contents},
+        "footer":{"type":"box","layout":"vertical","paddingAll":"8px","contents":[
+            {"type":"button","style":"secondary","height":"sm",
+             "action":{"type":"message","label":"📋 看完整持股卡","text":"持股"}}
+        ]},
+    })
+
+    return {"type":"carousel","contents":bubbles}
+
+
 def save_sell_to_sheets(user_id, symbol, name, sell_shares, sell_price, cost_avg, realized_pnl):
-    """v10.9.81：賣出紀錄寫入 Google Sheets「賣出紀錄」分頁。"""
+    """v10.9.81：賣出紀錄寫入 Google Sheets「賣出紀錄」分頁。
+    v10.9.95：分頁不存在自動建立（之前同 silent fail bug — get_sheet 回 None 直接跳過）。"""
     try:
-        sheet = get_sheet("賣出紀錄")
-        if sheet:
-            now = now_taipei().strftime("%Y-%m-%d %H:%M")
-            sheet.append_row([now, user_id, symbol, name,
-                              sell_shares, sell_price, cost_avg, realized_pnl])
+        sheet = get_or_create_sheet("賣出紀錄",
+                                    headers=["時間","用戶ID","代號","名稱",
+                                             "股數","賣價","成本均價","已實現損益"])
+        if not sheet:
+            dlog("PORTFOLIO", f"無法取得/建立「賣出紀錄」分頁，{user_id[-6:]} {symbol} 未寫入")
+            return
+        now = now_taipei().strftime("%Y-%m-%d %H:%M")
+        sheet.append_row([now, user_id, symbol, name,
+                          sell_shares, sell_price, cost_avg, realized_pnl])
+        dlog("PORTFOLIO", f"賣出紀錄寫入：{user_id[-6:]} {symbol} pnl={realized_pnl}")
     except Exception as e:
-        dlog("PORTFOLIO", f"save_sell_to_sheets 失敗：{e}")
+        dlog("PORTFOLIO", f"save_sell_to_sheets 失敗：{type(e).__name__}: {e}")
 
 
 def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: float) -> dict:
@@ -9216,8 +9437,22 @@ def handle_message(event):
     if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
     if text in ["損益分析", "我的損益", "損益總覽"]:
-        # v10.9.85：已實現 + 未實現分開（取代原本與「我的持股」重複的文字版）
-        reply_text(event.reply_token, format_pnl_analysis(user_id)); return
+        # v10.9.85：已實現 + 未實現分開
+        # v10.9.95：優先 Flex carousel；失敗 fallback 文字
+        try:
+            flex = make_pnl_analysis_flex(user_id)
+            if flex:
+                reply_flex(event.reply_token, flex, "損益分析")
+                return
+        except Exception as e:
+            dlog("PNL", f"Flex 失敗 fallback：{type(e).__name__}: {e}")
+        try:
+            reply_text(event.reply_token, format_pnl_analysis(user_id))
+        except Exception as e:
+            dlog("PNL", f"reply 也失敗：{e}")
+            try: push_message(user_id, format_pnl_analysis(user_id))
+            except: pass
+        return
     if text=="查快取說明": reply_text(event.reply_token,"格式：查快取 代號\n例如：查快取 2330"); return
 
     # ══ 查股票子選單 ══
