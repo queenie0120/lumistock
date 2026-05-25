@@ -1,6 +1,22 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.90（手續費設定持久化修復 — silent fail bug）
+LINE Bot 模組 v10.9.91（push_flex silent fail → 必 fallback 文字+浮標）
+
+【v10.9.91 更新】
+使用者反映：傳賣出截圖後，「🔍 辨識中...」之後完全沒下文。
+
+Root cause：
+- push_flex() 內部 try/except 把所有錯誤吞了（包含 LINE API 拒絕 Flex）
+- 外層 v10.9.89 的 try/except 永遠不會收到 exception
+- → 結果：Flex 沒送出、fallback 文字也沒送出、使用者看不到任何回應
+
+改動：
+1. push_flex(...) 改回傳 True/False
+2. 圖片 handler 三條分支：push_flex 回 False 時必 fallback push_text_with_qr
+3. Fallback 文字也帶 [✅ 確認/取消] Quick Reply 浮標（呼應「不要打字」原則）
+4. 「賣出說明」引導文字改成「卡片上點 ✅ 確認賣出」
+
+【v10.9.90】手續費設定持久化修復 — silent fail bug
 
 【v10.9.90 更新】
 使用者反映：設了「無折扣 100%」收到 ✅ 成功訊息，但賣出辨識顯示 60%。
@@ -708,7 +724,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.90"
+VERSION              = "10.9.91"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3480,14 +3496,18 @@ def push_text_with_qr(user_id: str, text: str, qr_pairs: list):
         dlog("PUSH", f"push_text_with_qr 失敗：{e}")
         push_message(user_id, text)  # fallback 純文字
 
-def push_flex(user_id: str, flex_content: dict, alt_text: str = "觀察清單"):
+def push_flex(user_id: str, flex_content: dict, alt_text: str = "觀察清單") -> bool:
+    """v10.9.91：回傳 True/False 讓呼叫端能 fallback 到文字。"""
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(
                 PushMessageRequest(to=user_id,
                     messages=[FlexMessage(alt_text=alt_text,
                         contents=FlexContainer.from_dict(flex_content))]))
-    except Exception as e: dlog("PUSH", f"push_flex失敗：{e}")
+        return True
+    except Exception as e:
+        dlog("PUSH", f"push_flex失敗：{type(e).__name__}: {e}")
+        return False
 
 
 # ══════════════════════════════════════════
@@ -8145,35 +8165,42 @@ def handle_image(event):
 
             if rtype == "holdings" and items:
                 WAITING_PORTFOLIO_IMPORT[user_id] = {"items": items, "ts": time.time()}
-                # v10.9.89：改用 Flex 卡片預覽 + 內嵌浮標確認/取消
+                # v10.9.89：Flex 卡片預覽；v10.9.91：失敗必 fallback 文字 + 浮標
+                ok = False
                 try:
                     flex = make_holdings_preview_flex(items)
-                    push_flex(user_id, flex, alt_text="庫存匯入預覽")
+                    ok = push_flex(user_id, flex, alt_text="庫存匯入預覽")
                 except Exception as e:
-                    dlog("IMAGE", f"庫存 Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
-                    push_message(user_id, format_portfolio_import_preview(items))
+                    dlog("IMAGE", f"庫存 Flex builder 失敗：{type(e).__name__}: {e}")
+                if not ok:
+                    push_text_with_qr(user_id, format_portfolio_import_preview(items),
+                                      [("✅ 確認匯入", "確認匯入"), ("🚫 取消匯入", "取消匯入")])
                 return
 
             if rtype == "sell" and items:
                 WAITING_SELL_IMPORT[user_id] = {"items": items, "ts": time.time()}
-                # v10.9.89：改用 Flex 卡片預覽 + 內嵌浮標確認/取消
+                ok = False
                 try:
                     flex = make_sell_preview_flex(items, user_id)
-                    push_flex(user_id, flex, alt_text="賣出預覽")
+                    ok = push_flex(user_id, flex, alt_text="賣出預覽")
                 except Exception as e:
-                    dlog("IMAGE", f"賣出 Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
-                    push_message(user_id, format_sell_import_preview(items, user_id))
+                    dlog("IMAGE", f"賣出 Flex builder 失敗：{type(e).__name__}: {e}")
+                if not ok:
+                    push_text_with_qr(user_id, format_sell_import_preview(items, user_id),
+                                      [("✅ 確認賣出", "確認賣出"), ("🚫 取消賣出", "取消賣出")])
                 return
 
             if rtype == "buy" and items:
                 WAITING_BUY_IMPORT[user_id] = {"items": items, "ts": time.time()}
-                # v10.9.89：改用 Flex 卡片預覽 + 內嵌浮標確認/取消
+                ok = False
                 try:
                     flex = make_buy_preview_flex(items, user_id)
-                    push_flex(user_id, flex, alt_text="買進預覽")
+                    ok = push_flex(user_id, flex, alt_text="買進預覽")
                 except Exception as e:
-                    dlog("IMAGE", f"買進 Flex 失敗 fallback 文字：{type(e).__name__}: {e}")
-                    push_message(user_id, format_buy_import_preview(items, user_id))
+                    dlog("IMAGE", f"買進 Flex builder 失敗：{type(e).__name__}: {e}")
+                if not ok:
+                    push_text_with_qr(user_id, format_buy_import_preview(items, user_id),
+                                      [("✅ 確認加碼", "確認加碼"), ("🚫 取消加碼", "取消加碼")])
                 return
 
             push_message(user_id,
@@ -8787,7 +8814,8 @@ def handle_message(event):
             "　例如：賣出 6742 1000 59.5\n\n"
             "2️⃣ 截圖辨識 ✨\n"
             "　傳券商「成交回報（賣）」截圖\n"
-            "　AI 自動辨識 → 預估已實現損益 → 確認賣出\n\n"
+            "　AI 自動辨識 → 預估已實現損益\n"
+            "　→ 卡片上點 [✅ 確認賣出] 即可（v10.9.89 起免打字）\n\n"
             "系統會自動：\n"
             "　• 從庫存扣股數（成本均價不變）\n"
             "　• 計算已實現損益（含手續費 + 證交稅）\n"
