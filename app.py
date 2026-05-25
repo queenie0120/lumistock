@@ -1,6 +1,22 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.78（修：TPEx 櫃買指數 SSL 連線失敗）
+LINE Bot 模組 v10.9.79（未註冊者全面阻擋所有功能）
+
+【v10.9.79 更新】
+使用者：未註冊的人完全不能點擊功能，不是只有查股票無法使用。
+
+問題：之前 is_registered 檢查放在 handler 中段，前面的菜單按鈕、AI 問答、
+      股票查詢、postback、截圖辨識都還是會通。
+
+修法：三個入口統一在最前面 gate
+1. handle_message（文字訊息）：blocked → registered → 主流程
+2. handle_postback（按鈕點擊）：同上
+3. handle_image（截圖上傳）：同上
+
+Owner / Admin 自動視為已註冊，避免管理者被卡住。
+未註冊者只能輸入「註冊 姓名」完成註冊，其他全部導向註冊提示。
+
+【v10.9.78】修：TPEx 櫃買指數 SSL 連線失敗
 
 【v10.9.78 修正】
 今天 06:30 自動健檢 7/8 失敗，TPEx 櫃買指數錯誤：
@@ -473,7 +489,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.78"
+VERSION              = "10.9.79"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6555,6 +6571,12 @@ def handle_postback(event):
         reply_text(event.reply_token, "⛔ 此帳號已停止使用權限")
         return
 
+    # v10.9.79：未註冊者全面阻擋 postback
+    if not is_owner(user_id) and not is_admin(user_id) and not is_registered(user_id):
+        reply_text(event.reply_token,
+            "🔒 請先註冊才能使用功能\n輸入「註冊 您的姓名」即可")
+        return
+
     # 解析 data: action=xxx&param=yyy
     params = {}
     for pair in data.split("&"):
@@ -6719,8 +6741,10 @@ def handle_image(event):
     dlog("IMAGE", f"收到圖片 user={user_id[:10]}... msg_id={msg_id}")
     if is_blocked_user(user_id):
         return
-    if not is_registered_user(user_id):
-        reply_text(event.reply_token, "請先註冊才能使用此功能")
+    # v10.9.79：未註冊者全面阻擋（含截圖辨識）
+    if not is_owner(user_id) and not is_admin(user_id) and not is_registered(user_id):
+        reply_text(event.reply_token,
+            "🔒 請先註冊才能使用功能\n輸入「註冊 您的姓名」即可")
         return
     if not GROQ_AVAILABLE:
         reply_text(event.reply_token,
@@ -6777,6 +6801,34 @@ def handle_message(event):
         return
 
     update_user_activity(user_id,text)
+
+    # ══ 未註冊使用者全面阻擋（v10.9.79）══
+    # 未註冊者只能：1) 輸入「註冊 姓名」完成註冊  2) 看歡迎/說明
+    # Owner / Admin 自動視為已註冊（避免管理者被卡住）
+    if not is_owner(user_id) and not is_admin(user_id) and not is_registered(user_id):
+        if text.startswith("註冊 "):
+            reg_name = text.replace("註冊 ", "").strip()
+            if reg_name:
+                result = register_user(user_id, reg_name)
+                reply_text(event.reply_token, result)
+                if "成功" in result:
+                    push_to_owner(f"🆕 新用戶註冊！\n姓名：{reg_name}\n時間：{now_taipei().strftime('%Y-%m-%d %H:%M')}")
+            else:
+                reply_text(event.reply_token, "格式：註冊 姓名\n例如：註冊 王小明")
+            return
+        # 其他任何訊息一律導向註冊
+        dlog("MSG", f"未註冊者嘗試使用：{user_id[:10]}... text='{text[:20]}'")
+        reply_text(event.reply_token,
+              "👋 歡迎使用慧股拾光 Lumistock！\n"
+              "━━━━━━━━━━━━━━\n"
+              "🔒 為了個人化投資助理體驗，\n"
+              "全部功能須先完成註冊才能使用。\n\n"
+              "📝 註冊方式：\n"
+              "　輸入「註冊 您的姓名」\n\n"
+              "　例如：\n"
+              "　註冊 王小明\n\n"
+              "註冊完成後，所有功能立即解鎖 🌸")
+        return
 
     # ══ AI 智能問答（v10.9.69 / v10.9.74 升級為連續對話）══
     # 進入問答模式（按鈕）
@@ -7408,12 +7460,7 @@ def handle_message(event):
             reply_text(event.reply_token,"格式：註冊 姓名\n例如：註冊 王小明")
         return
 
-    if not is_registered(user_id):
-        reply_text(event.reply_token,
-              "👋 歡迎使用慧股拾光 Lumistock！\n━━━━━━━━━━━━━━\n"
-              "請先完成註冊才能使用全部功能\n\n"
-              "📝 註冊方式：\n　輸入「註冊 您的姓名」\n\n　例如：\n　註冊 王小明")
-        return
+    # v10.9.79：未註冊已在 handler 開頭擋掉，此處不再需要重複檢查
 
     # ══ WAITING_SUGGESTION ══
     if user_id in WAITING_SUGGESTION:
