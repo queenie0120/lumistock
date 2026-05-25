@@ -1,6 +1,21 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.87（意見回饋系統 — 自動推播 + 顯示使用者身份）
+LINE Bot 模組 v10.9.88（意見回饋升級 Flex 卡片 + 簡化入口）
+
+【v10.9.88 更新】
+使用者反映：
+1. 建議推播希望用卡片整理（v10.9.87 是純文字 push）
+2. 5 個入口字詞意思都一樣，太多冗餘
+
+改動：
+1. 新增 make_suggestion_flex()：粉嫩 Flex 卡片
+   - Header 顏色依角色：Owner 珊瑚粉、Admin 薰衣草、User 杏粉
+   - 身份區（姓名 / 角色 / user_id）獨立框
+   - 內容區白底圓角，清楚易讀
+2. 推播改用 push_flex；Flex 失敗 fallback 純文字
+3. 簡化入口：只保留「意見回饋」「建議」（移除其他 4 個冗詞）
+
+【v10.9.87】意見回饋系統
 
 【v10.9.87 更新】
 使用者要求：用戶/管理者建議自動傳 LINE 給 Owner，且顯示誰傳的。
@@ -652,7 +667,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.87"
+VERSION              = "10.9.88"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2961,6 +2976,75 @@ def get_user_record(user_id: str) -> dict:
                 if str(row.get("user_id"))==user_id: return row
     except: pass
     return {}
+
+def make_suggestion_flex(info: dict, suggestion_text: str, ts: str) -> dict:
+    """v10.9.88：意見回饋 Flex 卡片（給 Owner 看的，粉嫩風格）"""
+    # 用顏色區分角色
+    role = info.get("role", "")
+    if "Owner" in role:
+        header_color = "#E89B82"  # 珊瑚粉（自己人）
+    elif "管理者" in role:
+        header_color = "#C9B0DB"  # 薰衣草粉
+    else:
+        header_color = "#E8B8A8"  # 杏粉（一般使用者）
+    return {
+        "type": "bubble", "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical",
+            "backgroundColor": header_color, "paddingAll": "14px",
+            "contents": [
+                {"type": "text", "text": "💬 收到新建議",
+                 "size": "lg", "color": "#FFFFFF", "weight": "bold"},
+                {"type": "text", "text": ts,
+                 "size": "xxs", "color": "#FDF6F0", "margin": "xs"},
+            ]
+        },
+        "body": {
+            "type": "box", "layout": "vertical",
+            "backgroundColor": "#FDF6F0", "paddingAll": "14px", "spacing": "sm",
+            "contents": [
+                # 身份區
+                {"type": "box", "layout": "vertical", "spacing": "xs",
+                 "backgroundColor": "#FAE6DE", "cornerRadius": "8px", "paddingAll": "10px",
+                 "contents": [
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "👤 來自", "size": "xxs",
+                         "color": "#9B6B5A", "flex": 2},
+                        {"type": "text", "text": info.get("name", ""),
+                         "size": "md", "color": "#5B4040",
+                         "weight": "bold", "flex": 5, "align": "end", "wrap": True}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "角色", "size": "xxs",
+                         "color": "#9B6B5A", "flex": 2},
+                        {"type": "text", "text": info.get("role", ""),
+                         "size": "xs", "color": "#A05A48", "flex": 5, "align": "end"}
+                    ]},
+                    {"type": "box", "layout": "horizontal", "contents": [
+                        {"type": "text", "text": "user_id", "size": "xxs",
+                         "color": "#9B6B5A", "flex": 2},
+                        {"type": "text", "text": f"{info.get('user_id','')[:12]}...",
+                         "size": "xxs", "color": "#9B6B5A", "flex": 5, "align": "end"}
+                    ]}
+                 ]},
+                # 內容區
+                {"type": "text", "text": "📝 建議內容", "size": "xs",
+                 "color": "#A05A48", "weight": "bold", "margin": "md"},
+                {"type": "box", "layout": "vertical",
+                 "backgroundColor": "#FFFFFF", "cornerRadius": "8px",
+                 "paddingAll": "12px", "margin": "sm",
+                 "contents": [
+                    {"type": "text", "text": suggestion_text,
+                     "size": "sm", "color": "#5B4040", "wrap": True}
+                 ]},
+                {"type": "separator", "color": "#E8C4B4", "margin": "md"},
+                {"type": "text",
+                 "text": "完整紀錄已寫入 Google Sheets「系統記錄」",
+                 "size": "xxs", "color": "#C9A89A", "align": "center", "margin": "sm"},
+            ]
+        }
+    }
+
 
 def get_user_display_info(user_id: str) -> dict:
     """v10.9.87：取得使用者顯示資訊（給意見回饋等情境用）。
@@ -8596,9 +8680,9 @@ def handle_message(event):
 
     # v10.9.79：未註冊已在 handler 開頭擋掉，此處不再需要重複檢查
 
-    # ══ 意見回饋（v10.9.87）═══════════════════════════
-    # 進入回饋模式
-    if text in ["意見回饋", "建議", "回饋", "回報問題", "我要回報", "我有建議"]:
+    # ══ 意見回饋（v10.9.87 / v10.9.88 升級 Flex）═══════════════════════════
+    # 進入回饋模式（兩個入口：意見回饋 / 建議）
+    if text in ["意見回饋", "建議"]:
         WAITING_SUGGESTION[user_id] = time.time()
         WAITING_AI_QA.pop(user_id, None)      # 退出 AI 問答避免干擾
         WAITING_FEE_INPUT.pop(user_id, None)
@@ -8607,8 +8691,7 @@ def handle_message(event):
             "請直接打下你的建議、想法或 bug 回報\n"
             "（最多 1000 字，5 分鐘內任何訊息都會送出）\n\n"
             "你的訊息會直接通知 Owner，\n"
-            "並附上你的註冊姓名讓他知道是誰。\n\n"
-            "也可以打「取消回饋」離開",
+            "並附上你的註冊姓名讓他知道是誰 🌸",
             [("🚫 取消回饋", "取消回饋")])
         return
     if text in ["取消回饋", "取消建議"]:
@@ -8629,20 +8712,18 @@ def handle_message(event):
             save_suggestion_to_sheets(user_id, suggestion_text)
         except Exception as e:
             dlog("SUGGESTION", f"寫 Sheets 失敗：{e}")
-        # 推播給 Owner，附上完整身份
+        # v10.9.88：推播給 Owner（Flex 卡片）
         try:
-            push_to_owner(
-                "💬 收到新建議\n"
-                "━━━━━━━━━━━━━━\n"
-                f"{info['role']}  {info['name']}\n"
-                f"user_id: {info['user_id'][:12]}...\n"
-                f"時間：{ts}\n\n"
-                "📝 內容：\n"
-                f"{suggestion_text}\n"
-                "━━━━━━━━━━━━━━\n"
-                "完整紀錄已寫入 Google Sheets「系統記錄」")
+            flex = make_suggestion_flex(info, suggestion_text, ts)
+            push_flex(OWNER_USER_ID, flex, alt_text=f"新建議 — {info.get('name','')}")
         except Exception as e:
-            dlog("SUGGESTION", f"push 失敗：{e}")
+            dlog("SUGGESTION", f"Flex push 失敗 fallback text：{e}")
+            try:
+                push_to_owner(
+                    f"💬 收到新建議\n━━━━━━━━━━━━━━\n"
+                    f"{info['role']}  {info['name']}\n"
+                    f"時間：{ts}\n\n📝 內容：\n{suggestion_text}")
+            except: pass
         reply_text(event.reply_token,
             "✅ 已收到你的建議，謝謝！\n"
             "Owner 會盡快看到並評估 🌸")
