@@ -1,6 +1,22 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.83（加碼 / 分批買進 + 買進截圖辨識）
+LINE Bot 模組 v10.9.84（「新增」改為智能模式：既有部位自動加碼）
+
+【v10.9.84 更新】
+使用者反映：沒有賣出又再買進不就是加碼嗎？系統應該自動分辨。
+
+改動：
+1. 「新增」指令改用 process_buy()，自動判斷：
+   - 既有部位 → 加權平均（不覆蓋）
+   - 新部位 → 建立
+2. 新增「重設 代號 股數 價」指令給明確強制覆蓋情境（少用）
+3. 「加碼」保留為別名（同新增）
+4. 新增持股說明文字更新
+
+99% 日常情境系統自動做對的事，
+只有想刻意重設資料才用「重設」。
+
+【v10.9.83】加碼 / 分批買進 + 買進截圖辨識
 
 【v10.9.83 更新】
 使用者要求：分批買進需求。
@@ -576,7 +592,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.83"
+VERSION              = "10.9.84"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -8083,14 +8099,21 @@ def handle_message(event):
     if text=="移除管理者說明": reply_text(event.reply_token,"格式：移除管理者 姓名"); return
     if text=="新增持股說明":
         reply_text(event.reply_token,
-            "📋 新增持股 — 兩種方式\n━━━━━━━━━━━━━━\n"
+            "📋 新增持股 — 兩種方式（v10.9.84 智能模式）\n━━━━━━━━━━━━━━\n"
             "1️⃣ 手動輸入\n"
             "　格式：新增 代碼 股數 買入價\n"
             "　例如：新增 2330 100 2010\n\n"
             "2️⃣ 截圖辨識 ✨\n"
-            "　直接傳券商「庫存查詢」頁截圖\n"
-            "　AI 自動辨識 → 確認匯入 → 一鍵儲存\n"
-            "　⚠ 截圖會送雲端，建議先遮蔽帳號餘額")
+            "　傳券商「庫存查詢」or「成交回報（買）」截圖\n"
+            "　AI 自動辨識 → 確認 → 一鍵儲存\n\n"
+            "🧠 系統會自動判斷：\n"
+            "　• 已有部位 → 自動加碼（加權平均成本）\n"
+            "　• 沒有部位 → 建立新部位\n"
+            "　• 含買入手續費納入成本均價\n\n"
+            "📌 特殊指令：\n"
+            "　• 重設 代號 股數 價 → 強制覆蓋（資料錯誤時用）\n"
+            "　• 加碼 代號 股數 價 → 等同新增（保留別名）\n"
+            "　⚠ 截圖會送雲端，建議遮蔽帳號餘額")
         return
     if text=="賣出說明":
         reply_text(event.reply_token,
@@ -8377,37 +8400,75 @@ def handle_message(event):
             reply_text(event.reply_token, "📋 目前沒有被封鎖的用戶")
         return
 
+    # v10.9.84：「新增」改為智能模式 — 既有部位自動加碼，新部位自動建立
     if text.startswith("新增 "):
         parts=text.split()
         if len(parts)==4:
-            raw=parts[1].upper(); market="台股" if raw.isdigit() else "美股"
-            symbol=raw
             try:
-                shares=int(parts[2]); raw_price=float(parts[3])
-                # v10.9.82：成本均價含手續費
-                buy_fee = calc_buy_fee(raw_price, shares, user_id) if raw.isdigit() else 0
-                cost_avg = (raw_price * shares + buy_fee) / shares if shares else raw_price
-                p=load_portfolio()
-                p[_pf_key(user_id, symbol)]={"shares":shares,"buy_price":cost_avg,"user_id":user_id}
-                save_portfolio(p)
-                tw=get_tw_stock(raw) if raw.isdigit() else None
-                us=get_us_stock(raw) if not raw.isdigit() else None
-                name=(tw or us or {}).get("name",symbol) if (tw or us) else symbol
-                if not name or name==symbol:
-                    name=NAME_CACHE.get(raw,symbol) if raw.isdigit() else symbol
-                save_portfolio_to_sheets(user_id,symbol,name,market,shares,cost_avg)
-                log_to_sheets(user_id,"新增持股",symbol,"成功")
-                discount = get_user_fee_discount(user_id)
-                disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
+                stock_id = parts[1].upper()
+                shares = int(parts[2])
+                raw_price = float(parts[3])
+                if shares <= 0 or raw_price <= 0:
+                    raise ValueError("invalid")
+                r = process_buy(user_id, stock_id, shares, raw_price)
+                # process_buy 已根據是否有既有部位顯示「📈 加碼」或「🆕 新增」
+                reply_text(event.reply_token, r["msg"] + "\n\n💡 想強制覆蓋既有部位請用「重設 代號 股數 價」")
+            except Exception:
                 reply_text(event.reply_token,
-                      f"✅ 新增成功\n━━━━━━━━━━━━━━\n"
-                      f"　{symbol}｜{name}\n"
-                      f"　{shares:,} 股 @ {raw_price:,.2f}\n"
-                      f"　手續費 {buy_fee:,}（折數 {disc_str}）\n"
-                      f"　含費成本均價 {cost_avg:,.4f}")
-            except Exception as e:
-                reply_text(event.reply_token,"格式錯誤\n範例：新增 2330 100 200")
-        else: reply_text(event.reply_token,"格式：新增 代碼 股數 買入價\n範例：新增 2330 100 200")
+                    "格式錯誤\n範例：新增 2330 100 200")
+        else:
+            reply_text(event.reply_token,
+                "格式：新增 代碼 股數 買入價\n範例：新增 2330 100 200\n\n"
+                "說明：\n　• 既有部位 → 自動加碼（加權平均）\n"
+                "　• 新部位 → 建立\n"
+                "　• 強制覆蓋請用「重設」")
+        return
+
+    # v10.9.84：「重設」明確強制覆蓋既有部位（少用，用於資料錯誤想重設）
+    if text.startswith("重設 "):
+        parts = text.split()
+        if len(parts) == 4:
+            try:
+                stock_id = parts[1].upper()
+                shares = int(parts[2])
+                raw_price = float(parts[3])
+                if shares <= 0 or raw_price <= 0:
+                    raise ValueError("invalid")
+                norm = stock_id.replace(".TW", "")
+                is_tw = norm.isdigit()
+                buy_fee = calc_buy_fee(raw_price, shares, user_id) if is_tw else 0
+                cost_avg = (raw_price * shares + buy_fee) / shares if shares else raw_price
+                # 移除所有既有 key
+                p = load_portfolio()
+                for k in (_pf_key(user_id, norm), _pf_key(user_id, stock_id),
+                          norm, stock_id, stock_id + ".TW"):
+                    if k in p and p[k].get("user_id") == user_id:
+                        p.pop(k, None)
+                p[_pf_key(user_id, norm)] = {
+                    "user_id": user_id,
+                    "shares": shares,
+                    "buy_price": cost_avg,
+                }
+                save_portfolio(p)
+                name = NAME_CACHE.get(norm, norm)
+                market = "台股" if is_tw else "美股"
+                save_portfolio_to_sheets(user_id, norm, name, market, shares, cost_avg)
+                log_to_sheets(user_id, "重設持股", norm, "成功")
+                disc = get_user_fee_discount(user_id)
+                disc_str = f"{int(disc*100)}%" if disc < 1.0 else "無折扣"
+                reply_text(event.reply_token,
+                    f"🔄 重設成功（既有部位被覆蓋）\n━━━━━━━━━━━━━━\n"
+                    f"　{norm} {name}\n"
+                    f"　{shares:,} 股 @ {raw_price:,.2f}\n"
+                    f"　手續費 {buy_fee:,}（折數 {disc_str}）\n"
+                    f"　含費成本均價 {cost_avg:,.4f}")
+            except Exception:
+                reply_text(event.reply_token,
+                    "格式錯誤\n範例：重設 2330 100 200")
+        else:
+            reply_text(event.reply_token,
+                "格式：重設 代碼 股數 買入價\n範例：重設 2330 100 200\n\n"
+                "⚠ 重設會覆蓋既有部位（一般情境請用「新增」自動加碼）")
         return
 
     # v10.9.82：設定手續費折數 / 查詢
