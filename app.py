@@ -1,6 +1,26 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.86（移除加碼按鈕 + 智能手續費輸入）
+LINE Bot 模組 v10.9.87（意見回饋系統 — 自動推播 + 顯示使用者身份）
+
+【v10.9.87 更新】
+使用者要求：用戶/管理者建議自動傳 LINE 給 Owner，且顯示誰傳的。
+
+問題：現有 WAITING_SUGGESTION 是死碼（沒有進入點，從沒被用到）。
+
+新增：
+1. get_user_display_info(user_id)：取得 註冊姓名 + 角色 + user_id
+   role: 👑 Owner / 🛡️ 管理者 / 👤 使用者
+2. 意見回饋進入指令：意見回饋 / 建議 / 回饋 / 回報問題 / 我要回報 / 我有建議
+   → 設定 WAITING_SUGGESTION state（5 分鐘 TTL）+ Quick Reply「取消回饋」
+3. 取消指令：取消回饋 / 取消建議
+4. 提交後：
+   - 寫 Google Sheets「系統記錄」
+   - push 給 Owner（含 完整身份 + 時間 + 內容）
+   - 回覆使用者「已收到」
+5. 「💬 意見回饋」按鈕加進 AI 分析選單
+6. HELP_MSG 加入意見回饋說明
+
+【v10.9.86】移除加碼按鈕 + 智能手續費輸入
 
 【v10.9.86 更新】
 使用者反映：
@@ -632,7 +652,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.86"
+VERSION              = "10.9.87"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -642,7 +662,7 @@ FINMIND_TOKEN        = os.environ.get("FINMIND_TOKEN", "")
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(CHANNEL_SECRET)
 
-WAITING_SUGGESTION = set()
+WAITING_SUGGESTION = {}  # v10.9.87: user_id -> ts（5 分鐘內任何訊息當作建議）
 WAITING_STOCK_NEWS = {}  # v10.9.58: user_id -> set_at_timestamp（5 分鐘內輸入股票代號 → 回新聞 carousel）
 WAITING_PORTFOLIO_IMPORT = {}  # v10.9.64: user_id -> {"items": [...], "ts": ts}（5 分鐘內確認）
 WAITING_SELL_IMPORT      = {}  # v10.9.81: user_id -> {"items":[{stock_id,shares,sell_price}], "ts":ts}
@@ -2942,6 +2962,24 @@ def get_user_record(user_id: str) -> dict:
     except: pass
     return {}
 
+def get_user_display_info(user_id: str) -> dict:
+    """v10.9.87：取得使用者顯示資訊（給意見回饋等情境用）。
+    回傳：{"name", "role", "user_id"}
+    role: "Owner" / "Admin" / "User"
+    name: 註冊姓名 > LINE displayName > user_id 簡寫
+    """
+    rec = get_user_record(user_id)
+    name = (rec.get("註冊姓名") or rec.get("displayName") or "").strip()
+    if not name:
+        name = f"{user_id[:8]}..."
+    if is_owner(user_id):
+        role = "👑 Owner"
+    elif is_admin(user_id):
+        role = "🛡️ 管理者"
+    else:
+        role = "👤 使用者"
+    return {"name": name, "role": role, "user_id": user_id}
+
 def is_registered(user_id: str) -> bool:
     return bool(get_user_record(user_id).get("註冊姓名"))
 
@@ -3493,7 +3531,8 @@ def make_ai_menu_flex() -> dict:
         [("💬 問 AI 助理","問AI"),                # v10.9.69：AI 智能問答入口
          ("⭐ 觀察清單","觀察清單"), ("📈 趨勢觀察","趨勢觀察"),
          ("🌱 成長觀察","成長觀察"), ("💰 存股觀察","存股觀察"),
-         ("🌊 波段觀察","波段觀察"), ("🤖 AI概念觀察","AI概念觀察")]
+         ("🌊 波段觀察","波段觀察"), ("🤖 AI概念觀察","AI概念觀察"),
+         ("💬 意見回饋","意見回饋")]            # v10.9.87：使用者建議直送 Owner
     )
 
 def make_news_menu_flex() -> dict:
@@ -7441,6 +7480,9 @@ HELP_MSG="""✨ 慧股拾光 Lumistock
 📰 財經新聞　台股美股國際
 
 📋 持股管理　損益追蹤
+
+💬 意見回饋　輸入「意見回饋」
+　直接告訴 Owner 你的想法或 bug
 ━━━━━━━━━━━━━━
 台股／美股／ETF 皆支援"""
 
@@ -8554,12 +8596,56 @@ def handle_message(event):
 
     # v10.9.79：未註冊已在 handler 開頭擋掉，此處不再需要重複檢查
 
-    # ══ WAITING_SUGGESTION ══
-    if user_id in WAITING_SUGGESTION:
-        WAITING_SUGGESTION.discard(user_id)
-        save_suggestion_to_sheets(user_id,text)
-        push_to_owner(f"💬 收到新建議！\n時間：{now_taipei().strftime('%Y-%m-%d %H:%M')}\n內容：{text}")
-        reply_text(event.reply_token,"✅ 感謝您的建議！\n我們會持續改善 Lumistock 🌱")
+    # ══ 意見回饋（v10.9.87）═══════════════════════════
+    # 進入回饋模式
+    if text in ["意見回饋", "建議", "回饋", "回報問題", "我要回報", "我有建議"]:
+        WAITING_SUGGESTION[user_id] = time.time()
+        WAITING_AI_QA.pop(user_id, None)      # 退出 AI 問答避免干擾
+        WAITING_FEE_INPUT.pop(user_id, None)
+        reply_text_with_qr(event.reply_token,
+            "💬 意見回饋\n━━━━━━━━━━━━━━\n"
+            "請直接打下你的建議、想法或 bug 回報\n"
+            "（最多 1000 字，5 分鐘內任何訊息都會送出）\n\n"
+            "你的訊息會直接通知 Owner，\n"
+            "並附上你的註冊姓名讓他知道是誰。\n\n"
+            "也可以打「取消回饋」離開",
+            [("🚫 取消回饋", "取消回饋")])
+        return
+    if text in ["取消回饋", "取消建議"]:
+        if WAITING_SUGGESTION.pop(user_id, None):
+            reply_text(event.reply_token, "✅ 已取消意見回饋")
+        else:
+            reply_text(event.reply_token, "⏰ 沒有進行中的意見回饋")
+        return
+    # 在回饋模式中送出
+    sug_at = WAITING_SUGGESTION.get(user_id)
+    if sug_at and (time.time() - sug_at) < 300:
+        WAITING_SUGGESTION.pop(user_id, None)
+        suggestion_text = text[:1000]
+        info = get_user_display_info(user_id)
+        ts = now_taipei().strftime("%Y-%m-%d %H:%M")
+        # 寫 Sheets（保留歷史）
+        try:
+            save_suggestion_to_sheets(user_id, suggestion_text)
+        except Exception as e:
+            dlog("SUGGESTION", f"寫 Sheets 失敗：{e}")
+        # 推播給 Owner，附上完整身份
+        try:
+            push_to_owner(
+                "💬 收到新建議\n"
+                "━━━━━━━━━━━━━━\n"
+                f"{info['role']}  {info['name']}\n"
+                f"user_id: {info['user_id'][:12]}...\n"
+                f"時間：{ts}\n\n"
+                "📝 內容：\n"
+                f"{suggestion_text}\n"
+                "━━━━━━━━━━━━━━\n"
+                "完整紀錄已寫入 Google Sheets「系統記錄」")
+        except Exception as e:
+            dlog("SUGGESTION", f"push 失敗：{e}")
+        reply_text(event.reply_token,
+            "✅ 已收到你的建議，謝謝！\n"
+            "Owner 會盡快看到並評估 🌸")
         return
 
     # ══ 持股管理指令 ══
