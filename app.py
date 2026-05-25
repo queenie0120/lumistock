@@ -1,6 +1,26 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.89（截圖預覽 Flex 卡片 + 內嵌浮標確認）
+LINE Bot 模組 v10.9.90（手續費設定持久化修復 — silent fail bug）
+
+【v10.9.90 更新】
+使用者反映：設了「無折扣 100%」收到 ✅ 成功訊息，但賣出辨識顯示 60%。
+
+Root cause：
+- 手續費寫入 Sheets 用 try/except: pass 包住
+- 「使用者設定」分頁第一次使用時根本不存在 → get_sheet 回 None
+- 寫入完全 fail 但 UI 顯示成功
+- Render 重啟（剛好部署 v10.9.89 觸發）→ /tmp 被清 → restore 也讀不到分頁
+- → fall back DEFAULT_FEE_DISCOUNT = 0.6（六折）
+
+改動：
+1. 新增 get_or_create_sheet(name, headers)：分頁不存在自動建立
+2. set_user_fee_discount() 改用 get_or_create_sheet
+   - 寫入成功會 dlog 記錄
+   - 寫入失敗會 dlog 記錄（不再 silent: pass）
+3. restore_user_settings_from_sheets() 也用 get_or_create_sheet
+   - 第一次開機就建立空表，後續寫入才不會 silent fail
+
+【v10.9.89】截圖預覽 Flex 卡片 + 內嵌浮標確認
 
 【v10.9.89 更新】
 使用者反映：
@@ -688,7 +708,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.89"
+VERSION              = "10.9.90"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2825,6 +2845,29 @@ def get_sheet(sheet_name):
     except: pass
     return None
 
+def get_or_create_sheet(sheet_name: str, headers: list = None, rows: int = 200, cols: int = None):
+    """v10.9.90：取得分頁；若不存在則自動建立（含 header）。
+    Why: 「使用者設定」這種分頁如果沒被建立，set 操作會被 except 吞掉，
+    使用者以為設定成功，重啟後實際 fall back 預設值。"""
+    try:
+        client = get_sheets_client()
+        if not client: return None
+        ss = client.open_by_key(SHEETS_ID)
+        try:
+            return ss.worksheet(sheet_name)
+        except Exception:
+            ncols = cols or (len(headers) if headers else 4)
+            ws = ss.add_worksheet(title=sheet_name, rows=rows, cols=ncols)
+            if headers:
+                try: ws.append_row(headers)
+                except Exception as e2:
+                    dlog("SHEETS", f"建立 {sheet_name} 但寫 header 失敗：{e2}")
+            dlog("SHEETS", f"自動建立分頁：{sheet_name}")
+            return ws
+    except Exception as e:
+        dlog("SHEETS", f"get_or_create_sheet({sheet_name}) 失敗：{type(e).__name__}: {e}")
+        return None
+
 def log_to_sheets(user_id, action, content, result):
     try:
         sheet = get_sheet("系統記錄")
@@ -3251,26 +3294,34 @@ def set_user_fee_discount(user_id: str, discount: float) -> None:
     s = USER_SETTINGS.setdefault(user_id, {})
     s["fee_discount"] = round(float(discount), 4)
     _save_user_settings(USER_SETTINGS)
-    # 同步寫到 Sheets「使用者設定」（失敗不影響）
+    # v10.9.90：分頁不存在時自動建立 + 失敗有 log（之前 except: pass 會悄悄丟）
     try:
-        sheet = get_sheet("使用者設定")
-        if sheet:
-            records = sheet.get_all_values()
-            updated = False
-            for i, row in enumerate(records[1:], start=2):
-                if row and row[0] == user_id:
-                    sheet.update_cell(i, 2, s["fee_discount"])
-                    updated = True
-                    break
-            if not updated:
-                sheet.append_row([user_id, s["fee_discount"],
-                                  now_taipei().strftime("%Y-%m-%d %H:%M")])
-    except: pass
+        sheet = get_or_create_sheet("使用者設定",
+                                    headers=["用戶ID", "手續費折數", "更新時間"])
+        if not sheet:
+            dlog("SETTINGS", f"無法取得/建立「使用者設定」分頁，{user_id} 折數僅存在記憶體")
+            return
+        records = sheet.get_all_values()
+        updated = False
+        for i, row in enumerate(records[1:], start=2):
+            if row and row[0] == user_id:
+                sheet.update_cell(i, 2, s["fee_discount"])
+                sheet.update_cell(i, 3, now_taipei().strftime("%Y-%m-%d %H:%M"))
+                updated = True
+                break
+        if not updated:
+            sheet.append_row([user_id, s["fee_discount"],
+                              now_taipei().strftime("%Y-%m-%d %H:%M")])
+        dlog("SETTINGS", f"已寫入 Sheets 使用者設定：{user_id[-6:]} = {s['fee_discount']}")
+    except Exception as e:
+        dlog("SETTINGS", f"寫入使用者設定到 Sheets 失敗：{type(e).__name__}: {e}")
 
 def restore_user_settings_from_sheets() -> int:
-    """v10.9.82：開機從 Sheets 還原使用者設定（手續費折數）。"""
+    """v10.9.82：開機從 Sheets 還原使用者設定（手續費折數）。
+    v10.9.90：分頁不存在時自動建立空表，下次寫入才不會再 silent fail。"""
     try:
-        sheet = get_sheet("使用者設定")
+        sheet = get_or_create_sheet("使用者設定",
+                                    headers=["用戶ID", "手續費折數", "更新時間"])
         if not sheet: return 0
         rows = sheet.get_all_values()
         if not rows or len(rows) < 2: return 0
