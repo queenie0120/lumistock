@@ -1,6 +1,31 @@
 """
 慧股拾光 Lumistock – by Hui
-LINE Bot 模組 v10.9.81（賣出指令 + 截圖辨識賣出）
+LINE Bot 模組 v10.9.82（手續費設定 + 含費損益計算）
+
+【v10.9.82 更新】
+使用者要求：成本及損益應含買入手續費、賣出手續費、證交稅；
+            使用者可自訂手續費折數（不一定都打折）。
+
+新增：
+1. USER_SETTINGS（/tmp + Sheets「使用者設定」分頁）
+   每位使用者獨立的手續費折數（預設 6 折，可調 1-100%）
+2. calc_buy_fee()：買入手續費 = max(20, 股數×價×0.001425×折數)
+3. calc_sell_fee_tax()：手續費 + 證交稅 0.3%
+4. 「新增」自動算含費成本均價：
+   cost_avg = (股數×價 + 手續費) / 股數
+5. 「賣出」完整明細：毛收入 / 手續費 / 證交稅 / 淨收入 / 淨損益
+6. 截圖辨識賣出預覽也含費
+7. 新指令：
+   - 設定手續費 28　→ 2.8 折
+   - 設定手續費 60　→ 6 折
+   - 設定手續費 100 → 無折扣
+   - 查手續費　　　→ 查目前設定
+8. 「💰 手續費設定」按鈕加進持股管理選單
+9. 開機從 Sheets 還原使用者設定
+
+待 v10.9.83 做：分批買進「加碼」指令（加權平均）。
+
+【v10.9.81】賣出指令 + 截圖辨識賣出
 
 【v10.9.81 更新】
 使用者要求：要有賣出指令計算已實現損益，且要能傳賣出截圖辨識。
@@ -533,7 +558,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.81"
+VERSION              = "10.9.82"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -549,6 +574,7 @@ WAITING_PORTFOLIO_IMPORT = {}  # v10.9.64: user_id -> {"items": [...], "ts": ts}
 WAITING_SELL_IMPORT      = {}  # v10.9.81: user_id -> {"items":[{stock_id,shares,sell_price}], "ts":ts}
 WAITING_AI_QA = {}  # v10.9.69: user_id -> set_at_ts（AI 問答模式，5 分鐘內任何訊息當問題）
 PORTFOLIO_FILE     = "/tmp/lumistock_portfolio.json"
+USER_SETTINGS_FILE = "/tmp/lumistock_user_settings.json"  # v10.9.82：手續費折數等
 NAME_CACHE         = {}
 STARTUP_DONE       = False
 NAME_CACHE_LOADING = False
@@ -886,6 +912,12 @@ def _bg_init():
         restore_portfolio_from_sheets()
     except Exception as e:
         dlog("PORTFOLIO", f"開機還原持股失敗：{e}")
+    # v10.9.82：還原使用者手續費設定
+    try:
+        n = restore_user_settings_from_sheets()
+        if n: dlog("SETTINGS", f"還原使用者設定：{n} 位")
+    except Exception as e:
+        dlog("SETTINGS", f"開機還原設定失敗：{e}")
 
 
 # ══════════════════════════════════════════
@@ -2962,6 +2994,95 @@ def save_portfolio(p):
     with open(PORTFOLIO_FILE,"w",encoding="utf-8") as f:
         json.dump(p, f, ensure_ascii=False, indent=2)
 
+
+# ══════════════════════════════════════════
+#  使用者設定 — 手續費折數 (v10.9.82)
+# ══════════════════════════════════════════
+DEFAULT_FEE_DISCOUNT = 0.6   # 預設 6 折（一般券商常見優惠）
+TW_COMMISSION_RATE   = 0.001425  # 0.1425% 手續費標準
+TW_TAX_RATE          = 0.003     # 0.3% 證交稅（一般股，ETF 為 0.001）
+TW_MIN_COMMISSION    = 20        # 最低手續費 20 元
+
+def _load_user_settings() -> dict:
+    if os.path.exists(USER_SETTINGS_FILE):
+        try:
+            with open(USER_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: pass
+    return {}
+
+def _save_user_settings(s: dict) -> None:
+    try:
+        with open(USER_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dlog("SETTINGS", f"寫入失敗：{e}")
+
+USER_SETTINGS = _load_user_settings()
+
+def get_user_fee_discount(user_id: str) -> float:
+    s = USER_SETTINGS.get(user_id, {})
+    d = s.get("fee_discount", DEFAULT_FEE_DISCOUNT)
+    try:
+        d = float(d)
+        return max(0.1, min(1.0, d))
+    except: return DEFAULT_FEE_DISCOUNT
+
+def set_user_fee_discount(user_id: str, discount: float) -> None:
+    s = USER_SETTINGS.setdefault(user_id, {})
+    s["fee_discount"] = round(float(discount), 4)
+    _save_user_settings(USER_SETTINGS)
+    # 同步寫到 Sheets「使用者設定」（失敗不影響）
+    try:
+        sheet = get_sheet("使用者設定")
+        if sheet:
+            records = sheet.get_all_values()
+            updated = False
+            for i, row in enumerate(records[1:], start=2):
+                if row and row[0] == user_id:
+                    sheet.update_cell(i, 2, s["fee_discount"])
+                    updated = True
+                    break
+            if not updated:
+                sheet.append_row([user_id, s["fee_discount"],
+                                  now_taipei().strftime("%Y-%m-%d %H:%M")])
+    except: pass
+
+def restore_user_settings_from_sheets() -> int:
+    """v10.9.82：開機從 Sheets 還原使用者設定（手續費折數）。"""
+    try:
+        sheet = get_sheet("使用者設定")
+        if not sheet: return 0
+        rows = sheet.get_all_values()
+        if not rows or len(rows) < 2: return 0
+        for row in rows[1:]:
+            if len(row) < 2: continue
+            uid = (row[0] or "").strip()
+            try: disc = float(row[1])
+            except: continue
+            if uid:
+                USER_SETTINGS.setdefault(uid, {})["fee_discount"] = disc
+        _save_user_settings(USER_SETTINGS)
+        return len(USER_SETTINGS)
+    except Exception as e:
+        dlog("SETTINGS", f"還原使用者設定失敗：{e}")
+        return 0
+
+def calc_buy_fee(price: float, shares: int, user_id: str) -> int:
+    """買入手續費（無條件捨去取整數，符合券商實務）。"""
+    trade_value = price * shares
+    discount = get_user_fee_discount(user_id)
+    raw = trade_value * TW_COMMISSION_RATE * discount
+    return max(TW_MIN_COMMISSION, int(raw))
+
+def calc_sell_fee_tax(price: float, shares: int, user_id: str) -> tuple:
+    """賣出手續費 + 證交稅。回傳 (fee, tax)。"""
+    trade_value = price * shares
+    discount = get_user_fee_discount(user_id)
+    fee = max(TW_MIN_COMMISSION, int(trade_value * TW_COMMISSION_RATE * discount))
+    tax = int(trade_value * TW_TAX_RATE)
+    return fee, tax
+
 def restore_portfolio_from_sheets() -> int:
     """v10.9.71：開機時從 Google Sheets「自選股」還原持股到 /tmp。
     解決 Render /tmp 重啟清空 → 持股遺失的問題。
@@ -3261,6 +3382,7 @@ def make_portfolio_menu_flex() -> dict:
          ("💗 立即持股警報","立即持股警報"),       # v10.9.68：手動 force 警報
          ("➕ 新增持股","新增持股說明"),
          ("💸 賣出登記","賣出說明"),               # v10.9.81：賣出指令說明
+         ("💰 手續費設定","查手續費"),             # v10.9.82：手續費折數
          ("📊 損益分析","損益分析"),
          ("🔴 停損提醒","停損提醒說明"),
          ("🎯 目標價提醒","目標價提醒說明")]
@@ -4554,10 +4676,10 @@ def save_sell_to_sheets(user_id, symbol, name, sell_shares, sell_price, cost_avg
 
 def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: float) -> dict:
     """v10.9.81：處理賣出 — 從持股扣股數、算已實現損益、寫 Sheets。
-    回傳 {"ok": bool, "msg": str, "realized_pnl": float, "remaining_shares": int, "name": str}
+    v10.9.82：含手續費 + 證交稅計算。
+    回傳 {"ok": bool, "msg": str, "realized_pnl": float, ..., "fee": int, "tax": int}
     """
     portfolio = load_portfolio()
-    # 找對應持股（複合 key + 相容舊 key）
     norm = stock_id.replace(".TW", "")
     candidates = [
         _pf_key(user_id, norm),
@@ -4582,7 +4704,12 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
         return {"ok": False,
                 "msg": f"❌ 賣出股數 {sell_shares:,} 超過持有 {held_shares:,} 股\n請確認"}
 
-    realized_pnl = (sell_price - cost_avg) * sell_shares
+    # v10.9.82：含手續費 + 證交稅
+    gross = sell_price * sell_shares
+    fee, tax = calc_sell_fee_tax(sell_price, sell_shares, user_id)
+    net_proceeds = gross - fee - tax
+    cost_total = cost_avg * sell_shares
+    realized_pnl = net_proceeds - cost_total
     remaining = held_shares - sell_shares
     name = NAME_CACHE.get(norm, norm)
 
@@ -4599,23 +4726,35 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
     save_sell_to_sheets(user_id, norm, name, sell_shares, sell_price, cost_avg, realized_pnl)
 
     sign = "🟢 賺" if realized_pnl >= 0 else "🔴 虧"
-    pct = (sell_price - cost_avg) / cost_avg * 100 if cost_avg else 0
+    pct = realized_pnl / cost_total * 100 if cost_total else 0
+    discount = get_user_fee_discount(user_id)
+    disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
     msg = (f"✅ 賣出完成：{norm} {name}\n"
            f"━━━━━━━━━━━━━━\n"
            f"　賣出 {sell_shares:,} 股 @ {sell_price:,.2f}\n"
-           f"　成本均價 {cost_avg:,.2f}\n"
+           f"　毛收入　{gross:>10,.0f}\n"
+           f"　手續費　-{fee:>9,}（折數 {disc_str}）\n"
+           f"　證交稅　-{tax:>9,}（0.3%）\n"
+           f"　淨收入　{net_proceeds:>10,.0f}\n"
+           f"　成本　　{cost_total:>10,.0f}（均價 {cost_avg:,.2f}）\n"
            f"　{sign}　{realized_pnl:+,.0f} 元（{pct:+.2f}%）\n"
            f"　剩餘庫存 {remaining:,} 股")
     return {"ok": True, "msg": msg, "realized_pnl": realized_pnl,
-            "remaining_shares": remaining, "name": name}
+            "remaining_shares": remaining, "name": name,
+            "fee": fee, "tax": tax, "gross": gross, "net": net_proceeds}
 
 
 def format_sell_import_preview(items: list, user_id: str) -> str:
-    """v10.9.81：賣出截圖辨識結果預覽，含預估已實現損益。"""
+    """v10.9.81：賣出截圖辨識結果預覽，含預估已實現損益。
+    v10.9.82：扣手續費 + 證交稅後的淨損益。
+    """
     if not items:
         return "❌ 沒有辨識到任何賣出交易"
     portfolio = load_portfolio()
+    discount = get_user_fee_discount(user_id)
+    disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
     lines = ["💸 辨識結果 — 賣出交易",
+             f"（手續費折數 {disc_str}　證交稅 0.3%）",
              "━━━━━━━━━━━━━━"]
     total_pnl = 0
     can_process = 0
@@ -4637,10 +4776,14 @@ def format_sell_import_preview(items: list, user_id: str) -> str:
             cost = float(held.get("buy_price", 0))
             held_n = int(held.get("shares", 0))
             if shares <= held_n:
-                pnl = (price - cost) * shares
+                gross = price * shares
+                fee, tax = calc_sell_fee_tax(price, shares, user_id)
+                net = gross - fee - tax
+                pnl = net - cost * shares
                 total_pnl += pnl
                 sign = "🟢" if pnl >= 0 else "🔴"
-                lines.append(f"　成本 {cost:,.2f} ‧ {sign} 預估 {pnl:+,.0f} 元")
+                lines.append(f"　毛 {gross:,.0f} ‧ 費 -{fee} ‧ 稅 -{tax}")
+                lines.append(f"　成本 {cost:,.2f} ‧ {sign} 淨 {pnl:+,.0f} 元")
                 can_process += 1
             else:
                 lines.append(f"　⚠ 持有僅 {held_n:,} 股，無法賣出 {shares:,}")
@@ -4649,7 +4792,7 @@ def format_sell_import_preview(items: list, user_id: str) -> str:
     lines.append("━━━━━━━━━━━━━━")
     if can_process:
         sign = "🟢" if total_pnl >= 0 else "🔴"
-        lines.append(f"預估合計：{sign} {total_pnl:+,.0f} 元（{can_process} 筆可處理）")
+        lines.append(f"預估合計淨損益：{sign} {total_pnl:+,.0f} 元（{can_process} 筆可處理）")
     lines.append("　• 輸入「確認賣出」執行")
     lines.append("　• 輸入「取消賣出」放棄")
     lines.append("　• 5 分鐘後自動取消")
@@ -8008,23 +8151,70 @@ def handle_message(event):
         parts=text.split()
         if len(parts)==4:
             raw=parts[1].upper(); market="台股" if raw.isdigit() else "美股"
-            # v10.9.73：台股統一不帶 .TW，並用複合 key（多使用者隔離）
             symbol=raw
             try:
+                shares=int(parts[2]); raw_price=float(parts[3])
+                # v10.9.82：成本均價含手續費
+                buy_fee = calc_buy_fee(raw_price, shares, user_id) if raw.isdigit() else 0
+                cost_avg = (raw_price * shares + buy_fee) / shares if shares else raw_price
                 p=load_portfolio()
-                p[_pf_key(user_id, symbol)]={"shares":int(parts[2]),"buy_price":float(parts[3]),"user_id":user_id}
+                p[_pf_key(user_id, symbol)]={"shares":shares,"buy_price":cost_avg,"user_id":user_id}
                 save_portfolio(p)
                 tw=get_tw_stock(raw) if raw.isdigit() else None
                 us=get_us_stock(raw) if not raw.isdigit() else None
                 name=(tw or us or {}).get("name",symbol) if (tw or us) else symbol
                 if not name or name==symbol:
                     name=NAME_CACHE.get(raw,symbol) if raw.isdigit() else symbol
-                save_portfolio_to_sheets(user_id,symbol,name,market,int(parts[2]),float(parts[3]))
+                save_portfolio_to_sheets(user_id,symbol,name,market,shares,cost_avg)
                 log_to_sheets(user_id,"新增持股",symbol,"成功")
+                discount = get_user_fee_discount(user_id)
+                disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
                 reply_text(event.reply_token,
-                      f"✅ 新增成功\n━━━━━━━━━━━━━━\n　{symbol}｜{name}\n　{parts[2]} 股　均價 {parts[3]}")
-            except: reply_text(event.reply_token,"格式錯誤\n範例：新增 2330 100 200")
+                      f"✅ 新增成功\n━━━━━━━━━━━━━━\n"
+                      f"　{symbol}｜{name}\n"
+                      f"　{shares:,} 股 @ {raw_price:,.2f}\n"
+                      f"　手續費 {buy_fee:,}（折數 {disc_str}）\n"
+                      f"　含費成本均價 {cost_avg:,.4f}")
+            except Exception as e:
+                reply_text(event.reply_token,"格式錯誤\n範例：新增 2330 100 200")
         else: reply_text(event.reply_token,"格式：新增 代碼 股數 買入價\n範例：新增 2330 100 200")
+        return
+
+    # v10.9.82：設定手續費折數 / 查詢
+    if text.startswith("設定手續費 "):
+        try:
+            v = text.split()[1]
+            n = int(v)
+            if not (1 <= n <= 100):
+                raise ValueError("out of range")
+            disc = n / 100.0
+            set_user_fee_discount(user_id, disc)
+            reply_text(event.reply_token,
+                f"✅ 手續費折數已設定\n━━━━━━━━━━━━━━\n"
+                f"目前折數：{n}%（{disc:.2f}）\n"
+                f"標準費率：0.1425%\n"
+                f"實際費率：{0.1425 * disc:.4f}%\n"
+                f"證交稅：0.3%（固定）\n\n"
+                f"⚠ 之後所有新增 / 賣出皆按此折數計算")
+        except:
+            reply_text(event.reply_token,
+                "格式：設定手續費 折數%\n"
+                "例如：設定手續費 28　→ 2.8 折\n"
+                "　　 設定手續費 60　→ 6 折\n"
+                "　　 設定手續費 100 → 無折扣")
+        return
+    if text in ["查手續費", "手續費", "目前手續費"]:
+        d = get_user_fee_discount(user_id)
+        disc_str = f"{int(d*100)}%" if d < 1.0 else "100%（無折扣）"
+        reply_text(event.reply_token,
+            f"💸 你的手續費設定\n━━━━━━━━━━━━━━\n"
+            f"折數：{disc_str}\n"
+            f"標準費率：0.1425%\n"
+            f"實際費率：{0.1425 * d:.4f}%\n"
+            f"證交稅：0.3%（固定）\n"
+            f"最低手續費：{TW_MIN_COMMISSION} 元\n\n"
+            f"變更：輸入「設定手續費 折數%」\n"
+            f"例：設定手續費 28")
         return
 
     if text.startswith("刪除 "):
