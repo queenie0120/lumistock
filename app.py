@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.117"
+VERSION              = "10.9.118"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -7242,6 +7242,62 @@ def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
     return merged[:count]
 
 
+# v10.9.118 Phase 5：美股→台股供應鏈連動硬編對應表
+# 對應規格 project_us_news_spec.md「十二、美股新聞要和台股聯動」
+US_TO_TW_SUPPLY_CHAIN = {
+    # ── AI / 半導體 / 雲端 ──
+    "NVDA": ["2330 台積電", "3017 奇鋐", "2308 台達電", "AI 伺服器族群"],
+    "AMD":  ["2330 台積電", "2308 台達電", "AI 概念股"],
+    "AVGO": ["2330 台積電", "3017 奇鋐", "AI 網通供應鏈"],
+    "TSM":  ["2330 台積電（母公司 ADR）", "台股半導體族群整體"],
+    "INTC": ["2330 台積電（代工關係）", "PC 供應鏈"],
+    "QCOM": ["2454 聯發科（競爭）", "手機晶片供應鏈"],
+    "MRVL": ["2330 台積電", "網通晶片相關"],
+    "ARM":  ["2330 台積電", "晶片設計相關"],
+    "ASML": ["2330 台積電（設備客戶）"],
+    "MU":   ["3260 威剛", "2408 南亞科", "DRAM / NAND 族群"],
+    # ── 蘋果產業鏈 ──
+    "AAPL": ["2317 鴻海", "3008 大立光", "3406 玉晶光", "2454 聯發科",
+             "4938 和碩", "2330 台積電", "蘋概股族群"],
+    # ── 電動車 / 車用電子 ──
+    "TSLA": ["2308 台達電", "2376 技嘉", "電動車零件族群", "車用電子族群"],
+    "RIVN": ["電動車零件族群"], "LCID": ["電動車零件族群"],
+    # ── 雲端 / AI 軟體 ──
+    "MSFT": ["AI 雲端基建供應鏈", "2330 台積電（伺服器晶片）"],
+    "GOOG": ["AI 基建相關"], "GOOGL": ["AI 基建相關"],
+    "ORCL": ["雲端基建相關"],
+    "CRM":  ["雲端 SaaS"],
+    # ── 社群 / 消費科技 ──
+    "META": ["VR / AI 相關供應鏈", "2330 台積電（AI 晶片）"],
+    "AMZN": ["雲端 + 電商物流相關"],
+    "NFLX": [],
+    # ── 網通 / 5G ──
+    "CSCO": ["網通設備供應鏈"],
+    "ANET": ["AI 網通", "3037 欣興"],
+    # ── 金融 / 消費 ──
+    "JPM": [], "BAC": [], "GS": [], "MS": [],
+    # ── 大盤指數連動（^Ticker）──
+    "^GSPC": ["影響台股大盤", "外資資金流向"],
+    "^IXIC": ["科技股 / 半導體族群（敏感）"],
+    "^DJI":  ["影響台股大盤"],
+    "^SOX":  ["費半 → 台半導體族群（高度連動）"],
+    "^VIX":  ["恐慌指數 → 影響台股波動"],
+}
+
+def _us_supply_chain_for(ticker: str) -> list:
+    """v10.9.118：查美股對應的台股供應鏈。沒對應回空 list。"""
+    return US_TO_TW_SUPPLY_CHAIN.get(ticker.upper(), [])
+
+def _us_supply_chain_text(ticker: str) -> str:
+    """v10.9.118：把供應鏈 list 組成短字串給 UI 用。"""
+    chain = _us_supply_chain_for(ticker)
+    if not chain: return ""
+    # 顯示前 2 個 + 「等 N 檔」
+    if len(chain) <= 2:
+        return " / ".join(chain)
+    return f"{chain[0]} / {chain[1]} 等 {len(chain)} 檔"
+
+
 def ai_analyze_us_news(items: list, ticker: str, ticker_name: str) -> list:
     """v10.9.115 Phase 3 完整版：一次 batch Groq 呼叫分析新聞。
     對每則新聞補上：
@@ -7276,14 +7332,22 @@ def ai_analyze_us_news(items: list, ticker: str, ticker_name: str) -> list:
 
     # 構造 prompt
     news_text = "\n".join([f"{idx+1}. {it[1].get('title','')}" for idx, it in enumerate(to_analyze)])
-    system_prompt = f"""你是專業美股新聞分析師。針對股票 {ticker} ({ticker_name}) 分析以下新聞。
+    # v10.9.118：把美股→台股供應鏈當 context 餵給 AI（規格十二）
+    chain_list = _us_supply_chain_for(ticker)
+    chain_hint = ""
+    if chain_list:
+        chain_hint = f"\n\n【{ticker} 已知對台股供應鏈影響】（請優先參考）：\n" + \
+                     " / ".join(chain_list[:5])
+
+    system_prompt = f"""你是專業美股新聞分析師。針對股票 {ticker} ({ticker_name}) 分析以下新聞。{chain_hint}
+
 對每則回傳一個 JSON object，欄位嚴格如下：
 
 - category: 必為 "個股" / "產業" / "總經" / "市場情緒" / "國際" / "台股連動" 之一
 - importance_ai: 必為 "高" / "中" / "低" 之一（依規格：財報/Fed/併購/大幅升降評/出口管制=高；產業趨勢/法人觀點=中；雜訊=低）
 - sentiment_6: 必為 "偏多" / "偏空" / "中性" / "觀望" / "短多長空" / "短空長多" 之一
 - summary_zh: 20 字內中文摘要，必須說重點，不要照抄標題
-- impact_tw: 10-15 字內，對台股供應鏈/族群影響（例如「台積電供應鏈受惠」「無直接連動」）
+- impact_tw: 10-15 字內，對台股供應鏈/族群影響（用上方已知對應，例如「台積電 / 鴻海 供應鏈受惠」；若新聞無實質影響，回「無直接連動」）
 - relevance: 0-100 整數，與 {ticker} ({ticker_name}) 的實質相關度（純粹提到名字 ≤ 30；實質影響 ≥ 70）
 - keep: true/false，是否建議保留（雜訊、無關、過時 → false）
 
@@ -7308,16 +7372,21 @@ def ai_analyze_us_news(items: list, ticker: str, ticker_name: str) -> list:
         return items
 
     # 套用 AI 結果到原 items
+    chain_fallback = _us_supply_chain_text(ticker)   # v10.9.118：AI 空白時的備援
     for ai_idx, (orig_idx, _) in enumerate(to_analyze):
         if ai_idx >= len(ai_data): break
         ai = ai_data[ai_idx]
         if not isinstance(ai, dict): continue
+        impact_tw_raw = str(ai.get("impact_tw", ""))[:30]
+        # v10.9.118：AI 沒給或給「無連動」但實際有供應鏈 → 用硬編表
+        if (not impact_tw_raw or impact_tw_raw in ("無直接連動", "無連動", "無影響")) and chain_fallback:
+            impact_tw_raw = f"參考：{chain_fallback}"
         data = {
             "category": str(ai.get("category", ""))[:10],
             "importance_ai": str(ai.get("importance_ai", ""))[:2],
             "sentiment_6": str(ai.get("sentiment_6", ""))[:6],
             "summary_zh": str(ai.get("summary_zh", ""))[:40],
-            "impact_tw": str(ai.get("impact_tw", ""))[:30],
+            "impact_tw": impact_tw_raw,
             "relevance": int(ai.get("relevance", 50)) if str(ai.get("relevance","")).isdigit() else 50,
             "keep": ai.get("keep", True),
         }
