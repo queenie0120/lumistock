@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.111"
+VERSION              = "10.9.112"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6888,63 +6888,157 @@ def clean_title(t:str)->str:
     t=t.split(" - ")[0].strip(); t=re.sub(r'\s+',' ',t)
     return t[:32]+"…" if len(t)>32 else t
 
-def get_us_stock_news(symbol: str, name: str, count: int = 4) -> list:
-    """v10.9.111：抓美股個股新聞（英文）。
-    來源：
-      1. Google News (hl=en, gl=US) — 用 "{symbol} {name} stock news" 搜尋
-      2. Yahoo Finance RSS（按 ticker）
-    回傳 [(title, url), ...]，去重 + 限制權威來源優先。
+# v10.9.112 Phase 1：美股新聞來源權重表（依規格書「二、來源權重排序」）
+US_NEWS_SOURCE_WEIGHTS = {
+    # 最高權重（規格 1-7）
+    "reuters.com": 100, "bloomberg.com": 100, "wsj.com": 100, "cnbc.com": 100,
+    # 中高權重（規格 8-12）
+    "apnews.com": 90, "ap.org": 90,
+    "nasdaq.com": 85, "nyse.com": 85,
+    "marketwatch.com": 80, "barrons.com": 80,
+    # 中等權重（規格 13-16）
+    "finance.yahoo.com": 65, "yahoo.com": 60,
+    "investing.com": 60, "tradingview.com": 55, "seekingalpha.com": 55,
+    # 華語輔助（規格 17-21）
+    "cnyes.com": 50, "udn.com": 50, "money.udn.com": 50,
+    "chinatimes.com": 50, "moneydj.com": 50, "wantgoo.com": 45,
+    # 補充常見可信
+    "ft.com": 90, "forbes.com": 60, "businessinsider.com": 50,
+    "fool.com": 45, "zacks.com": 50,
+}
+
+US_NEWS_SOURCE_NAMES = {
+    "reuters.com": "Reuters", "bloomberg.com": "Bloomberg", "wsj.com": "WSJ",
+    "cnbc.com": "CNBC", "apnews.com": "AP", "ap.org": "AP",
+    "nasdaq.com": "Nasdaq", "nyse.com": "NYSE",
+    "marketwatch.com": "MarketWatch", "barrons.com": "Barron's",
+    "finance.yahoo.com": "Yahoo Finance", "yahoo.com": "Yahoo",
+    "investing.com": "Investing.com", "tradingview.com": "TradingView",
+    "seekingalpha.com": "Seeking Alpha",
+    "cnyes.com": "鉅亨網", "udn.com": "經濟日報", "money.udn.com": "經濟日報",
+    "chinatimes.com": "工商時報", "moneydj.com": "MoneyDJ", "wantgoo.com": "玩股網",
+    "ft.com": "FT", "forbes.com": "Forbes",
+    "businessinsider.com": "Business Insider", "fool.com": "Motley Fool", "zacks.com": "Zacks",
+}
+
+def _us_news_source_weight(url: str) -> int:
+    """v10.9.112：URL → 來源權重；未列出回 10（低）。"""
+    u = (url or "").lower()
+    best = 10
+    for domain, w in US_NEWS_SOURCE_WEIGHTS.items():
+        if domain in u and w > best: best = w
+    return best
+
+def _us_news_source_name(url: str) -> str:
+    """v10.9.112：URL → 顯示用來源名。"""
+    u = (url or "").lower()
+    for domain, name in US_NEWS_SOURCE_NAMES.items():
+        if domain in u: return name
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(u).netloc.replace("www.", "").split(".")[0]
+        return host.title() if host else "綜合"
+    except: return "綜合"
+
+
+def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
+    """v10.9.112 Phase 1：美股新聞多來源 + 權重排序。
+    對應規格書一/二/三：
+    - 多來源並查（Google News 英文/中文 + Yahoo RSS）
+    - 權重排序（Reuters/Bloomberg/WSJ/CNBC 優先，內容農場低分）
+    - 標題必須提到 ticker 或公司名（避免抓不相關新聞）
+    - 簡單 normalize_title 去重（Phase 2 才做完整事件合併）
+    回傳 [{title, url, source, date}, ...] 直接餵 make_stock_news_carousel。
     """
     headers = {"User-Agent": "Mozilla/5.0"}
-    all_results = []
+    name_clean = (name or "").strip()
+    # 去掉公司類型尾綴
+    for suffix in [", Inc.", " Inc.", " Corp.", " Corporation", " Ltd.", " LLC", " plc"]:
+        if name_clean.endswith(suffix):
+            name_clean = name_clean[:-len(suffix)].strip()
 
-    # 1. Google News 英文
-    try:
-        query = f"{symbol} {name} stock"
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-US&gl=US&ceid=US:en"
-        r = requests.get(url, timeout=8, headers=headers)
-        root = ET.fromstring(r.content)
-        for item in root.findall(".//item")[:count*3]:
-            title = clean_title(item.findtext("title", ""))
-            link = item.findtext("link", "").strip()
-            if title and link and is_real_news(title):
-                all_results.append((title, link))
-    except Exception as e:
-        dlog("US_NEWS", f"Google News fail: {type(e).__name__}: {e}")
+    def _parse_rss(url: str, max_items: int, label: str) -> list:
+        try:
+            r = requests.get(url, timeout=6, headers=headers)
+            if r.status_code != 200:
+                dlog("US_NEWS", f"{label} HTTP {r.status_code}")
+                return []
+            root = ET.fromstring(r.content)
+            out = []
+            for it in root.findall(".//item")[:max_items]:
+                t = clean_title(it.findtext("title", "") or "")
+                link = (it.findtext("link", "") or "").strip()
+                if not t or not link or not is_real_news(t): continue
+                # Google News 標題尾巴常有「... - Source」→ 切掉
+                if " - " in t:
+                    head, _ = t.rsplit(" - ", 1)
+                    if len(head) > 10: t = head.strip()
+                pub = (it.findtext("pubDate", "") or "").strip()
+                ds = pub
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(pub)
+                    ds = dt.astimezone(TZ_TAIPEI).strftime("%m/%d %H:%M")
+                except: pass
+                out.append({"title": t, "url": link, "date": ds})
+            return out
+        except Exception as e:
+            dlog("US_NEWS", f"{label} fail: {type(e).__name__}")
+            return []
 
-    # 2. Yahoo Finance RSS（個股）
-    try:
-        url = f"https://finance.yahoo.com/rss/headline?s={symbol}"
-        r = requests.get(url, timeout=8, headers=headers)
-        root = ET.fromstring(r.content)
-        for item in root.findall(".//item")[:count*2]:
-            title = clean_title(item.findtext("title", ""))
-            link = item.findtext("link", "").strip()
-            if title and link:
-                all_results.append((title, link))
-    except Exception as e:
-        dlog("US_NEWS", f"Yahoo RSS fail: {type(e).__name__}: {e}")
+    q_en = f"{symbol} {name_clean}".strip() if name_clean else symbol
+    q_zh = f"{symbol} {name_clean}".strip() if name_clean else symbol
+    url_en = f"https://news.google.com/rss/search?q={requests.utils.quote(q_en)}&hl=en-US&gl=US&ceid=US:en"
+    url_zh = f"https://news.google.com/rss/search?q={requests.utils.quote(q_zh)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    url_yh = f"https://finance.yahoo.com/rss/headline?s={symbol}"
 
-    # 權威來源優先 + 去重
-    TRUSTED_US = ["reuters.com", "cnbc.com", "bloomberg.com", "marketwatch.com",
-                  "wsj.com", "barrons.com", "investing.com", "benzinga.com",
-                  "seekingalpha.com", "finance.yahoo.com", "ft.com", "forbes.com",
-                  "cnn.com/business", "apnews.com"]
-    trusted = []
-    untrusted = []
-    seen_titles = set()
-    for t, u in all_results:
-        key = normalize_title(t)[:25] if t else ""
-        if not key or key in seen_titles: continue
-        seen_titles.add(key)
-        if any(s in u.lower() for s in TRUSTED_US):
-            trusted.append((t, u))
-        else:
-            untrusted.append((t, u))
-    combined = trusted[:count]
-    if len(combined) < count:
-        combined += untrusted[:count - len(combined)]
-    return combined[:count]
+    from concurrent.futures import ThreadPoolExecutor
+    all_items = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fs = [pool.submit(_parse_rss, url_en, 25, "GoogleEN"),
+              pool.submit(_parse_rss, url_zh, 15, "GoogleZH"),
+              pool.submit(_parse_rss, url_yh, 15, "YahooRSS")]
+        for f in fs:
+            try: all_items += f.result(timeout=10)
+            except: pass
+
+    # 套權重 + 來源名
+    for it in all_items:
+        it["weight"] = _us_news_source_weight(it["url"])
+        it["source"] = _us_news_source_name(it["url"])
+
+    # 篩選（規格三）：標題必須相關，或來源權重夠高
+    sym_l = symbol.lower()
+    name_first = name_clean.split()[0].lower() if name_clean else ""
+    candidates = []
+    seen = set()
+    for it in all_items:
+        norm = normalize_title(it["title"])[:30]
+        if not norm or norm in seen: continue
+        title_l = it["title"].lower()
+        has_ticker = sym_l in title_l
+        has_name = bool(name_first) and len(name_first) >= 3 and name_first in title_l
+        if has_ticker or has_name:
+            seen.add(norm); candidates.append(it)
+        elif it["weight"] >= 80:
+            # 高權重源即使沒提 ticker 也保留（可能是大盤/產業新聞）
+            seen.add(norm); candidates.append(it)
+
+    # 排序：權重高優先，標題含 ticker 加分
+    def _sort_key(it):
+        title_has_ticker = sym_l in it["title"].lower()
+        return (-it["weight"], 0 if title_has_ticker else 1)
+    candidates.sort(key=_sort_key)
+
+    dlog("US_NEWS", f"{symbol}：{len(all_items)} 抓 → {len(candidates)} 篩 → 取 {count}")
+    return candidates[:count]
+
+
+def get_us_stock_news(symbol: str, name: str, count: int = 4) -> list:
+    """v10.9.112：給 stock card 用的版本 — 回傳 [(title, url), ...] tuples。
+    底層走 v2 多來源 + 權重，這裡只是格式轉換。"""
+    enriched = get_us_stock_news_v2(symbol, name, count)
+    return [(it["title"], it["url"]) for it in enriched]
 
 
 def get_news(query:str, count:int=4, trusted_only:bool=True)->list:
@@ -10624,27 +10718,36 @@ def handle_message(event):
     # ══ 股票代號查詢 ══
     t=text.upper().replace("查","").strip()
     if t and (t.isdigit() or (t.isalpha() and len(t)>=1) or t.replace("-","").isalnum()):
-        # v10.9.58：「個股新聞」模式 — 5 分鐘內輸入代號 → 回新聞 carousel（不是個股 Flex）
+        # v10.9.58：「個股新聞」模式 — 5 分鐘內輸入代號 → 回新聞 carousel
         waiting_at = WAITING_STOCK_NEWS.get(user_id)
         if waiting_at and (time.time() - waiting_at) < 300:
             WAITING_STOCK_NEWS.pop(user_id, None)
             dlog("HANDLER", f"→ 個股新聞 carousel {t}")
-            # 嘗試解出中文名（先用快取，再用 fallback）
-            name = NAME_CACHE.get(t, "")
-            if not has_chinese(name):
-                name = get_tw_stock_name_fallback(t) or ""
-            # v10.9.76：多來源（FinMind 直接連結 + Google 多媒體），去重補充更多
-            fm = get_finmind_news_enriched(t, count=10)
-            gq = f"{t} {name}".strip() if has_chinese(name) else f"{t} 股票"
-            gg = get_google_news_multi(gq, count=10)
-            news_dicts = _merge_dedup_news(fm, gg, count=12)
+            # v10.9.112：分台股 / 美股走不同新聞源
+            is_us = t.isalpha() and len(t) <= 5  # 美股 ticker: 1-5 個字母
+            if is_us:
+                # 美股：多來源 + 權重排序（規格 Phase 1）
+                us_data = get_us_stock(t)
+                us_name = (us_data.get("name") if us_data else "") or t
+                news_dicts = get_us_stock_news_v2(t, us_name, count=4)
+                display_name = us_name
+            else:
+                # 台股：FinMind + Google 多來源（既有）
+                name = NAME_CACHE.get(t, "")
+                if not has_chinese(name):
+                    name = get_tw_stock_name_fallback(t) or ""
+                fm = get_finmind_news_enriched(t, count=10)
+                gq = f"{t} {name}".strip() if has_chinese(name) else f"{t} 股票"
+                gg = get_google_news_multi(gq, count=10)
+                news_dicts = _merge_dedup_news(fm, gg, count=12)
+                display_name = name or t
             if news_dicts:
-                carousel = make_stock_news_carousel(t, name or t, news_dicts)
+                carousel = make_stock_news_carousel(t, display_name, news_dicts)
                 if carousel:
                     reply_flex(event.reply_token, carousel, f"{t} 個股新聞")
                     return
             reply_text(event.reply_token,
-                f"📰 {t} {name}\n━━━━━━━━━━━━━━\n近期無相關新聞\n或資料源暫時無法取得")
+                f"📰 {t} {display_name}\n━━━━━━━━━━━━━━\n近期無相關新聞\n或資料源暫時無法取得")
             return
         dlog("HANDLER", f"→ 股票查詢 {t}")
         flex,err=get_stock_flex(t,user_id)
