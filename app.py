@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.112"
+VERSION              = "10.9.113"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6941,6 +6941,74 @@ def _us_news_source_name(url: str) -> str:
     except: return "綜合"
 
 
+def _us_news_normalize(title: str) -> str:
+    """v10.9.113 Phase 2：跨來源比對用的標題正規化。
+    去標點 / lowercase / 合併空白。"""
+    t = (title or "").lower()
+    t = re.sub(r'[^\w\s]', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+def _us_news_title_similar(a: str, b: str) -> float:
+    """v10.9.113 Phase 2：標題相似度（綜合 SequenceMatcher + Jaccard）。
+    回傳 0-1，越接近 1 越像同事件。
+    """
+    from difflib import SequenceMatcher
+    na = _us_news_normalize(a)
+    nb = _us_news_normalize(b)
+    if not na or not nb: return 0.0
+    # SequenceMatcher（字元層級）
+    sm = SequenceMatcher(None, na, nb).ratio()
+    # Jaccard（詞層級，>= 3 字才算 token，過濾雜訊）
+    ta = {w for w in na.split() if len(w) >= 3}
+    tb = {w for w in nb.split() if len(w) >= 3}
+    if ta and tb:
+        jac = len(ta & tb) / len(ta | tb)
+    else:
+        jac = 0.0
+    # 取較高者（兩種同事件都會中一種）
+    return max(sm, jac)
+
+def _us_news_merge_events(items: list, count: int = 4, sim_threshold: float = 0.5) -> list:
+    """v10.9.113 Phase 2：同事件合併。
+    1. 高權重源代表事件
+    2. 相似度 > threshold → 視為同事件
+    3. 其他來源合併到 also_sources（含 url）
+    4. source 欄位改用「來源 · 來源 ...」呈現
+
+    items: 已排序的 [{title, url, source, date, weight}, ...]
+    回傳同樣結構，但 source 可能變成多源合併字串、新增 also_sources 鍵。
+    """
+    if not items: return []
+    events = []
+    used = set()
+    for i, item in enumerate(items):
+        if i in used: continue
+        rep = dict(item)
+        also = []   # [{name, url}, ...]
+        for j in range(i+1, len(items)):
+            if j in used: continue
+            sim = _us_news_title_similar(item["title"], items[j]["title"])
+            if sim >= sim_threshold:
+                used.add(j)
+                src = items[j].get("source", "")
+                if src and src != item.get("source", "") and \
+                   not any(s["name"] == src for s in also):
+                    also.append({"name": src, "url": items[j].get("url", "")})
+        if also:
+            # 來源欄合併呈現：主來源 · 來源 2 · 來源 3（最多顯示 3 個）
+            names = [item.get("source", "綜合")] + [s["name"] for s in also]
+            display = " · ".join(names[:3])
+            if len(names) > 3:
+                display += f" 等 {len(names)} 來源"
+            rep["source"] = display
+            rep["also_sources"] = also
+        events.append(rep)
+        used.add(i)
+        if len(events) >= count: break
+    return events
+
+
 def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
     """v10.9.112 Phase 1：美股新聞多來源 + 權重排序。
     對應規格書一/二/三：
@@ -7030,8 +7098,13 @@ def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
         return (-it["weight"], 0 if title_has_ticker else 1)
     candidates.sort(key=_sort_key)
 
-    dlog("US_NEWS", f"{symbol}：{len(all_items)} 抓 → {len(candidates)} 篩 → 取 {count}")
-    return candidates[:count]
+    # v10.9.113 Phase 2：同事件合併（相似度 >= 0.5）
+    # candidates 已按權重排序，最高權重者為事件代表
+    # 給 merge 多一些素材（取 count*4），merge 完再截 count
+    merged = _us_news_merge_events(candidates[:count*4], count=count, sim_threshold=0.5)
+
+    dlog("US_NEWS", f"{symbol}：{len(all_items)} 抓 → {len(candidates)} 篩 → {len(merged)} 事件 → 取 {count}")
+    return merged[:count]
 
 
 def get_us_stock_news(symbol: str, name: str, count: int = 4) -> list:
