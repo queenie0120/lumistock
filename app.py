@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.106"
+VERSION              = "10.9.107"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4576,80 +4576,226 @@ def get_tw_stock_name_fallback(stock_id: str) -> str:
 # ══════════════════════════════════════════
 #  台股資料
 # ══════════════════════════════════════════
-def get_tw_stock(stock_id: str) -> dict:
+def _fetch_tw_mis(stock_id: str) -> dict:
+    """v10.9.107: TWSE MIS API。回傳 raw dict 或 None。
+    包含 price/prev/open/high/low/vol/name/is_realtime。"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    for ex in ["tse","otc"]:
+    for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
-            r   = requests.get(url, headers=headers, timeout=8, verify=False)
-            d   = r.json().get("msgArray",[])
+            r = requests.get(url, headers=headers, timeout=5, verify=False)
+            d = r.json().get("msgArray", [])
             if not d: continue
             d = d[0]
-            raw_name = d.get("n","").strip()
+            raw_name = d.get("n", "").strip()
             if not raw_name: continue
-            y = d.get("y","-")
+            y = d.get("y", "-")
             if y in ["-","","0",None]: continue
             prev = float(y)
-            z = d.get("z","-")
-            if z not in ["-","","0",None]: price=float(z); is_rt=True
-            else: price=prev; is_rt=False
-            chg=price-prev; pct=chg/prev*100 if prev else 0
-
-            # v10.9.42：除權息日當天，MIS 的 y（昨收）沒扣股利，需修正
-            ex_div = get_ex_dividend_info(stock_id)
-            if ex_div:
-                cash = ex_div["cash"]
-                # 除息參考價 = 昨收 - 現金股利
-                ref_price = prev - cash
-                chg = price - ref_price
-                pct = chg/ref_price*100 if ref_price else 0
-                dlog("EXDIV", f"{stock_id} 今日除息 {cash} 元，修正漲跌：{price}-{ref_price:.2f}={chg:+.2f}({pct:+.2f}%)")
-
-            if has_chinese(raw_name): NAME_CACHE[stock_id]=raw_name; name=raw_name
+            z = d.get("z", "-")
+            if z not in ["-","","0",None]:
+                price = float(z); is_rt = True
             else:
-                name=NAME_CACHE.get(stock_id,"")
-                if not has_chinese(name): name=get_tw_stock_name_fallback(stock_id)
-                if not has_chinese(name): name=stock_id
-            tv=d.get("tv","-"); v=d.get("v","-")
+                price = prev; is_rt = False
+            tv = d.get("tv", "-"); v = d.get("v", "-")
+            vol_lots = None
             if tv not in ["-","","0",None]:
-                try: vol_str=f"{int(float(str(tv).replace(',',''))):,} 張"
-                except: vol_str="N/A"
+                try: vol_lots = int(float(str(tv).replace(",", "")))
+                except: pass
             elif v not in ["-","","0",None]:
-                try: vol_str=f"{int(float(str(v).replace(',',''))):,} 張"
-                except: vol_str="N/A"
-            else: vol_str="N/A"
-            open_v=d.get("o","-"); high_v=d.get("h","-"); low_v=d.get("l","-")
-            open_v="N/A" if open_v in ["-","","0"] else open_v
-            high_v="N/A" if high_v in ["-","","0"] else high_v
-            low_v ="N/A" if low_v  in ["-","","0"] else low_v
-            result = {"name":name,"price":price,"chg":chg,"pct":pct,
-                    "open":open_v,"high":high_v,"low":low_v,"vol":vol_str,
-                    "market_type":"台股","status":"盤中" if is_rt else "試撮","source":"TWSE 即時",
-                    "meta": build_data_meta("TWSE MIS", is_realtime=is_rt, is_fallback=False, delay_min=0)}
-            # v10.9.42：除權息日，傳遞給 UI 顯示
-            if ex_div:  # ex_div 在上方計算 chg 時已賦值（None 或 dict）
-                result["ex_dividend"] = ex_div["cash"]
-            return result
-        except: pass
+                try: vol_lots = int(float(str(v).replace(",", "")))
+                except: pass
+            return {
+                "source": "TWSE MIS",
+                "price": price, "prev": prev,
+                "open": d.get("o"), "high": d.get("h"), "low": d.get("l"),
+                "vol_lots": vol_lots,  # 已是「張」單位
+                "name": raw_name if has_chinese(raw_name) else "",
+                "is_realtime": is_rt,
+            }
+        except Exception as e:
+            dlog("TW_STOCK", f"MIS {stock_id} {ex} fail: {type(e).__name__}")
+            continue
+    return None
 
+
+def _fetch_tw_yahoo(stock_id: str) -> dict:
+    """v10.9.107: Yahoo Chart API。回傳 raw dict 或 None。
+    含 stale 偵測（regularMarketTime > 24hr 視為過期）。"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for suffix in [".TW", ".TWO"]:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
+            r = requests.get(url, headers=headers, timeout=5)
+            result = r.json()["chart"]["result"][0]
+            meta = result["meta"]
+            quotes = result.get("indicators", {}).get("quote", [{}])[0]
+            opens = [o for o in quotes.get("open", []) if o is not None]
+            highs = [h for h in quotes.get("high", []) if h is not None]
+            lows  = [l for l in quotes.get("low", []) if l is not None]
+            vols  = [v for v in quotes.get("volume", []) if v is not None]
+            closes = [c for c in quotes.get("close", []) if c is not None]
+            price = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
+            prev  = closes[-2] if len(closes) >= 2 else (meta.get("chartPreviousClose") or price)
+            # Stale 偵測：regularMarketTime 超過 24 小時前 → 跳過
+            rmt = meta.get("regularMarketTime", 0)
+            if rmt:
+                age_hr = (datetime.now(timezone.utc).timestamp() - float(rmt)) / 3600
+                if age_hr > 24:
+                    dlog("TW_STOCK", f"Yahoo {stock_id}{suffix} stale {age_hr:.1f}hr 前，跳過")
+                    continue
+            if not price or price <= 0:
+                continue
+            return {
+                "source": "Yahoo Finance",
+                "price": float(price), "prev": float(prev) if prev else float(price),
+                "open": opens[-1] if opens else None,
+                "high": highs[-1] if highs else None,
+                "low": lows[-1] if lows else None,
+                "vol_lots": (vols[-1] // 1000) if vols else None,  # Yahoo 是「股」，換算「張」
+                "name": "",
+                "is_realtime": False,  # 略有延遲
+            }
+        except Exception as e:
+            dlog("TW_STOCK", f"Yahoo {stock_id}{suffix} fail: {type(e).__name__}")
+            continue
+    return None
+
+
+def _validate_tw_sources(mis: dict, yahoo: dict) -> tuple:
+    """v10.9.107: 多源驗證 — 返回 (picked, validation_label)。
+    規則：
+      兩源差 < 1%  → ✓ 採 TWSE（官方）
+      兩源差 1~5% → ⚠ 採 TWSE，標 Yahoo 偏差
+      兩源差 > 5% → ⚠ 採 TWSE，警告請確認
+      單一來源    → ⚠ 標單一來源
+      全失敗     → (None, 失敗訊息)
+    """
+    if not mis and not yahoo:
+        return None, "❌ 所有來源失敗"
+    if mis and not yahoo:
+        return mis, "⚠ 單一來源 TWSE（Yahoo 失敗）"
+    if yahoo and not mis:
+        return yahoo, "⚠ 單一來源 Yahoo（TWSE 失敗）"
+    # 兩源都有
+    mp, yp = mis["price"], yahoo["price"]
+    if mp <= 0 or yp <= 0:
+        chosen = mis if mp > 0 else yahoo
+        return chosen, "⚠ 一源異常，採另一源"
+    diff_pct = abs(mp - yp) / mp * 100
+    if diff_pct < 1.0:
+        return mis, f"✓ 雙源一致（TWSE={mp:.2f} / Yahoo={yp:.2f}）"
+    elif diff_pct < 5.0:
+        return mis, f"⚠ 雙源差 {diff_pct:.2f}%，採 TWSE 官方"
+    else:
+        return mis, f"⚠ 雙源差距大 {diff_pct:.2f}%，採 TWSE 官方（請確認）"
+
+
+def get_tw_stock(stock_id: str) -> dict:
+    """v10.9.107：多源驗證版。
+    1. 並行查 TWSE MIS + Yahoo（各 5 秒 timeout）
+    2. 比對結果挑最可信
+    3. 都失敗才 fallback STOCK_DAY（含日期驗證）
+    4. 真的全失敗回 None（UI 顯示「資料暫時無法取得」）
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_mis = pool.submit(_fetch_tw_mis, stock_id)
+        f_yh  = pool.submit(_fetch_tw_yahoo, stock_id)
+        mis = None; yh = None
+        try: mis = f_mis.result(timeout=8)
+        except Exception as e: dlog("TW_STOCK", f"MIS thread {stock_id}: {e}")
+        try: yh = f_yh.result(timeout=8)
+        except Exception as e: dlog("TW_STOCK", f"Yahoo thread {stock_id}: {e}")
+
+    picked, label = _validate_tw_sources(mis, yh)
+    dlog("TW_STOCK", f"{stock_id}：{label}")
+
+    if picked:
+        prev = picked.get("prev", 0)
+        price = picked["price"]
+        chg = price - prev
+        pct = chg / prev * 100 if prev else 0
+
+        # 名稱解析（優先 MIS 中文名，次之 NAME_CACHE，再次 fallback）
+        name = ""
+        if mis and mis.get("name"):
+            name = mis["name"]
+            NAME_CACHE[stock_id] = name
+        if not has_chinese(name):
+            name = NAME_CACHE.get(stock_id, "")
+        if not has_chinese(name):
+            name = get_tw_stock_name_fallback(stock_id) or stock_id
+
+        # v10.9.42：除權息日修正
+        ex_div = get_ex_dividend_info(stock_id)
+        if ex_div:
+            cash = ex_div["cash"]
+            ref_price = prev - cash
+            chg = price - ref_price
+            pct = chg / ref_price * 100 if ref_price else 0
+
+        def _fmt(v):
+            if v is None: return "N/A"
+            if isinstance(v, str) and v in ("-", "", "0"): return "N/A"
+            try: return f"{float(v):.2f}"
+            except: return str(v) if v else "N/A"
+
+        vol_lots = picked.get("vol_lots")
+        vol_str = f"{vol_lots:,} 張" if isinstance(vol_lots, int) and vol_lots > 0 else "N/A"
+
+        is_rt = picked.get("is_realtime", False)
+        result = {
+            "name": name, "price": price, "chg": chg, "pct": pct,
+            "open": _fmt(picked.get("open")),
+            "high": _fmt(picked.get("high")),
+            "low":  _fmt(picked.get("low")),
+            "vol": vol_str,
+            "market_type": "台股",
+            "status": "盤中" if is_rt else "盤後/延遲",
+            "source": picked["source"],
+            "validation": label,  # v10.9.107：UI 可顯示
+            "meta": build_data_meta(picked["source"],
+                                    is_realtime=is_rt, is_fallback=False,
+                                    delay_min=0 if is_rt else 15),
+        }
+        if ex_div:
+            result["ex_dividend"] = ex_div["cash"]
+        return result
+
+    # 兩源全失敗 → 嘗試 STOCK_DAY（嚴格日期驗證，只接受今天）
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
-        r   = requests.get(url, headers=headers, timeout=8, verify=False)
+        r = requests.get(url, headers=headers, timeout=8, verify=False)
         data = r.json()
-        if data.get("stat")=="OK" and data.get("data"):
-            rows=data["data"]; last=rows[-1]
-            price=float(last[6].replace(",","")); prev=float(rows[-2][6].replace(",","")) if len(rows)>1 else price
-            chg=price-prev; pct=chg/prev*100 if prev else 0
-            try: vol_str=f"{int(float(last[1].replace(',',''))//1000):,} 張"
-            except: vol_str="N/A"
-            name=NAME_CACHE.get(stock_id,"")
-            if not has_chinese(name): name=get_tw_stock_name_fallback(stock_id)
-            if not has_chinese(name): name=stock_id
-            return {"name":name,"price":price,"chg":chg,"pct":pct,
-                    "open":last[3].replace(",",""),"high":last[4].replace(",",""),
-                    "low":last[5].replace(",",""),"vol":vol_str,
-                    "market_type":"台股","status":"收盤","source":"TWSE",
-                    "meta": build_data_meta("TWSE 日線", is_realtime=False, is_fallback=True, delay_min=0)}
+        if data.get("stat") == "OK" and data.get("data"):
+            rows = data["data"]; last = rows[-1]
+            today_t = now_taipei()
+            try:
+                dparts = str(last[0]).split("/")
+                is_today = (int(dparts[0])+1911 == today_t.year
+                            and int(dparts[1]) == today_t.month
+                            and int(dparts[2]) == today_t.day)
+            except: is_today = False
+            if is_today:
+                price = float(last[6].replace(",",""))
+                prev = float(rows[-2][6].replace(",","")) if len(rows) > 1 else price
+                chg = price - prev; pct = chg/prev*100 if prev else 0
+                try: vol_str = f"{int(float(last[1].replace(',',''))//1000):,} 張"
+                except: vol_str = "N/A"
+                name = NAME_CACHE.get(stock_id, "")
+                if not has_chinese(name): name = get_tw_stock_name_fallback(stock_id)
+                if not has_chinese(name): name = stock_id
+                return {"name":name,"price":price,"chg":chg,"pct":pct,
+                        "open":last[3].replace(",",""),"high":last[4].replace(",",""),
+                        "low":last[5].replace(",",""),"vol":vol_str,
+                        "market_type":"台股","status":"收盤",
+                        "source":"TWSE STOCK_DAY",
+                        "validation":"⚠ 末援 STOCK_DAY 收盤日報",
+                        "meta": build_data_meta("TWSE 日線", is_realtime=False, is_fallback=True, delay_min=0)}
+            else:
+                dlog("TW_STOCK", f"{stock_id} STOCK_DAY 最後日期 {last[0]} 非今天，跳過")
     except: pass
 
     try:
@@ -4675,31 +4821,6 @@ def get_tw_stock(stock_id: str) -> dict:
                     "meta": build_data_meta("TPEx 日線", is_realtime=False, is_fallback=True, delay_min=0)}
     except: pass
 
-    for suffix in [".TW",".TWO"]:
-        try:
-            url=f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
-            r=requests.get(url,headers=headers,timeout=10)
-            result=r.json()["chart"]["result"][0]; meta=result["meta"]
-            quotes=result.get("indicators",{}).get("quote",[{}])[0]
-            opens=[o for o in quotes.get("open",[]) if o is not None]
-            highs=[h for h in quotes.get("high",[]) if h is not None]
-            lows=[l for l in quotes.get("low",[]) if l is not None]
-            vols=[v for v in quotes.get("volume",[]) if v is not None]
-            closes=[c for c in quotes.get("close",[]) if c is not None]
-            price=meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
-            prev=closes[-2] if len(closes)>=2 else (meta.get("chartPreviousClose") or price)
-            chg=price-prev; pct=chg/prev*100 if prev else 0
-            name=NAME_CACHE.get(stock_id,"")
-            if not has_chinese(name): name=get_tw_stock_name_fallback(stock_id)
-            if not has_chinese(name): name=stock_id
-            vol_str=f"{int(vols[-1]/1000):,} 張" if vols else "N/A"
-            return {"name":name,"price":price,"chg":chg,"pct":pct,
-                    "open":f"{opens[-1]:.2f}" if opens else "N/A",
-                    "high":f"{highs[-1]:.2f}" if highs else "N/A",
-                    "low":f"{lows[-1]:.2f}" if lows else "N/A","vol":vol_str,
-                    "market_type":"台股","status":"收盤","source":"Yahoo Finance",
-                    "meta": build_data_meta("Yahoo Finance", is_realtime=False, is_fallback=True, delay_min=15)}
-        except: pass
     return None
 
 
