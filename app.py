@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.107"
+VERSION              = "10.9.108"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4827,15 +4827,12 @@ def get_tw_stock(stock_id: str) -> dict:
 # ══════════════════════════════════════════
 #  美股資料
 # ══════════════════════════════════════════
-def get_us_stock(symbol: str) -> dict:
-    """美股報價（v10.9.66：補上 v10.9.50 同等的 stale rmp 防禦 + meta + record_health）。
-    跟 get_yahoo_quote 同樣的偵測邏輯：
-      若 regularMarketPrice 過時（> 24hr）或偏離 latest_close > 5%，改用日線 close 並標記為備援。
-    """
+def _fetch_us_yahoo_chart(symbol: str) -> dict:
+    """v10.9.108: Yahoo Chart API（含 marketState 邏輯 + stale 防禦）。回傳 raw dict 或 None。"""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=10d"
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=5)
         result = r.json()["chart"]["result"][0]
         meta_raw = result["meta"]
         quotes = result.get("indicators",{}).get("quote",[{}])[0]
@@ -4845,13 +4842,11 @@ def get_us_stock(symbol: str) -> dict:
         vols   = [v for v in quotes.get("volume",[]) if v is not None]
         closes = [c for c in quotes.get("close",[]) if c is not None]
         ms = meta_raw.get("marketState","")
-
         rmp = meta_raw.get("regularMarketPrice")
         rmt = meta_raw.get("regularMarketTime", 0)
         latest_close = closes[-1] if closes else 0
 
-        is_stale = False
-        is_outlier = False
+        is_stale = False; is_outlier = False
         try:
             if rmt:
                 is_stale = (datetime.now(timezone.utc).timestamp() - float(rmt)) > 86400
@@ -4859,73 +4854,161 @@ def get_us_stock(symbol: str) -> dict:
                 is_outlier = abs(float(rmp) - latest_close) / latest_close > 0.05
         except: pass
 
-        meta_source = "Yahoo Finance"
-        meta_is_realtime = False
-        meta_is_fallback = False
-        meta_delay_min = 15
-
-        # 依市場狀態 + stale 偵測決定 price / prev
-        if ms == "POST":
-            post_price = meta_raw.get("postMarketPrice")
-            if post_price:
-                price = float(post_price)
-                meta_delay_min = 0
-            elif rmp and not is_stale and not is_outlier:
-                price = float(rmp)
-                meta_delay_min = 0
-            else:
-                price = latest_close
-                meta_is_fallback = True
-                meta_source = "Yahoo Finance（日線備援）"
-            prev = closes[-1] if closes else price
-        elif ms == "PRE":
-            pre_price = meta_raw.get("preMarketPrice")
-            if pre_price:
-                price = float(pre_price)
-                meta_delay_min = 0
-            elif rmp and not is_stale and not is_outlier:
-                price = float(rmp)
-                meta_delay_min = 0
-            else:
-                price = latest_close
-                meta_is_fallback = True
-                meta_source = "Yahoo Finance（日線備援）"
-            prev = closes[-2] if len(closes) >= 2 else price
+        # 依 marketState 決定 price / prev
+        post_p = meta_raw.get("postMarketPrice")
+        pre_p  = meta_raw.get("preMarketPrice")
+        if ms == "POST" and post_p:
+            price = float(post_p); prev = float(rmp) if rmp else (closes[-1] if closes else price)
+        elif ms == "PRE" and pre_p:
+            price = float(pre_p); prev = closes[-1] if closes else price
+        elif rmp and not is_stale and not is_outlier:
+            price = float(rmp); prev = closes[-2] if len(closes) >= 2 else (closes[-1] if closes else price)
         else:
-            if rmp and not is_stale and not is_outlier:
-                price = float(rmp)
-                meta_is_realtime = (ms == "REGULAR")
-                meta_delay_min = 0 if meta_is_realtime else 15
-            else:
-                price = latest_close
-                meta_is_fallback = True
-                meta_source = "Yahoo Finance（日線備援）"
-                if rmp and (is_stale or is_outlier):
-                    dlog("YAHOO", f"⚠️ US {symbol} rmp 異常（rmp={rmp}, latest={latest_close}, stale={is_stale}, outlier={is_outlier}）→ 改用日線 close")
+            price = latest_close
             prev = closes[-2] if len(closes) >= 2 else price
+            if rmp and (is_stale or is_outlier):
+                dlog("US_STOCK", f"{symbol} chart rmp 異常→用日線 close（stale={is_stale}, outlier={is_outlier}）")
 
-        chg = price - prev
-        pct = chg / prev * 100 if prev else 0
-        name = meta_raw.get("shortName") or meta_raw.get("longName") or symbol
-        sl = {"POST":"盤後","PRE":"盤前","REGULAR":"盤中","CLOSED":"收盤"}.get(ms,"")
+        if price <= 0: return None
 
-        record_health("Yahoo Finance", True)
         return {
-            "name": name[:20], "price": price, "chg": chg, "pct": pct,
-            "open": f"{opens[-1]:.2f}" if opens else "N/A",
-            "high": f"{highs[-1]:.2f}" if highs else "N/A",
-            "low": f"{lows[-1]:.2f}" if lows else "N/A",
-            "vol": format_us_volume(vols[-1]) if vols else "N/A",
-            "status": sl, "closes": [],
-            "meta": build_data_meta(meta_source,
-                                    is_realtime=meta_is_realtime,
-                                    is_fallback=meta_is_fallback,
-                                    delay_min=meta_delay_min),
+            "source": "Yahoo Chart",
+            "price": price, "prev": prev,
+            "open": opens[-1] if opens else None,
+            "high": highs[-1] if highs else None,
+            "low":  lows[-1] if lows else None,
+            "vol":  vols[-1] if vols else None,
+            "name": meta_raw.get("shortName") or meta_raw.get("longName") or symbol,
+            "market_state": ms,
+            "is_realtime": ms == "REGULAR",
+            "is_fallback": is_stale or is_outlier,
         }
     except Exception as e:
-        dlog("YAHOO", f"get_us_stock({symbol}) 失敗：{type(e).__name__}: {e}")
-        record_health("Yahoo Finance", False, f"US {type(e).__name__}: {e}")
+        dlog("US_STOCK", f"Yahoo Chart {symbol} fail: {type(e).__name__}")
         return None
+
+
+def _fetch_us_yahoo_quote(symbol: str) -> dict:
+    """v10.9.108: Yahoo v7 quote API（輕量、不同 endpoint，作為第二源交叉驗證）。"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code != 200:
+            dlog("US_STOCK", f"Yahoo Quote v7 {symbol} HTTP {r.status_code}")
+            return None
+        results = r.json().get("quoteResponse", {}).get("result", [])
+        if not results: return None
+        d = results[0]
+        ms = d.get("marketState", "")
+        rmp = d.get("regularMarketPrice")
+        rpc = d.get("regularMarketPreviousClose")
+        post_p = d.get("postMarketPrice")
+        pre_p  = d.get("preMarketPrice")
+
+        if ms == "POST" and post_p:
+            price = float(post_p); prev = float(rmp) if rmp else float(rpc) if rpc else price
+        elif ms == "PRE" and pre_p:
+            price = float(pre_p); prev = float(rpc) if rpc else (float(rmp) if rmp else price)
+        elif rmp:
+            price = float(rmp); prev = float(rpc) if rpc else price
+        else:
+            return None
+
+        if price <= 0: return None
+
+        return {
+            "source": "Yahoo Quote v7",
+            "price": price, "prev": prev,
+            "open": d.get("regularMarketOpen"),
+            "high": d.get("regularMarketDayHigh"),
+            "low":  d.get("regularMarketDayLow"),
+            "vol":  d.get("regularMarketVolume"),
+            "name": d.get("shortName") or d.get("longName") or symbol,
+            "market_state": ms,
+            "is_realtime": ms == "REGULAR",
+            "is_fallback": False,
+        }
+    except Exception as e:
+        dlog("US_STOCK", f"Yahoo Quote v7 {symbol} fail: {type(e).__name__}")
+        return None
+
+
+def _validate_us_sources(chart: dict, quote: dict) -> tuple:
+    """v10.9.108: 兩源比對 — 返回 (picked, validation_label)。"""
+    if not chart and not quote:
+        return None, "❌ 所有來源失敗"
+    if chart and not quote:
+        return chart, "⚠ 單一來源 Yahoo Chart（quote 失敗）"
+    if quote and not chart:
+        return quote, "⚠ 單一來源 Yahoo Quote（chart 失敗）"
+    # 兩源都有
+    cp, qp = chart["price"], quote["price"]
+    diff_pct = abs(cp - qp) / cp * 100 if cp else 100
+    if diff_pct < 1.0:
+        # 一致，優先採非 fallback 的；都 ok 採 quote（v7 比較輕量、新鮮）
+        chosen = quote if not quote.get("is_fallback") else chart
+        return chosen, f"✓ 雙源一致（Chart={cp:.2f} / Quote={qp:.2f}）"
+    elif diff_pct < 5.0:
+        # 採 quote（v7 直接拿 marketState 對應價格，誤差小）
+        return quote, f"⚠ 雙源差 {diff_pct:.2f}%，採 Quote v7"
+    else:
+        # 大差距，採非 fallback 的；都是的話採 quote
+        if chart.get("is_fallback") and not quote.get("is_fallback"):
+            return quote, f"⚠ 雙源差距大 {diff_pct:.2f}%，Chart fallback → 採 Quote"
+        return quote, f"⚠ 雙源差距大 {diff_pct:.2f}%，採 Quote v7（請確認）"
+
+
+def get_us_stock(symbol: str) -> dict:
+    """v10.9.108：美股多源驗證版。
+    並行查 Yahoo Chart + Yahoo Quote v7，交叉驗證 → 返回最可信。
+    全失敗回 None（UI 顯示「資料暫時無法取得」）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_chart = pool.submit(_fetch_us_yahoo_chart, symbol)
+        f_quote = pool.submit(_fetch_us_yahoo_quote, symbol)
+        chart = None; quote = None
+        try: chart = f_chart.result(timeout=8)
+        except Exception as e: dlog("US_STOCK", f"chart thread {symbol}: {e}")
+        try: quote = f_quote.result(timeout=8)
+        except Exception as e: dlog("US_STOCK", f"quote thread {symbol}: {e}")
+
+    picked, label = _validate_us_sources(chart, quote)
+    dlog("US_STOCK", f"{symbol}：{label}")
+
+    if not picked:
+        record_health("Yahoo Finance", False, f"US {symbol} 全失敗")
+        return None
+
+    record_health("Yahoo Finance", True)
+    price = picked["price"]
+    prev = picked.get("prev", price)
+    chg = price - prev
+    pct = chg / prev * 100 if prev else 0
+    ms = picked.get("market_state", "")
+    sl = {"POST":"盤後","PRE":"盤前","REGULAR":"盤中","CLOSED":"收盤"}.get(ms, "")
+
+    def _fmt(v):
+        if v is None: return "N/A"
+        try: return f"{float(v):.2f}"
+        except: return "N/A"
+
+    return {
+        "name": (picked.get("name") or symbol)[:20],
+        "price": price, "chg": chg, "pct": pct,
+        "open": _fmt(picked.get("open")),
+        "high": _fmt(picked.get("high")),
+        "low":  _fmt(picked.get("low")),
+        "vol":  format_us_volume(picked.get("vol")) if picked.get("vol") else "N/A",
+        "status": sl, "closes": [],
+        "source": picked["source"],
+        "validation": label,
+        "meta": build_data_meta(picked["source"],
+                                is_realtime=picked.get("is_realtime", False),
+                                is_fallback=picked.get("is_fallback", False),
+                                delay_min=0 if picked.get("is_realtime") else 15),
+    }
 
 def get_us_closes(symbol: str) -> list:
     headers = {"User-Agent": "Mozilla/5.0"}
