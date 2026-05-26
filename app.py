@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.113"
+VERSION              = "10.9.114"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6969,6 +6969,60 @@ def _us_news_title_similar(a: str, b: str) -> float:
     # 取較高者（兩種同事件都會中一種）
     return max(sm, jac)
 
+# v10.9.114 Phase 3 lite：重要程度評分關鍵字（規格書「九、新聞重要程度判斷」）
+US_NEWS_HIGH_KEYWORDS = [
+    # 財報相關
+    "earnings", "revenue", "eps", "guidance", "outlook", "beats", "misses",
+    "tops estimates", "downgrade", "upgrade", "price target",
+    # 重大事件
+    "merger", "acquisition", "acquires", "buyout", "lawsuit", "settlement",
+    "ceo", "cfo", "resign", "appoint", "steps down",
+    # 政策/總經
+    "fed", "interest rate", "cpi", "ppi", "inflation", "non-farm", "jobs report",
+    "rate decision", "rate hike", "rate cut", "fomc", "powell",
+    # 監管/制裁
+    "sec", "ftc", "antitrust", "tariff", "sanction", "export control", "ban",
+    # 中文關鍵字
+    "財報", "財測", "升評", "降評", "目標價", "併購", "重大", "突發",
+    "升息", "降息", "利率", "通膨", "非農", "關稅", "制裁",
+]
+US_NEWS_MEDIUM_KEYWORDS = [
+    "launches", "unveils", "announces", "partnership", "deal", "contract",
+    "expansion", "investment", "production", "supply", "demand",
+    "發表", "推出", "合作", "投資", "供應", "需求", "產能",
+]
+
+def _us_news_score_importance(item: dict) -> int:
+    """v10.9.114 Phase 3 lite：給新聞打 0-100 重要程度分數。
+    Heuristic 評分（不靠 AI）：
+      - 來源權重 0-50 分（最大因素）
+      - 高重要關鍵字 0-25 分
+      - 多源驗證 0-20 分
+      - 標題含 ticker 0-10 分
+    """
+    score = 0
+    # 來源權重（轉換成 0-50）
+    score += min(50, item.get("weight", 10) * 5 // 10)
+    # 關鍵字
+    title_l = item.get("title", "").lower()
+    high_hits = sum(1 for k in US_NEWS_HIGH_KEYWORDS if k in title_l)
+    med_hits = sum(1 for k in US_NEWS_MEDIUM_KEYWORDS if k in title_l)
+    score += min(25, high_hits * 12 + med_hits * 5)
+    # 多源驗證
+    also_n = len(item.get("also_sources", []))
+    score += min(20, also_n * 7)
+    # ticker 在標題
+    if item.get("_has_ticker"): score += 10
+    return min(100, score)
+
+def _us_news_importance_label(score: int) -> tuple:
+    """v10.9.114：分數 → (level, emoji, color)。
+    閾值：高 ≥ 65 / 中 ≥ 40 / 低 < 40"""
+    if score >= 65: return ("高", "🔴", "#D97A5C")
+    if score >= 40: return ("中", "🟡", "#E89B82")
+    return ("低", "🔵", "#9BB8CC")
+
+
 def _us_news_merge_events(items: list, count: int = 4, sim_threshold: float = 0.5) -> list:
     """v10.9.113 Phase 2：同事件合併。
     1. 高權重源代表事件
@@ -7095,15 +7149,26 @@ def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
     # 排序：權重高優先，標題含 ticker 加分
     def _sort_key(it):
         title_has_ticker = sym_l in it["title"].lower()
+        it["_has_ticker"] = title_has_ticker  # v10.9.114：給 importance scoring 用
         return (-it["weight"], 0 if title_has_ticker else 1)
     candidates.sort(key=_sort_key)
 
     # v10.9.113 Phase 2：同事件合併（相似度 >= 0.5）
-    # candidates 已按權重排序，最高權重者為事件代表
-    # 給 merge 多一些素材（取 count*4），merge 完再截 count
     merged = _us_news_merge_events(candidates[:count*4], count=count, sim_threshold=0.5)
 
-    dlog("US_NEWS", f"{symbol}：{len(all_items)} 抓 → {len(candidates)} 篩 → {len(merged)} 事件 → 取 {count}")
+    # v10.9.114 Phase 3 lite：算每則重要程度分數（heuristic，不靠 AI）
+    for ev in merged:
+        score = _us_news_score_importance(ev)
+        level, emoji, color = _us_news_importance_label(score)
+        ev["importance_score"] = score
+        ev["importance_level"] = level   # 高 / 中 / 低
+        ev["importance_emoji"] = emoji   # 🔴 / 🟡 / 🔵
+
+    dlog("US_NEWS", f"{symbol}：{len(all_items)} 抓 → {len(candidates)} 篩 → "
+         f"{len(merged)} 事件 → 取 {count}（"
+         f"高 {sum(1 for e in merged if e.get('importance_level')=='高')} "
+         f"中 {sum(1 for e in merged if e.get('importance_level')=='中')} "
+         f"低 {sum(1 for e in merged if e.get('importance_level')=='低')}）")
     return merged[:count]
 
 
@@ -7280,7 +7345,9 @@ def get_finmind_news_enriched(stock_id: str, count: int = 10) -> list:
 
 
 def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict:
-    """v10.9.58：個股新聞 carousel — 每張卡 1 則新聞含媒體 / 時間 / 連結。粉嫩風格。"""
+    """v10.9.58：個股新聞 carousel。
+    v10.9.114：若 news_dict 含 importance_level → header 顯示重要程度徽章，
+              依分數動態調 header 顏色。"""
     bubbles = []
     for i, n in enumerate(news_dicts[:12], start=1):
         title  = n.get("title", "")
@@ -7294,18 +7361,37 @@ def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict
                 date_short = date[5:16].replace("-", "/")
         except: pass
 
+        # v10.9.114：依重要程度切 header 色（高=玫瑰紅 / 中=杏粉 / 低=灰藍 / 未評=預設杏粉）
+        level = n.get("importance_level", "")
+        emoji = n.get("importance_emoji", "")
+        if level == "高":
+            header_color = "#D97A5C"
+        elif level == "低":
+            header_color = "#9BB8CC"
+        else:
+            header_color = "#E8B8A8"   # 中 + 未評
+
+        header_top_row = [
+            {"type": "text", "text": f"#{i}", "size": "xs",
+             "color": "#FDF6F0", "flex": 0, "weight": "bold"},
+            {"type": "text", "text": f"{stock_id} {name}", "size": "xs",
+             "color": "#FFFFFF", "weight": "bold", "flex": 1, "margin": "sm"},
+        ]
+        if level:
+            header_top_row.append({
+                "type": "text",
+                "text": f"{emoji} {level}",
+                "size": "xxs", "color": "#FFFFFF", "weight": "bold",
+                "flex": 0, "align": "end",
+            })
+
         bubble = {
             "type": "bubble", "size": "kilo",
             "header": {
                 "type": "box", "layout": "vertical",
-                "backgroundColor": "#E8B8A8", "paddingAll": "10px",
+                "backgroundColor": header_color, "paddingAll": "10px",
                 "contents": [
-                    {"type": "box", "layout": "horizontal", "contents": [
-                        {"type": "text", "text": f"#{i}", "size": "xs",
-                         "color": "#FDF6F0", "flex": 0, "weight": "bold"},
-                        {"type": "text", "text": f"{stock_id} {name}", "size": "xs",
-                         "color": "#FFFFFF", "weight": "bold", "flex": 1, "margin": "sm"},
-                    ]},
+                    {"type": "box", "layout": "horizontal", "contents": header_top_row},
                     {"type": "text", "text": f"📰 {source}　{date_short}",
                      "size": "xxs", "color": "#FDF6F0", "margin": "xs", "wrap": True},
                 ]
