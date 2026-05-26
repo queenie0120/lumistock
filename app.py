@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.115"
+VERSION              = "10.9.116"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -11027,7 +11027,8 @@ def handle_message(event):
                 # 美股：多來源 + 權重排序（規格 Phase 1）
                 us_data = get_us_stock(t)
                 us_name = (us_data.get("name") if us_data else "") or t
-                news_dicts = get_us_stock_news_v2(t, us_name, count=4)
+                # v10.9.116：個股新聞 carousel 對齊台股（10 則），跟提示文字一致
+                news_dicts = get_us_stock_news_v2(t, us_name, count=10)
                 display_name = us_name
             else:
                 # 台股：FinMind + Google 多來源（既有）
