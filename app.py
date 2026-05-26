@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.118"
+VERSION              = "10.9.119"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -7349,6 +7349,9 @@ def ai_analyze_us_news(items: list, ticker: str, ticker_name: str) -> list:
 - summary_zh: 20 字內中文摘要，必須說重點，不要照抄標題
 - impact_tw: 10-15 字內，對台股供應鏈/族群影響（用上方已知對應，例如「台積電 / 鴻海 供應鏈受惠」；若新聞無實質影響，回「無直接連動」）
 - relevance: 0-100 整數，與 {ticker} ({ticker_name}) 的實質相關度（純粹提到名字 ≤ 30；實質影響 ≥ 70）
+- sentiment_reason: 8-15 字內，為什麼是這個情緒（例「財報優於預期」「估值偏高小心追高」「短期題材中長期基本面未變」）
+- price_reflected: 必為 "已反映" / "未反映" / "部分反映" / "未知" 之一（該訊息是否已反映在股價）
+- risks: 0-2 個字串的陣列，每個 10-15 字內列出風險（例：["估值偏高，小心追高","政策落地不確定性"]）；無明顯風險回 []
 - keep: true/false，是否建議保留（雜訊、無關、過時 → false）
 
 只輸出 JSON 陣列，不要其他文字、不要 markdown 標籤。"""
@@ -7378,16 +7381,25 @@ def ai_analyze_us_news(items: list, ticker: str, ticker_name: str) -> list:
         ai = ai_data[ai_idx]
         if not isinstance(ai, dict): continue
         impact_tw_raw = str(ai.get("impact_tw", ""))[:30]
-        # v10.9.118：AI 沒給或給「無連動」但實際有供應鏈 → 用硬編表
         if (not impact_tw_raw or impact_tw_raw in ("無直接連動", "無連動", "無影響")) and chain_fallback:
             impact_tw_raw = f"參考：{chain_fallback}"
+        # v10.9.119：解析 risks 陣列（最多 2 個，各 25 字內）
+        risks_raw = ai.get("risks", []) or []
+        risks_clean = []
+        if isinstance(risks_raw, list):
+            for r in risks_raw[:2]:
+                if isinstance(r, str) and r.strip():
+                    risks_clean.append(str(r).strip()[:25])
         data = {
             "category": str(ai.get("category", ""))[:10],
             "importance_ai": str(ai.get("importance_ai", ""))[:2],
             "sentiment_6": str(ai.get("sentiment_6", ""))[:6],
+            "sentiment_reason": str(ai.get("sentiment_reason", ""))[:25],
             "summary_zh": str(ai.get("summary_zh", ""))[:40],
             "impact_tw": impact_tw_raw,
             "relevance": int(ai.get("relevance", 50)) if str(ai.get("relevance","")).isdigit() else 50,
+            "price_reflected": str(ai.get("price_reflected", ""))[:4],
+            "risks": risks_clean,
             "keep": ai.get("keep", True),
         }
         items[orig_idx].update(data)
@@ -7623,8 +7635,11 @@ def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict
         ]
         ai_summary = n.get("summary_zh", "")
         sentiment_6 = n.get("sentiment_6", "")
+        sentiment_reason = n.get("sentiment_reason", "")
         impact_tw = n.get("impact_tw", "")
         category = n.get("category", "")
+        price_reflected = n.get("price_reflected", "")
+        risks = n.get("risks", []) or []
         if ai_summary:
             body_contents.append({"type": "separator", "color": "#E8C4B4", "margin": "sm"})
             body_contents.append({
@@ -7647,12 +7662,41 @@ def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict
                     "size": "xxs", "color": "#7AABBE", "weight": "bold",
                     "margin": "xs", "wrap": True
                 })
+        # v10.9.119：情緒原因（規格八補完）
+        if sentiment_reason:
+            body_contents.append({
+                "type": "text",
+                "text": f"　└ {sentiment_reason}",
+                "size": "xxs", "color": "#9B6B5A", "margin": "xs", "wrap": True
+            })
         if impact_tw:
             body_contents.append({
                 "type": "text",
                 "text": f"🇹🇼 {impact_tw}",
                 "size": "xxs", "color": "#A05A48", "margin": "xs", "wrap": True
             })
+        # v10.9.119：是否反映在股價（規格十、十三）
+        if price_reflected and price_reflected != "未知":
+            pr_emoji_map = {"已反映":"📍","未反映":"⏳","部分反映":"🌗"}
+            pe = pr_emoji_map.get(price_reflected, "")
+            body_contents.append({
+                "type": "text",
+                "text": f"{pe} 股價：{price_reflected}",
+                "size": "xxs", "color": "#7AABBE", "margin": "xs", "wrap": True
+            })
+        # v10.9.119：風險提醒（規格十、十三、十四）
+        if risks:
+            body_contents.append({
+                "type": "text",
+                "text": "⚠ 風險",
+                "size": "xxs", "color": "#D97A5C", "weight": "bold", "margin": "sm"
+            })
+            for risk in risks[:2]:
+                body_contents.append({
+                    "type": "text",
+                    "text": f"　• {risk}",
+                    "size": "xxs", "color": "#A05A48", "wrap": True
+                })
 
         bubble = {
             "type": "bubble", "size": "kilo",
@@ -7671,7 +7715,7 @@ def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict
                 "contents": body_contents
             },
             "footer": {
-                "type": "box", "layout": "vertical", "paddingAll": "8px",
+                "type": "box", "layout": "vertical", "spacing": "xs", "paddingAll": "8px",
                 "contents": [
                     {"type": "button", "style": "primary", "color": "#E89B82",
                      "height": "sm",
@@ -7679,6 +7723,19 @@ def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict
                 ]
             }
         }
+        # v10.9.119：規格七 9 — 同事件有多源時，加「其他來源」按鈕（最多 2 個）
+        also_sources = n.get("also_sources", []) or []
+        if also_sources:
+            for alt in also_sources[:2]:
+                alt_url = alt.get("url", "")
+                alt_name = alt.get("name", "")
+                if alt_url and alt_name:
+                    bubble["footer"]["contents"].append({
+                        "type": "button", "style": "secondary", "height": "sm",
+                        "action": {"type": "uri",
+                                   "label": f"🔗 {alt_name[:8]}",
+                                   "uri": alt_url}
+                    })
         bubbles.append(bubble)
 
     if not bubbles:
