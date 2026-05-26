@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.105"
+VERSION              = "10.9.106"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4980,6 +4980,49 @@ def groq_chat(messages: list, max_tokens: int = 1500, temperature: float = 0.2, 
         return ""
 
 
+def _lookup_code_by_name(name: str) -> str:
+    """v10.9.106：用股票中文名稱反查代號。
+    很多券商（永豐 / 玉山 / 群益…）庫存頁只顯示名稱，AI 看不到代號。
+    為了避免 AI 自己亂猜，prompt 要求名稱原樣回傳，由後端反查 NAME_CACHE。
+
+    策略：
+      1. 精確相符（OCR 名稱 == NAME_CACHE 名稱）
+      2. NAME_CACHE 名稱包含 OCR 名稱（"萬邦" → "5443 萬邦電"）
+      3. OCR 名稱包含 NAME_CACHE 名稱（少見，OCR 多字）
+    多個候選時不猜，回 ""。
+    """
+    if not name: return ""
+    name = name.strip().replace(" ", "").replace("　", "")
+    if not name or len(name) < 2: return ""
+    # 1. 精確相符
+    for code, n in NAME_CACHE.items():
+        if not code.isdigit(): continue
+        if n.strip() == name:
+            return code
+    # 2. NAME_CACHE 名稱包含 OCR 名稱（最常見：OCR 抓到簡稱）
+    candidates = []
+    for code, n in NAME_CACHE.items():
+        if not code.isdigit(): continue
+        if name in n:
+            candidates.append((code, n))
+    if len(candidates) == 1:
+        return candidates[0][0]
+    if len(candidates) > 1:
+        # 多個候選 → 取長度最接近的（避免太寬鬆配對）
+        exact_len = [c for c in candidates if len(c[1]) == len(name)]
+        if len(exact_len) == 1:
+            return exact_len[0][0]
+        return ""
+    # 3. OCR 名稱包含 NAME_CACHE 名稱
+    for code, n in NAME_CACHE.items():
+        if not code.isdigit(): continue
+        if len(n.strip()) >= 2 and n.strip() in name:
+            candidates.append((code, n))
+    if len(candidates) == 1:
+        return candidates[0][0]
+    return ""
+
+
 def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
     """v10.9.81：統一辨識券商截圖（庫存 OR 賣出回報）。
     回傳：
@@ -4998,31 +5041,40 @@ def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
     prompt = """這是台灣證券戶的截圖。請判斷類型並辨識資料。
 
 【類型 1：庫存頁】顯示「目前持有的股票」，欄位有股數、平均成本/均價、現價/損益等
-→ 回傳 {"type":"holdings","items":[{"stock_id":"2330","shares":100,"avg_price":2010.0}, ...]}
+→ 回傳 {"type":"holdings","items":[{"stock_id":"2330","name":"台積電","shares":100,"avg_price":2010.0}, ...]}
 
 【類型 2：賣出/委成回】顯示「賣出/現賣/沖賣/沖售」字樣，且為「已成交」
 → 只取「已成交的賣出」（忽略委託中、買單、未成交）
-→ 回傳 {"type":"sell","items":[{"stock_id":"6742","shares":1000,"sell_price":59.5}]}
+→ 回傳 {"type":"sell","items":[{"stock_id":"6742","name":"澤米","shares":1000,"sell_price":59.5}]}
 
 【類型 3：買進/成交回報】顯示「買進/現買/沖買/ROD買」字樣，且為「已成交」
 → 只取「已成交的買進」
-→ 回傳 {"type":"buy","items":[{"stock_id":"2330","shares":1000,"buy_price":2010.0}]}
+→ 回傳 {"type":"buy","items":[{"stock_id":"2330","name":"台積電","shares":1000,"buy_price":2010.0}]}
 
-【類型 4：無法判斷】
+【類型 4:無法判斷】
 → 回傳 {"type":"unknown","items":[]}
 
 判斷優先序：
 - 同時混合買賣 → 看哪邊筆數多就回哪邊；但若使用者明顯只截某一邊（如標題顯示「賣出回報」）以該邊為準
 - 純庫存（沒交易動作字樣，多欄損益/現價）→ holdings
 
-規則：
-- stock_id：4-6 位字元（2330/00878/6446）
+★★★ stock_id / name 取值規則（v10.9.106 重要）★★★
+1. 圖片中有「股票代號」（4-6 位數字，如 2330、00878、6446）
+   → stock_id 填代號、name 填看到的中文名（若有）
+2. 圖片中**只有中文名稱沒有代號**（很多券商如永豐 / 玉山 / 群益庫存頁是這樣）
+   → stock_id 填空字串 ""、name 填**完整、原原本本看到的中文名稱**
+   → 不要猜、不要簡寫、不要對照代號。後端會用 name 反查代號！
+3. 絕對禁止：根據名稱「猜」代號、根據股價「猜」代號、根據記憶反查代號
+   寧可 stock_id 留空，也不要填猜的代號
+4. 「現股」「現賣」「現買」「沖賣」「整股」「零股」等是交易類型，不是股票名稱 → 不要當 name
+
+其他規則：
 - shares：統一換算成「股數」（張 × 1000）
 - 庫存 avg_price = 平均成本；買進 buy_price = 成交價；賣出 sell_price = 成交價
-- 看不清楚的整筆略過
+- 看不清楚的整筆略過（寧可少也不要錯）
 - 只回純 JSON，不要 markdown、不要其他文字
 - 忽略「委託中」「部份成交（未完成）」等未實際成交的列
-- ★ items 陣列順序：嚴格按「圖片中視覺由上到下」的順序輸出（v10.9.94 要求）
+- ★ items 陣列順序：嚴格按「圖片中視覺由上到下」的順序輸出
 """
 
     payload = {
@@ -5064,12 +5116,27 @@ def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
         items = obj.get("items", [])
         if not isinstance(items, list):
             items = []
-        # 過濾驗證
+        # v10.9.106：過濾 + 名稱反查（支援只有名稱沒代號的券商）
         valid = []
+        skipped_names = []   # 收集無法解析的名稱讓 dlog 看得到
         for h in items:
             if not isinstance(h, dict): continue
             sid = str(h.get("stock_id", "")).strip().upper()
-            if not re.match(r"^[0-9]{4,6}[A-Z]?$", sid): continue
+            ocr_name = str(h.get("name", "")).strip()
+            # 代號驗證；若無效嘗試用名稱反查
+            if not re.match(r"^[0-9]{4,6}[A-Z]?$", sid):
+                if ocr_name:
+                    looked = _lookup_code_by_name(ocr_name)
+                    if looked:
+                        dlog("VISION", f"名稱反查成功：'{ocr_name}' → {looked}")
+                        sid = looked
+                    else:
+                        skipped_names.append(ocr_name)
+                        dlog("VISION", f"名稱反查失敗（NAME_CACHE 找不到）：'{ocr_name}'")
+                        continue
+                else:
+                    dlog("VISION", f"代號 '{sid}' 無效且無名稱可反查")
+                    continue
             sh = h.get("shares")
             if sh is None: continue
             try:
@@ -5100,6 +5167,8 @@ def analyze_brokerage_screenshot(image_bytes: bytes, mime: str = "image/jpeg") -
                     if price <= 0: continue
                     valid.append({"stock_id": sid, "shares": shares, "buy_price": price})
                 except: continue
+        if skipped_names:
+            dlog("VISION", f"⚠ 略過 {len(skipped_names)} 筆無法解析的名稱：{skipped_names}")
         dlog("VISION", f"辨識：type={t}, raw {len(items)} → valid {len(valid)}")
         if t not in ("holdings", "sell", "buy"):
             t = "unknown"
