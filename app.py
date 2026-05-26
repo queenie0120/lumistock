@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.108"
+VERSION              = "10.9.109"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1225,6 +1225,11 @@ def _bg_init():
         if n: dlog("SETTINGS", f"還原使用者設定：{n} 位")
     except Exception as e:
         dlog("SETTINGS", f"開機還原設定失敗：{e}")
+    # v10.9.109：還原警報 dedup 歷史（避免 Render 重啟後重發警報）
+    try:
+        restore_alert_history_from_sheets()
+    except Exception as e:
+        dlog("PORTFOLIO-ALERT", f"開機還原警報歷史失敗：{e}")
 
 
 # ══════════════════════════════════════════
@@ -2000,8 +2005,57 @@ def _save_alert_history(history: dict) -> None:
 
 ALERT_HISTORY = _load_alert_history()
 
+def _save_alert_to_sheets(uid: str, sid: str, alert_type: str, ts: float) -> None:
+    """v10.9.109：警報觸發時寫一筆到「警報紀錄」分頁。
+    Render 重啟也能從 Sheets 還原 dedup 狀態。"""
+    try:
+        sheet = get_or_create_sheet("警報紀錄",
+                                    headers=["用戶ID","代號","警報類型","觸發時間戳","觸發時間"])
+        if not sheet: return
+        sheet.append_row([
+            uid, sid, alert_type, int(ts),
+            now_taipei().strftime("%Y-%m-%d %H:%M")
+        ])
+    except Exception as e:
+        dlog("PORTFOLIO-ALERT", f"警報寫入 Sheets 失敗：{type(e).__name__}: {e}")
+
+def restore_alert_history_from_sheets() -> int:
+    """v10.9.109：開機從 Sheets「警報紀錄」還原 ALERT_HISTORY。
+    只保留 7 天內的紀錄，更舊的略過。"""
+    try:
+        sheet = get_or_create_sheet("警報紀錄",
+                                    headers=["用戶ID","代號","警報類型","觸發時間戳","觸發時間"])
+        if not sheet: return 0
+        rows = sheet.get_all_values()
+        if not rows: return 0
+        now_ts = time.time()
+        cutoff = now_ts - 7 * 86400
+        loaded = 0
+        for row in rows:
+            if len(row) < 4: continue
+            uid = (row[0] or "").strip()
+            if not uid.startswith("U") or len(uid) < 30: continue
+            sid = (row[1] or "").strip()
+            atype = (row[2] or "").strip()
+            try: ts = int(row[3])
+            except: continue
+            if not sid or not atype: continue
+            if ts < cutoff: continue
+            # 保留最新一次（同 key 多筆時取最大 ts）
+            key = f"{uid}|{sid}|{atype}"
+            if ALERT_HISTORY.get(key, 0) < ts:
+                ALERT_HISTORY[key] = ts
+                loaded += 1
+        _save_alert_history(ALERT_HISTORY)
+        if loaded: dlog("PORTFOLIO-ALERT", f"還原警報 dedup：{loaded} 筆")
+        return loaded
+    except Exception as e:
+        dlog("PORTFOLIO-ALERT", f"還原警報歷史失敗：{type(e).__name__}: {e}")
+        return 0
+
 def _should_alert(uid: str, sid: str, alert_type: str) -> bool:
-    """24h dedup：同一 (user, stock, type) 24 小時內只通報一次。"""
+    """24h dedup：同一 (user, stock, type) 24 小時內只通報一次。
+    v10.9.109：寫 /tmp + 寫 Sheets（雙保險，Render 重啟也保得住）。"""
     key = f"{uid}|{sid}|{alert_type}"
     last = ALERT_HISTORY.get(key, 0)
     now_ts = time.time()
@@ -2014,6 +2068,8 @@ def _should_alert(uid: str, sid: str, alert_type: str) -> bool:
     for k in stale_keys:
         ALERT_HISTORY.pop(k, None)
     _save_alert_history(ALERT_HISTORY)
+    # v10.9.109：同步寫 Sheets（失敗不影響功能）
+    _save_alert_to_sheets(uid, sid, alert_type, now_ts)
     return True
 
 
