@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.109"
+VERSION              = "10.9.110"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4341,69 +4341,135 @@ def make_yield_analysis_flex(data: dict) -> dict:
         }
     }
 
-def get_yahoo_quote(symbol: str) -> dict:
-    """抓 Yahoo Finance 指數/商品/外匯報價。
-    v10.9.50：加入自我防禦——某些指數（例如 ^TWOII 櫃買指數）的 regularMarketPrice
-    Yahoo 會卡在過期的舊值（甚至 1 年以上前），導致漲跌幅算出 -34% 等荒謬數字。
-    防禦策略：當 regularMarketPrice 跟最近日線收盤偏離 > 5% 或時間 > 24 小時前，
-    視為過時資料，改用 close 陣列的最新值。
-    """
+def _fetch_quote_chart(symbol: str) -> dict:
+    """v10.9.110: Yahoo Chart API for index/commodity/forex（含 stale 防禦）。"""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=10d"
-        r   = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=5)
         result = r.json()["chart"]["result"][0]
-        meta   = result["meta"]
+        meta = result["meta"]
         quotes = result.get("indicators",{}).get("quote",[{}])[0]
         closes = [c for c in quotes.get("close",[]) if c is not None]
-        ms     = meta.get("marketState","")
-
+        ms = meta.get("marketState","")
         rmp = meta.get("regularMarketPrice")
         rmt = meta.get("regularMarketTime", 0)
         latest_close = closes[-1] if closes else 0
 
-        # 偵測 regularMarketPrice 是否過時或異常
-        is_stale  = False
-        is_outlier = False
+        is_stale = False; is_outlier = False
         try:
             if rmt:
-                now_ts = datetime.now(timezone.utc).timestamp()
-                is_stale = (now_ts - float(rmt)) > 86400  # 超過 24 小時
+                is_stale = (datetime.now(timezone.utc).timestamp() - float(rmt)) > 86400
             if rmp and latest_close:
                 is_outlier = abs(float(rmp) - latest_close) / latest_close > 0.05
         except: pass
 
-        meta_source = "Yahoo Finance"
-        meta_is_realtime = False
-        meta_is_fallback = False
-        meta_delay_min = 15
-
         if rmp and not is_stale and not is_outlier:
-            price = float(rmp)
-            meta_is_realtime = (ms == "REGULAR")
-            meta_delay_min = 0 if meta_is_realtime else 15
+            price = float(rmp); is_fb = False
         else:
-            price = latest_close
-            meta_is_fallback = True
-            meta_source = "Yahoo Finance（日線備援）"
+            price = latest_close; is_fb = True
             if rmp and (is_stale or is_outlier):
-                dlog("YAHOO", f"⚠️ {symbol} regularMarketPrice 異常（rmp={rmp}, latest_close={latest_close}, stale={is_stale}, outlier={is_outlier}）→ 改用日線 close")
-
-        prev   = closes[-2] if len(closes) >= 2 else price
-        chg    = price - prev
-        pct    = chg / prev * 100 if prev else 0
-        record_health("Yahoo Finance", True)
+                dlog("QUOTE", f"{symbol} chart rmp 異常→用日線 close（stale={is_stale}, outlier={is_outlier}）")
+        if not price or price <= 0: return None
+        prev = closes[-2] if len(closes) >= 2 else price
         return {
-            "price":price, "chg":chg, "pct":pct, "ms":ms,
-            "meta": build_data_meta(meta_source,
-                                    is_realtime=meta_is_realtime,
-                                    is_fallback=meta_is_fallback,
-                                    delay_min=meta_delay_min),
+            "source": "Yahoo Chart", "price": float(price), "prev": float(prev),
+            "ms": ms, "is_realtime": ms == "REGULAR", "is_fallback": is_fb,
         }
     except Exception as e:
-        dlog("YAHOO", f"get_yahoo_quote({symbol}) 失敗：{type(e).__name__}: {e}")
-        record_health("Yahoo Finance", False, f"{type(e).__name__}: {e}")
+        dlog("QUOTE", f"chart {symbol} fail: {type(e).__name__}")
+        return None
+
+
+def _fetch_quote_v7(symbol: str) -> dict:
+    """v10.9.110: Yahoo v7 quote API（指數/外匯/商品也支援）。"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code != 200:
+            dlog("QUOTE", f"v7 {symbol} HTTP {r.status_code}")
+            return None
+        results = r.json().get("quoteResponse", {}).get("result", [])
+        if not results: return None
+        d = results[0]
+        ms = d.get("marketState", "")
+        rmp = d.get("regularMarketPrice")
+        rpc = d.get("regularMarketPreviousClose")
+        if not rmp: return None
+        price = float(rmp)
+        if price <= 0: return None
+        prev = float(rpc) if rpc else price
+        return {
+            "source": "Yahoo Quote v7", "price": price, "prev": prev,
+            "ms": ms, "is_realtime": ms == "REGULAR", "is_fallback": False,
+        }
+    except Exception as e:
+        dlog("QUOTE", f"v7 {symbol} fail: {type(e).__name__}")
+        return None
+
+
+def _validate_quote_sources(chart: dict, quote: dict) -> tuple:
+    """v10.9.110: 指數/商品/外匯雙源比對。同 _validate_us_sources 邏輯。"""
+    if not chart and not quote:
+        return None, "❌ 所有來源失敗"
+    if chart and not quote:
+        return chart, "⚠ 單一來源 Chart（v7 失敗）"
+    if quote and not chart:
+        return quote, "⚠ 單一來源 Quote v7（chart 失敗）"
+    cp, qp = chart["price"], quote["price"]
+    diff_pct = abs(cp - qp) / cp * 100 if cp else 100
+    if diff_pct < 1.0:
+        chosen = quote if not quote.get("is_fallback") else chart
+        return chosen, f"✓ 雙源一致（{cp:.2f} / {qp:.2f}）"
+    elif diff_pct < 5.0:
+        return quote, f"⚠ 雙源差 {diff_pct:.2f}%，採 Quote v7"
+    else:
+        if chart.get("is_fallback") and not quote.get("is_fallback"):
+            return quote, f"⚠ 雙源差距大 {diff_pct:.2f}%，採 Quote"
+        return quote, f"⚠ 雙源差距大 {diff_pct:.2f}%，採 Quote v7（請確認）"
+
+
+def get_yahoo_quote(symbol: str) -> dict:
+    """v10.9.110：指數/商品/外匯多源驗證版。
+    並行查 Yahoo Chart + Yahoo Quote v7，交叉驗證。
+    全失敗回 {}（保留原行為，呼叫端用 empty dict 判斷）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_c = pool.submit(_fetch_quote_chart, symbol)
+        f_q = pool.submit(_fetch_quote_v7, symbol)
+        chart = None; quote = None
+        try: chart = f_c.result(timeout=8)
+        except Exception as e: dlog("QUOTE", f"chart thread {symbol}: {e}")
+        try: quote = f_q.result(timeout=8)
+        except Exception as e: dlog("QUOTE", f"v7 thread {symbol}: {e}")
+
+    picked, label = _validate_quote_sources(chart, quote)
+    dlog("QUOTE", f"{symbol}：{label}")
+
+    if not picked:
+        record_health("Yahoo Finance", False, f"{symbol} 全失敗")
         return {}
+
+    record_health("Yahoo Finance", True)
+    price = picked["price"]
+    prev = picked.get("prev", price)
+    chg = price - prev
+    pct = chg / prev * 100 if prev else 0
+    ms = picked.get("ms", "")
+    is_rt = picked.get("is_realtime", False)
+    is_fb = picked.get("is_fallback", False)
+
+    return {
+        "price": price, "chg": chg, "pct": pct, "ms": ms,
+        "source": picked["source"],
+        "validation": label,
+        "meta": build_data_meta(picked["source"],
+                                is_realtime=is_rt,
+                                is_fallback=is_fb,
+                                delay_min=0 if is_rt else 15),
+    }
 
 
 def _fetch_tpex_index_raw():
