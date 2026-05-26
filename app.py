@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.114"
+VERSION              = "10.9.115"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -7164,12 +7164,116 @@ def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
         ev["importance_level"] = level   # 高 / 中 / 低
         ev["importance_emoji"] = emoji   # 🔴 / 🟡 / 🔵
 
+    # v10.9.115 Phase 3 完整：AI 分類 + 情緒 + 摘要（失敗自動 fallback 到 lite）
+    try:
+        merged = ai_analyze_us_news(merged, symbol, name)
+        # 過濾 AI 判斷 keep=false 或 relevance<30 的（規格 三、避免泛泛提到）
+        merged = [e for e in merged if e.get("keep", True) and
+                  e.get("relevance", 100) >= 30]
+        # 如果 AI 太狠把全砍光 → 退回原 merged（避免空白）
+        if not merged:
+            dlog("US_NEWS", f"{symbol}：AI 過濾後全空，退回 heuristic 版本")
+    except Exception as e:
+        dlog("US_NEWS_AI", f"AI 整合失敗（沿用 heuristic）：{type(e).__name__}: {e}")
+
     dlog("US_NEWS", f"{symbol}：{len(all_items)} 抓 → {len(candidates)} 篩 → "
-         f"{len(merged)} 事件 → 取 {count}（"
+         f"{len(merged)} 最終（"
          f"高 {sum(1 for e in merged if e.get('importance_level')=='高')} "
          f"中 {sum(1 for e in merged if e.get('importance_level')=='中')} "
          f"低 {sum(1 for e in merged if e.get('importance_level')=='低')}）")
     return merged[:count]
+
+
+def ai_analyze_us_news(items: list, ticker: str, ticker_name: str) -> list:
+    """v10.9.115 Phase 3 完整版：一次 batch Groq 呼叫分析新聞。
+    對每則新聞補上：
+      - category: 個股 / 產業 / 總經 / 市場情緒 / 國際 / 台股連動
+      - importance_ai: 高 / 中 / 低
+      - sentiment_6: 偏多 / 偏空 / 中性 / 觀望 / 短多長空 / 短空長多
+      - summary_zh: 20 字內中文摘要
+      - impact_tw: 對台股供應鏈/族群影響（10-15 字）
+      - relevance: 0-100，與該 ticker 的實質相關度
+      - keep: bool，AI 認為是否值得保留
+    失敗時直接回原 items（不破壞 Phase 1+2+3 lite 結果）。
+    """
+    if not items or not GROQ_AVAILABLE:
+        return items
+    # 快取檢查（key 含 ticker + title 避免不同股票共用解讀）
+    now_ts = int(time.time())
+    to_analyze = []
+    cached = {}
+    for i, it in enumerate(items):
+        key = f"v115_{ticker}_{normalize_title(it.get('title',''))}"
+        if key in NEWS_AI_CACHE:
+            data, ts = NEWS_AI_CACHE[key]
+            if now_ts - ts < NEWS_AI_CACHE_TTL:
+                cached[i] = data
+                continue
+        to_analyze.append((i, it))
+    if not to_analyze:
+        # 全部命中快取
+        for i, data in cached.items():
+            items[i].update(data)
+        return items
+
+    # 構造 prompt
+    news_text = "\n".join([f"{idx+1}. {it[1].get('title','')}" for idx, it in enumerate(to_analyze)])
+    system_prompt = f"""你是專業美股新聞分析師。針對股票 {ticker} ({ticker_name}) 分析以下新聞。
+對每則回傳一個 JSON object，欄位嚴格如下：
+
+- category: 必為 "個股" / "產業" / "總經" / "市場情緒" / "國際" / "台股連動" 之一
+- importance_ai: 必為 "高" / "中" / "低" 之一（依規格：財報/Fed/併購/大幅升降評/出口管制=高；產業趨勢/法人觀點=中；雜訊=低）
+- sentiment_6: 必為 "偏多" / "偏空" / "中性" / "觀望" / "短多長空" / "短空長多" 之一
+- summary_zh: 20 字內中文摘要，必須說重點，不要照抄標題
+- impact_tw: 10-15 字內，對台股供應鏈/族群影響（例如「台積電供應鏈受惠」「無直接連動」）
+- relevance: 0-100 整數，與 {ticker} ({ticker_name}) 的實質相關度（純粹提到名字 ≤ 30；實質影響 ≥ 70）
+- keep: true/false，是否建議保留（雜訊、無關、過時 → false）
+
+只輸出 JSON 陣列，不要其他文字、不要 markdown 標籤。"""
+    response = groq_chat([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"新聞列表：\n{news_text}"}
+    ], max_tokens=1500, temperature=0.2, timeout=12)
+
+    # 解析
+    ai_data = []
+    try:
+        m = re.search(r'\[.*\]', response, re.DOTALL)
+        if m:
+            parsed = json.loads(m.group(0))
+            if isinstance(parsed, list):
+                ai_data = parsed
+    except Exception as e:
+        dlog("US_NEWS_AI", f"JSON 解析失敗：{e} / response={response[:200]}")
+    if not ai_data:
+        dlog("US_NEWS_AI", f"AI 分析空回，沿用 heuristic 結果")
+        return items
+
+    # 套用 AI 結果到原 items
+    for ai_idx, (orig_idx, _) in enumerate(to_analyze):
+        if ai_idx >= len(ai_data): break
+        ai = ai_data[ai_idx]
+        if not isinstance(ai, dict): continue
+        data = {
+            "category": str(ai.get("category", ""))[:10],
+            "importance_ai": str(ai.get("importance_ai", ""))[:2],
+            "sentiment_6": str(ai.get("sentiment_6", ""))[:6],
+            "summary_zh": str(ai.get("summary_zh", ""))[:40],
+            "impact_tw": str(ai.get("impact_tw", ""))[:30],
+            "relevance": int(ai.get("relevance", 50)) if str(ai.get("relevance","")).isdigit() else 50,
+            "keep": ai.get("keep", True),
+        }
+        items[orig_idx].update(data)
+        # 寫入快取
+        key = f"v115_{ticker}_{normalize_title(items[orig_idx].get('title',''))}"
+        NEWS_AI_CACHE[key] = (data, now_ts)
+
+    # 套快取部分
+    for i, data in cached.items():
+        items[i].update(data)
+
+    dlog("US_NEWS_AI", f"{ticker}：AI 分析 {len(to_analyze)} 新 + {len(cached)} 快取")
+    return items
 
 
 def get_us_stock_news(symbol: str, name: str, count: int = 4) -> list:
@@ -7385,6 +7489,44 @@ def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict
                 "flex": 0, "align": "end",
             })
 
+        # v10.9.115：body 包含 title + AI 摘要/情緒/台股影響（沒 AI 欄位時自動降級為純 title）
+        body_contents = [
+            {"type": "text", "text": title, "size": "sm",
+             "color": "#5B4040", "weight": "bold", "wrap": True},
+        ]
+        ai_summary = n.get("summary_zh", "")
+        sentiment_6 = n.get("sentiment_6", "")
+        impact_tw = n.get("impact_tw", "")
+        category = n.get("category", "")
+        if ai_summary:
+            body_contents.append({"type": "separator", "color": "#E8C4B4", "margin": "sm"})
+            body_contents.append({
+                "type": "text", "text": f"💡 {ai_summary}",
+                "size": "xxs", "color": "#A05A48", "wrap": True, "margin": "sm"
+            })
+        if sentiment_6 or category:
+            sent_emoji_map = {
+                "偏多": "🟢", "偏空": "🔴", "中性": "🟡", "觀望": "⚪",
+                "短多長空": "🟢→🔴", "短空長多": "🔴→🟢",
+            }
+            sent_emoji = sent_emoji_map.get(sentiment_6, "")
+            parts = []
+            if sentiment_6: parts.append(f"{sent_emoji} {sentiment_6}")
+            if category: parts.append(f"[{category}]")
+            if parts:
+                body_contents.append({
+                    "type": "text",
+                    "text": " ‧ ".join(parts),
+                    "size": "xxs", "color": "#7AABBE", "weight": "bold",
+                    "margin": "xs", "wrap": True
+                })
+        if impact_tw:
+            body_contents.append({
+                "type": "text",
+                "text": f"🇹🇼 {impact_tw}",
+                "size": "xxs", "color": "#A05A48", "margin": "xs", "wrap": True
+            })
+
         bubble = {
             "type": "bubble", "size": "kilo",
             "header": {
@@ -7398,11 +7540,8 @@ def make_stock_news_carousel(stock_id: str, name: str, news_dicts: list) -> dict
             },
             "body": {
                 "type": "box", "layout": "vertical",
-                "backgroundColor": "#FDF6F0", "paddingAll": "12px",
-                "contents": [
-                    {"type": "text", "text": title, "size": "sm",
-                     "color": "#5B4040", "weight": "bold", "wrap": True},
-                ]
+                "backgroundColor": "#FDF6F0", "paddingAll": "12px", "spacing": "xs",
+                "contents": body_contents
             },
             "footer": {
                 "type": "box", "layout": "vertical", "paddingAll": "8px",
