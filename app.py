@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.110"
+VERSION              = "10.9.111"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6888,6 +6888,65 @@ def clean_title(t:str)->str:
     t=t.split(" - ")[0].strip(); t=re.sub(r'\s+',' ',t)
     return t[:32]+"…" if len(t)>32 else t
 
+def get_us_stock_news(symbol: str, name: str, count: int = 4) -> list:
+    """v10.9.111：抓美股個股新聞（英文）。
+    來源：
+      1. Google News (hl=en, gl=US) — 用 "{symbol} {name} stock news" 搜尋
+      2. Yahoo Finance RSS（按 ticker）
+    回傳 [(title, url), ...]，去重 + 限制權威來源優先。
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    all_results = []
+
+    # 1. Google News 英文
+    try:
+        query = f"{symbol} {name} stock"
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-US&gl=US&ceid=US:en"
+        r = requests.get(url, timeout=8, headers=headers)
+        root = ET.fromstring(r.content)
+        for item in root.findall(".//item")[:count*3]:
+            title = clean_title(item.findtext("title", ""))
+            link = item.findtext("link", "").strip()
+            if title and link and is_real_news(title):
+                all_results.append((title, link))
+    except Exception as e:
+        dlog("US_NEWS", f"Google News fail: {type(e).__name__}: {e}")
+
+    # 2. Yahoo Finance RSS（個股）
+    try:
+        url = f"https://finance.yahoo.com/rss/headline?s={symbol}"
+        r = requests.get(url, timeout=8, headers=headers)
+        root = ET.fromstring(r.content)
+        for item in root.findall(".//item")[:count*2]:
+            title = clean_title(item.findtext("title", ""))
+            link = item.findtext("link", "").strip()
+            if title and link:
+                all_results.append((title, link))
+    except Exception as e:
+        dlog("US_NEWS", f"Yahoo RSS fail: {type(e).__name__}: {e}")
+
+    # 權威來源優先 + 去重
+    TRUSTED_US = ["reuters.com", "cnbc.com", "bloomberg.com", "marketwatch.com",
+                  "wsj.com", "barrons.com", "investing.com", "benzinga.com",
+                  "seekingalpha.com", "finance.yahoo.com", "ft.com", "forbes.com",
+                  "cnn.com/business", "apnews.com"]
+    trusted = []
+    untrusted = []
+    seen_titles = set()
+    for t, u in all_results:
+        key = normalize_title(t)[:25] if t else ""
+        if not key or key in seen_titles: continue
+        seen_titles.add(key)
+        if any(s in u.lower() for s in TRUSTED_US):
+            trusted.append((t, u))
+        else:
+            untrusted.append((t, u))
+    combined = trusted[:count]
+    if len(combined) < count:
+        combined += untrusted[:count - len(combined)]
+    return combined[:count]
+
+
 def get_news(query:str, count:int=4, trusted_only:bool=True)->list:
     headers={"User-Agent":"Mozilla/5.0"}; all_results=[]
     try:
@@ -8633,7 +8692,9 @@ def get_stock_flex(symbol:str, user_id:str="")->tuple:
         us=get_us_stock(symbol)
         if not us: return None,f"查無此股票：{symbol}\n請確認代碼是否正確"
         closes=get_us_closes(symbol); kline=get_kline_analysis(closes)
-        news=get_news(f"{symbol} {us['name']} stock news",4,trusted_only=True)
+        # v10.9.111：原 get_news 是中文源（Google News zh-TW），美股查不到
+        # 改用 get_us_stock_news 抓英文新聞（Google News en + Yahoo Finance RSS）
+        news=get_us_stock_news(symbol, us['name'], 4)
         update_us_data_to_sheets(symbol,us)
         log_to_sheets(user_id,"查詢美股",symbol,"成功")
         return make_stock_flex(symbol,us["name"],"美股",us.get("status",""),"Yahoo Finance",
