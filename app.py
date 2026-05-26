@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.116"
+VERSION              = "10.9.117"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6940,6 +6940,48 @@ def _us_news_source_name(url: str) -> str:
         return host.title() if host else "綜合"
     except: return "綜合"
 
+# v10.9.117：source 名稱 → 權重（用於 Google News 抓的新聞，link 是 google.com 轉址抓不到原始 domain）
+US_NEWS_NAME_WEIGHTS = {
+    "Reuters": 100, "Bloomberg": 100, "Bloomberg.com": 100,
+    "Wall Street Journal": 100, "WSJ": 100, "The Wall Street Journal": 100,
+    "CNBC": 100, "CNBC.com": 100,
+    "Associated Press": 90, "AP News": 90, "AP": 90,
+    "Nasdaq": 85, "Nasdaq.com": 85, "NYSE": 85,
+    "MarketWatch": 80, "Barron's": 80, "Barrons": 80,
+    "Yahoo Finance": 65, "Yahoo": 60,
+    "Investing.com": 60, "TradingView": 55, "Seeking Alpha": 55,
+    "鉅亨網": 50, "經濟日報": 50, "工商時報": 50,
+    "MoneyDJ": 50, "玩股網": 45, "財訊快報": 50,
+    "Financial Times": 90, "FT": 90, "Forbes": 60,
+    "Business Insider": 50, "Motley Fool": 45, "The Motley Fool": 45,
+    "Zacks": 50, "Zacks Investment Research": 50,
+    "TheStreet": 45, "Benzinga": 50,
+    "CNN Business": 60, "CNN": 55,
+}
+
+def _us_news_source_weight_by_name(name: str) -> int:
+    """v10.9.117：由來源中文/英文名稱查權重；找不到回 10（會被過濾）。"""
+    if not name: return 10
+    nl = name.strip()
+    # 精確比對
+    if nl in US_NEWS_NAME_WEIGHTS:
+        return US_NEWS_NAME_WEIGHTS[nl]
+    # 模糊：常見「The X」「X.com」「X News」等變體
+    nl_lower = nl.lower()
+    for key, w in US_NEWS_NAME_WEIGHTS.items():
+        kl = key.lower()
+        if kl in nl_lower or nl_lower in kl:
+            return w
+    return 10
+
+def _us_news_compute_weight(url: str, source_name: str) -> int:
+    """v10.9.117：URL 路徑 + 來源名雙查，取較高者。
+    解決 Google News 抓到的新聞 link 是 google.com 轉址，原始 domain 查不到的問題。"""
+    return max(_us_news_source_weight(url), _us_news_source_weight_by_name(source_name))
+
+# v10.9.117：篩選門檻（規格十四：避免內容農場 / 不知名小媒體）
+US_NEWS_MIN_WEIGHT = 30   # 低於此分數 → 直接砍
+
 
 def _us_news_normalize(title: str) -> str:
     """v10.9.113 Phase 2：跨來源比對用的標題正規化。
@@ -7091,10 +7133,17 @@ def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
                 t = clean_title(it.findtext("title", "") or "")
                 link = (it.findtext("link", "") or "").strip()
                 if not t or not link or not is_real_news(t): continue
-                # Google News 標題尾巴常有「... - Source」→ 切掉
+                # v10.9.117：抓 <source> 標籤；Google News 的 <source>+ 標題尾巴都帶來源名
+                src_el = it.find("source")
+                src_name_from_tag = (src_el.text.strip() if src_el is not None and src_el.text else "")
+                src_name_from_title = ""
+                # Google News 標題尾巴「... - Source」→ 切出來
                 if " - " in t:
-                    head, _ = t.rsplit(" - ", 1)
-                    if len(head) > 10: t = head.strip()
+                    head, tail = t.rsplit(" - ", 1)
+                    if len(head) > 10:
+                        t = head.strip()
+                        src_name_from_title = tail.strip()
+                src_name = src_name_from_tag or src_name_from_title or ""
                 pub = (it.findtext("pubDate", "") or "").strip()
                 ds = pub
                 try:
@@ -7102,7 +7151,8 @@ def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
                     dt = parsedate_to_datetime(pub)
                     ds = dt.astimezone(TZ_TAIPEI).strftime("%m/%d %H:%M")
                 except: pass
-                out.append({"title": t, "url": link, "date": ds})
+                out.append({"title": t, "url": link, "date": ds,
+                            "_src_name_hint": src_name})  # v10.9.117：傳給後續查 weight
             return out
         except Exception as e:
             dlog("US_NEWS", f"{label} fail: {type(e).__name__}")
@@ -7124,10 +7174,18 @@ def get_us_stock_news_v2(symbol: str, name: str, count: int = 4) -> list:
             try: all_items += f.result(timeout=10)
             except: pass
 
-    # 套權重 + 來源名
+    # v10.9.117：URL + source 名稱雙路徑查 weight；source 顯示名以雙路徑為準
     for it in all_items:
-        it["weight"] = _us_news_source_weight(it["url"])
-        it["source"] = _us_news_source_name(it["url"])
+        src_hint = it.pop("_src_name_hint", "") or ""
+        it["weight"] = _us_news_compute_weight(it["url"], src_hint)
+        # source 顯示名：優先 hint（Google News 給的最準），否則 URL 推測
+        it["source"] = src_hint if src_hint else _us_news_source_name(it["url"])
+
+    # v10.9.117：內容農場過濾（規格十四：避免不知名小媒體 / 內容農場）
+    before_n = len(all_items)
+    all_items = [it for it in all_items if it["weight"] >= US_NEWS_MIN_WEIGHT]
+    if before_n - len(all_items) > 0:
+        dlog("US_NEWS", f"{symbol}：農場過濾砍掉 {before_n - len(all_items)} 則（weight < {US_NEWS_MIN_WEIGHT}）")
 
     # 篩選（規格三）：標題必須相關，或來源權重夠高
     sym_l = symbol.lower()
