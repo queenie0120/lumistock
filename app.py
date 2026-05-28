@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.119"
+VERSION              = "10.9.120"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6424,6 +6424,88 @@ _COMMON_NAME_TO_ID = {
     "統一": "1216", "台塑化": "6505",
 }
 
+# v10.9.120：AI 問答對話歷史（讓 AI 接上下文，解析「他/這/那」代名詞）
+AI_QA_HISTORY = {}             # user_id -> [{role, content, ts}, ...]
+AI_QA_HISTORY_MAX_TURNS = 6    # 保留近 6 則（3 輪 user+assistant）
+AI_QA_HISTORY_TTL = 1800       # 30 分鐘 — 超過就清，避免跨主題串接
+
+def _ai_qa_get_history(user_id: str) -> list:
+    """v10.9.120：取得使用者近期問答歷史（自動清掉超時的）。"""
+    h = AI_QA_HISTORY.get(user_id, [])
+    now = time.time()
+    h = [e for e in h if (now - e.get("ts", 0)) < AI_QA_HISTORY_TTL]
+    AI_QA_HISTORY[user_id] = h
+    return h
+
+def _ai_qa_add_history(user_id: str, role: str, content: str) -> None:
+    """v10.9.120：把 user/assistant 訊息加進歷史。"""
+    h = _ai_qa_get_history(user_id)
+    h.append({"role": role, "content": content[:1500], "ts": time.time()})
+    if len(h) > AI_QA_HISTORY_MAX_TURNS:
+        h = h[-AI_QA_HISTORY_MAX_TURNS:]
+    AI_QA_HISTORY[user_id] = h
+
+def _ai_qa_resolve_pronoun(user_id: str, question: str) -> list:
+    """v10.9.120：若問題含「他/這檔/那檔/該股」等代名詞且沒明確 ticker
+    → 從歷史中找最近一次提到的股票。"""
+    pronouns = ["他", "她", "牠", "它", "這檔", "那檔", "該檔", "該股", "該股票",
+                "這支", "那支", "這隻", "那隻", "這家", "那家", "這檔股", "那檔股"]
+    if not any(p in question for p in pronouns):
+        return []
+    h = _ai_qa_get_history(user_id)
+    for entry in reversed(h):
+        if entry.get("role") != "user": continue
+        prev_q = entry.get("content", "")
+        stocks = _detect_stocks_in_question(prev_q)
+        if stocks:
+            dlog("AI_QA", f"代名詞解析：{user_id[-6:]} 「{question[:20]}」→ 沿用上次 {stocks}")
+            return stocks
+    return []
+
+
+def _load_finmind_chip_recent(sid: str, days: int = 5) -> dict:
+    """v10.9.120：抓某檔股票近 N 天法人買賣超數字（FinMind Backer 有）。
+    回傳 {foreign_net_total, trust_net_total, dealer_net_total, days_back}（張數）。"""
+    if not FINMIND_TOKEN: return {}
+    end_date = now_taipei().strftime("%Y-%m-%d")
+    start_date = (now_taipei() - timedelta(days=days*2+5)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "data_id": sid,
+        "start_date": start_date,
+        "end_date": end_date,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200: return {}
+        payload = r.json()
+        if payload.get("status") != 200: return {}
+        rows = payload.get("data") or []
+        if not rows: return {}
+        # 取近 days 個交易日
+        dates = sorted(set(r.get("date","") for r in rows), reverse=True)[:days]
+        recent = [r for r in rows if r.get("date","") in dates]
+        agg = {"foreign_net":0, "trust_net":0, "dealer_net":0}
+        for row in recent:
+            name = (row.get("name") or "").strip()
+            buy = int(row.get("buy", 0) or 0)
+            sell = int(row.get("sell", 0) or 0)
+            net = (buy - sell) // 1000  # 換算成「張」
+            if name.startswith("Foreign_") or "外" in name:
+                agg["foreign_net"] += net
+            elif "Investment_Trust" in name or "投信" in name:
+                agg["trust_net"] += net
+            elif "Dealer" in name or "自營" in name:
+                agg["dealer_net"] += net
+        agg["days_back"] = len(dates)
+        return agg
+    except Exception as e:
+        dlog("AI_QA", f"chip {sid} fail: {type(e).__name__}: {e}")
+        return {}
+
+
 def _detect_stocks_in_question(text: str) -> list:
     """從問題中辨識股票代號（4-6 位數字）或常見名稱，回傳 [stock_id, ...]（最多 3 檔）。"""
     found = []
@@ -6472,6 +6554,16 @@ def _build_stock_context(sid: str) -> str:
             lines.append(f"　近 60 天區間參考：支撐約 {adv['stop_loss']:.1f}　壓力約 {adv['target']:.1f}")
         if adv.get("ex_div_date"):
             lines.append(f"　下次除息日 {adv['ex_div_date']}　現金 {adv.get('ex_div_cash',0)} 元")
+    except: pass
+    # v10.9.120：法人買賣超實際數字（近 5 日累計）
+    try:
+        chip = _load_finmind_chip_recent(sid, days=5)
+        if chip and chip.get("days_back"):
+            fn = chip.get("foreign_net", 0)
+            tn = chip.get("trust_net", 0)
+            dn = chip.get("dealer_net", 0)
+            sign = lambda x: f"{x:+,}" if x else "0"
+            lines.append(f"　法人 近 {chip['days_back']} 日累計：外資 {sign(fn)} 張 / 投信 {sign(tn)} 張 / 自營 {sign(dn)} 張")
     except: pass
     # 新聞
     try:
@@ -6556,6 +6648,9 @@ def ai_qa_answer(user_id: str, question: str) -> str:
     else:
         # 2) 個股偵測
         stocks = _detect_stocks_in_question(q)
+        # v10.9.120：若沒抓到 ticker 但有代名詞 → 沿用歷史最近提到的股票
+        if not stocks:
+            stocks = _ai_qa_resolve_pronoun(user_id, q)
         if stocks:
             qtype = "stock"
             context_parts.append("【即時資料區（僅能引用以下數據，未列出的不可編造）】")
@@ -6602,10 +6697,17 @@ def ai_qa_answer(user_id: str, question: str) -> str:
         f"請依系統規則回答。投資相關務必附資料來源與免責聲明、AI 信心。"
     )
 
-    messages = [
-        {"role": "system", "content": AI_QA_SYSTEM_PROMPT},
-        {"role": "user", "content": user_msg},
-    ]
+    # v10.9.120：加入對話歷史（讓 AI 接上下文）
+    history = _ai_qa_get_history(user_id)
+    messages = [{"role": "system", "content": AI_QA_SYSTEM_PROMPT}]
+    # 帶入近 4 則歷史（user 跟 assistant 交錯），長度限制避免爆 prompt
+    for h in history[-4:]:
+        role = h.get("role")
+        content = h.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content[:800]})
+    messages.append({"role": "user", "content": user_msg})
+
     answer = groq_chat(messages, max_tokens=1800, temperature=0.3, timeout=30)
     if not answer:
         return ("🤖 AI 暫時無法回答（可能是 API 忙碌或額度限制）\n"
@@ -6613,6 +6715,9 @@ def ai_qa_answer(user_id: str, question: str) -> str:
     # 保險：確保有免責聲明
     if "不構成投資建議" not in answer and qtype in ("stock", "market", "compare_knowledge"):
         answer += "\n\n⚠ 僅供參考，不構成投資建議"
+    # v10.9.120：寫入歷史（user + assistant 各一筆）
+    _ai_qa_add_history(user_id, "user", q)
+    _ai_qa_add_history(user_id, "assistant", answer)
     return answer
 
 
