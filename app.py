@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.123"
+VERSION              = "10.9.124"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2422,7 +2422,9 @@ def init_name_cache():
     try:
         fd = os.open(boot_flag, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.close(fd)
-        push_to_owner(f"✅ Lumistock v{VERSION} 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
+        dlog("BOOT", f"嘗試 push v{VERSION} 啟動通知到 Owner")  # v10.9.124
+        ok = push_to_owner(f"✅ Lumistock v{VERSION} 啟動完成\n名稱快取：{total} 筆\n{now_taipei().strftime('%m/%d %H:%M')}")
+        dlog("BOOT", f"啟動通知 push 結果：{'✅ 成功' if ok else '❌ 失敗'}")
     except FileExistsError:
         dlog("BOOT", f"v{VERSION} 已通知過，跳過重複通知")
     except Exception as e:
@@ -3706,11 +3708,15 @@ def restore_portfolio_from_sheets() -> int:
 #  推播
 # ══════════════════════════════════════════
 def push_to_owner(text):
+    """v10.9.124：把錯誤露出來，方便看是不是 LINE quota / token 失效"""
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(
                 PushMessageRequest(to=OWNER_USER_ID, messages=[TextMessage(text=text)]))
-    except: pass
+        return True
+    except Exception as e:
+        dlog("PUSH_OWNER", f"❌ push 失敗：{type(e).__name__}: {str(e)[:200]}")
+        return False
 
 def push_message(user_id: str, text: str):
     try:
