@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.121"
+VERSION              = "10.9.122"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6470,6 +6470,89 @@ def _ai_qa_resolve_pronoun(user_id: str, question: str) -> list:
     return []
 
 
+def _load_finmind_monthly_revenue(sid: str) -> list:
+    """v10.9.122：抓某檔股票近 4 期月營收（含年增率）。
+    Backer 等級有 TaiwanStockMonthRevenue dataset。
+    回傳 [{date, revenue_million, yoy_pct}, ...]（最新在前）。"""
+    if not FINMIND_TOKEN: return []
+    end_date = now_taipei().strftime("%Y-%m-%d")
+    start_date = (now_taipei() - timedelta(days=180)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockMonthRevenue",
+        "data_id": sid,
+        "start_date": start_date,
+        "end_date": end_date,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200: return []
+        payload = r.json()
+        if payload.get("status") != 200: return []
+        rows = payload.get("data") or []
+        if not rows: return []
+        rows.sort(key=lambda x: x.get("date", ""), reverse=True)
+        out = []
+        for row in rows[:4]:
+            try:
+                rev = int(row.get("revenue", 0)) // 1_000_000   # 換算成「百萬」
+                # FinMind 欄位：revenue_year, revenue_month, revenue, revenue_growth_rate, ...
+                yoy = row.get("revenue_year_growth")
+                if yoy is None:
+                    yoy = row.get("revenue_growth_rate", 0)
+                out.append({
+                    "date": (row.get("date") or "")[:7],   # YYYY-MM
+                    "revenue_million": rev,
+                    "yoy_pct": float(yoy) if yoy is not None else 0.0,
+                })
+            except: continue
+        return out
+    except Exception as e:
+        dlog("AI_QA", f"revenue {sid} fail: {type(e).__name__}: {e}")
+        return []
+
+
+# v10.9.122：個股「近期重點」AI 摘要快取（1 小時）
+RECENT_HIGHLIGHTS_CACHE = {}   # sid -> {"text": str, "ts": int}
+RECENT_HIGHLIGHTS_TTL = 3600
+
+def _ai_summarize_recent_events(sid: str, name: str, news_list: list) -> str:
+    """v10.9.122：用 AI 把最近 3-5 則新聞濃縮成「近期重點：A / B / C」一行。
+    1 小時快取避免重複呼叫。"""
+    if not news_list or not GROQ_AVAILABLE:
+        return ""
+    cache_key = sid
+    now_ts = int(time.time())
+    if cache_key in RECENT_HIGHLIGHTS_CACHE:
+        cached = RECENT_HIGHLIGHTS_CACHE[cache_key]
+        if now_ts - cached.get("ts", 0) < RECENT_HIGHLIGHTS_TTL:
+            return cached.get("text", "")
+    # 抓近 5 則標題
+    titles = []
+    for item in news_list[:5]:
+        if isinstance(item, tuple):
+            titles.append(item[0])
+        elif isinstance(item, dict):
+            titles.append(item.get("title", ""))
+    if not titles: return ""
+    prompt = f"""你是專業財經分析師。以下是 {sid} {name} 近期 3-5 則新聞標題：
+{chr(10).join(f"{i+1}. {t}" for i, t in enumerate(titles))}
+
+請濃縮成「近期重點：A / B / C」一行（最多 3 個點，每點 10-15 字內），描述這家公司近期發生的主要事件。
+只輸出該行文字，不要其他說明、不要 markdown。"""
+    try:
+        resp = groq_chat([{"role":"user","content":prompt}],
+                         max_tokens=200, temperature=0.2, timeout=10)
+        if resp:
+            resp = resp.strip().split("\n")[0][:120]   # 只取第一行，限長
+            RECENT_HIGHLIGHTS_CACHE[cache_key] = {"text": resp, "ts": now_ts}
+            return resp
+    except Exception as e:
+        dlog("AI_QA", f"近期重點 AI 失敗 {sid}: {type(e).__name__}")
+    return ""
+
+
 def _load_finmind_chip_recent(sid: str, days: int = 5) -> dict:
     """v10.9.120：抓某檔股票近 N 天法人買賣超數字（FinMind Backer 有）。
     回傳 {foreign_net_total, trust_net_total, dealer_net_total, days_back}（張數）。"""
@@ -6576,13 +6659,39 @@ def _build_stock_context(sid: str) -> str:
             sign = lambda x: f"{x:+,}" if x else "0"
             lines.append(f"　法人 近 {chip['days_back']} 日累計：外資 {sign(fn)} 張 / 投信 {sign(tn)} 張 / 自營 {sign(dn)} 張")
     except: pass
-    # 新聞
+    # 新聞 + AI 摘要近期重點（v10.9.122）
+    news_for_summary = []
     try:
         news = get_tw_stock_news(sid, name, count=3)
         if news:
+            news_for_summary = news
             lines.append("　近期新聞：")
             for t, u in news[:3]:
                 lines.append(f"　・{t}")
+    except: pass
+    # v10.9.122：AI 萃取「近期重點事件」
+    if news_for_summary:
+        try:
+            highlights = _ai_summarize_recent_events(sid, name, news_for_summary)
+            if highlights:
+                lines.append(f"　{highlights}")
+        except: pass
+    # v10.9.122：近 5/20 日股價變化（從現有 closes 算，0 額外 API）
+    try:
+        cl = get_tw_closes(sid)
+        if cl and len(cl) >= 20:
+            chg5 = (cl[-1] - cl[-5]) / cl[-5] * 100 if cl[-5] else 0
+            chg20 = (cl[-1] - cl[-20]) / cl[-20] * 100 if cl[-20] else 0
+            lines.append(f"　近期股價：5 日 {chg5:+.2f}% / 20 日 {chg20:+.2f}%")
+    except: pass
+    # v10.9.122：月營收 y/y（FinMind Backer）
+    try:
+        rev = _load_finmind_monthly_revenue(sid)
+        if rev:
+            parts = []
+            for r in rev[:3]:
+                parts.append(f"{r['date']}（{r['revenue_million']:,}M / 年增 {r['yoy_pct']:+.1f}%）")
+            lines.append(f"　月營收近 3 期：{' ‧ '.join(parts)}")
     except: pass
     return "\n".join(lines)
 
