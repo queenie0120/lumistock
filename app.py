@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.122"
+VERSION              = "10.9.123"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6518,8 +6518,12 @@ RECENT_HIGHLIGHTS_CACHE = {}   # sid -> {"text": str, "ts": int}
 RECENT_HIGHLIGHTS_TTL = 3600
 
 def _ai_summarize_recent_events(sid: str, name: str, news_list: list) -> str:
-    """v10.9.122：用 AI 把最近 3-5 則新聞濃縮成「近期重點：A / B / C」一行。
-    1 小時快取避免重複呼叫。"""
+    """v10.9.122 → v10.9.123：用 AI 從新聞萃取 3 段深度解讀（不只是標題濃縮）：
+      ① 近期重點事件（公司新研發/發表/合作/財報/法人異動）
+      ② 對市場意義（產業趨勢/題材/估值面）
+      ③ 影響族群（連動的台股供應鏈/概念股）
+    1 小時快取避免重複呼叫。回傳多行文字（或空字串）。
+    """
     if not news_list or not GROQ_AVAILABLE:
         return ""
     cache_key = sid
@@ -6528,7 +6532,6 @@ def _ai_summarize_recent_events(sid: str, name: str, news_list: list) -> str:
         cached = RECENT_HIGHLIGHTS_CACHE[cache_key]
         if now_ts - cached.get("ts", 0) < RECENT_HIGHLIGHTS_TTL:
             return cached.get("text", "")
-    # 抓近 5 則標題
     titles = []
     for item in news_list[:5]:
         if isinstance(item, tuple):
@@ -6536,18 +6539,28 @@ def _ai_summarize_recent_events(sid: str, name: str, news_list: list) -> str:
         elif isinstance(item, dict):
             titles.append(item.get("title", ""))
     if not titles: return ""
-    prompt = f"""你是專業財經分析師。以下是 {sid} {name} 近期 3-5 則新聞標題：
+    industry = INDUSTRY_CACHE.get(sid, "")
+    industry_hint = f"（產業：{industry}）" if industry else ""
+    prompt = f"""你是專業財經分析師。以下是 {sid} {name}{industry_hint} 近期 3-5 則新聞標題：
 {chr(10).join(f"{i+1}. {t}" for i, t in enumerate(titles))}
 
-請濃縮成「近期重點：A / B / C」一行（最多 3 個點，每點 10-15 字內），描述這家公司近期發生的主要事件。
-只輸出該行文字，不要其他說明、不要 markdown。"""
+請從這些新聞分析並輸出 3 行（每行 1 句，無 markdown）：
+
+近期重點: A / B / C（公司發生什麼具體事件，如：新研發/新產品/法說/重大合作/訴訟/高層異動，最多 3 點，每點 10-15 字）
+市場意義: 這些事件對股價/估值/題材的意義（一句話，20-30 字）
+影響族群: 影響哪些台股供應鏈/概念股族群（一句話，15-25 字；若無明顯連動回「無明顯族群連動」）
+
+只輸出這 3 行，每行前綴用上方標籤名（「近期重點」「市場意義」「影響族群」）。"""
     try:
         resp = groq_chat([{"role":"user","content":prompt}],
-                         max_tokens=200, temperature=0.2, timeout=10)
+                         max_tokens=400, temperature=0.2, timeout=12)
         if resp:
-            resp = resp.strip().split("\n")[0][:120]   # 只取第一行，限長
-            RECENT_HIGHLIGHTS_CACHE[cache_key] = {"text": resp, "ts": now_ts}
-            return resp
+            # 取前 3 行非空文字，限長
+            lines = [l.strip() for l in resp.strip().split("\n") if l.strip()][:3]
+            cleaned = "\n".join(f"　{l[:120]}" for l in lines)
+            if cleaned:
+                RECENT_HIGHLIGHTS_CACHE[cache_key] = {"text": cleaned, "ts": now_ts}
+                return cleaned
     except Exception as e:
         dlog("AI_QA", f"近期重點 AI 失敗 {sid}: {type(e).__name__}")
     return ""
@@ -6669,12 +6682,13 @@ def _build_stock_context(sid: str) -> str:
             for t, u in news[:3]:
                 lines.append(f"　・{t}")
     except: pass
-    # v10.9.122：AI 萃取「近期重點事件」
+    # v10.9.122 → v10.9.123：AI 深度解讀 3 段（事件 / 市場意義 / 影響族群）
     if news_for_summary:
         try:
             highlights = _ai_summarize_recent_events(sid, name, news_for_summary)
             if highlights:
-                lines.append(f"　{highlights}")
+                # 函式回的已是多行（每行已縮排）→ 直接 append
+                lines.append(highlights)
         except: pass
     # v10.9.122：近 5/20 日股價變化（從現有 closes 算，0 額外 API）
     try:
