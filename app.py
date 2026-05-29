@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.137"
+VERSION              = "10.9.138"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9219,6 +9219,87 @@ def get_market_summary()->str:
 # ══════════════════════════════════════════
 #  觀察清單 Flex
 # ══════════════════════════════════════════
+
+# v10.9.138：警告用語模組（依狀態 / 情境自動切換，不是固定一句）
+REC_WARNINGS = {
+    # A. 封面警告（固定）
+    "cover": "⚠️ 推薦不等於買進。本系統僅供研究參考，投資前請自行評估風險、停損與資金配置。",
+    # B. 一般推薦股（aggressive / positive）
+    "general": ("⚠️ 投資風險提醒：本分析為 AI 依據公開資料、技術指標、新聞資訊"
+                "與市場條件整理之研究參考，不構成任何買賣建議或獲利保證。"
+                "請務必自行判斷並設定停損。"),
+    # C. 強勢偏熱 / 等回測
+    "hot": ("⚠️ 短線風險提醒：此股目前趨勢偏強，但短線漲幅已大，追高風險較高。"
+            "若尚未進場，建議等待回測支撐、量縮整理或重新站穩關鍵均線後再評估，"
+            "不建議無腦追價。"),
+    # D. 高風險
+    "high_risk": ("🚨 高風險警告：技術已過熱或出現轉弱訊號（爆量長黑、籌碼轉賣、"
+                  "跌破短均線等）。短線不建議追價，應等待整理或重新站回關鍵均線。"
+                  "已持有者請評估減碼或設定停損。"),
+    # E. 資料不足
+    "insufficient": ("⚠️ 資料不足提醒：目前可取得資料不足，AI 信心偏低，"
+                     "暫不建議作為主要決策依據。建議等待更多公開資訊、"
+                     "財報或官方公告確認後再評估。"),
+    # F. 題材聯想
+    "concept": ("⚠️ 題材風險提醒：目前資訊較偏向市場題材或產業聯想，尚不代表"
+                "公司已確認直接受惠或與特定大廠合作。請以公司公告、法說會、"
+                "財報與可信新聞來源為準，避免把市場聯想當成確定事實。"),
+    # G. 暫無推薦
+    "no_recommendation": ("⚠️ 今日暫無高品質推薦股：目前市場條件或個股條件不足，"
+                          "系統暫不強行推薦。建議先觀察大盤趨勢、資金流向與風險變化，"
+                          "等待更明確的進場機會。"),
+}
+
+
+def _is_data_insufficient(s: dict) -> bool:
+    """判斷個股是否屬於『資料不足』情境（給警告選擇邏輯用）。"""
+    layer = s.get("layer_scores", {}) or {}
+    # 4 層任一為 0、或品質 < 30、或沒有 closes 衍生資料
+    if layer.get("quality", 0) < 30: return True
+    if not s.get("support") and not s.get("resistance"): return True
+    if (layer.get("trend", 0) == 0 and layer.get("position", 0) == 0):
+        return True
+    return False
+
+
+def pick_rec_warning(status_key: str, filter_type: str, s: dict) -> list:
+    """v10.9.138：依狀態 / 情境挑警告。回傳 list（可能 1-2 條）。
+    題材股若同時高風險 → 兩條都加。
+    """
+    warnings = []
+    # 暫無推薦最高優先
+    if status_key == "no_recommendation":
+        return [REC_WARNINGS["no_recommendation"]]
+    # 高風險
+    if status_key == "high_risk":
+        warnings.append(REC_WARNINGS["high_risk"])
+    # 強勢偏熱 / 等回測
+    elif status_key in ("strong_hot", "wait_pullback"):
+        warnings.append(REC_WARNINGS["hot"])
+    # 資料不足
+    elif _is_data_insufficient(s):
+        warnings.append(REC_WARNINGS["insufficient"])
+    else:
+        warnings.append(REC_WARNINGS["general"])
+    # 題材股額外加題材聯想警告（不取代）
+    if filter_type == "concept":
+        warnings.append(REC_WARNINGS["concept"])
+    return warnings
+
+
+# v10.9.138：分類副標 — 顯示在封面標題下方
+REC_CATEGORY_SUBTITLE = {
+    "trend":     "📈 趨勢股觀察清單",
+    "growth":    "🌱 成長股觀察清單",
+    "stable":    "💰 存股觀察清單",
+    "swing":     "🌊 波段股觀察清單",
+    "pullback":  "🔄 低基期轉強股觀察清單",
+    "concept":   "🤖 AI / 科技概念股觀察清單",
+    "chip":      "💼 籌碼集中股觀察清單",
+    "defensive": "🛡️ 防禦型股票觀察清單",
+}
+
+
 def make_rec_card(rank:int, s:dict)->dict:
     """v10.9.135：觀察清單卡片 — AI 深度分析版 + 7 狀態徽章 + 5 段拆分。"""
     is_up=s["pct"]>=0; color="#D97A5C" if is_up else "#7AABBE"
@@ -9317,12 +9398,18 @@ def make_rec_card(rank:int, s:dict)->dict:
                        {"type":"text","text":"目標","size":"xxs","color":"#9B6B5A","flex":1},
                        {"type":"text","text":f"{tg:.0f}","size":"xxs","color":"#E89B82","flex":2,"weight":"bold","align":"end"},
                    ]}] if has_levels else []),
-                # 風險提醒
+                # 風險提醒（AI 給的個股風險）
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"text","text":"⚠ 風險提醒","size":"xxs","color":"#A05A48","weight":"bold"},
                 {"type":"box","layout":"horizontal","backgroundColor":"#FAE6DE","cornerRadius":"6px","paddingAll":"6px","contents":[
                     {"type":"text","text":risk,"size":"xxs","color":"#A05A48","wrap":True}
                 ]},
+                # v10.9.138：依狀態自動選警告（C/D/E/F 多條時依序列出）
+                *[{"type":"box","layout":"horizontal",
+                   "backgroundColor":"#F2B4A5" if "🚨" in w else "#FAE6DE",
+                   "cornerRadius":"6px","paddingAll":"6px",
+                   "contents":[{"type":"text","text":w,"size":"xxs","color":"#5B2D24" if "🚨" in w else "#A05A48","wrap":True}]}
+                  for w in pick_rec_warning(s.get("status_key",""), s.get("category",""), s)],
                 # v10.9.135：適合對象 + 觀察條件
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"box","layout":"vertical","spacing":"xs","contents":[
@@ -9380,49 +9467,107 @@ def make_rec_card(rank:int, s:dict)->dict:
                        ]},
                    ]}] if s.get("layer_scores") else []),
                 # 評分 + AI 信心
+                {"type":"separator","color":"#E8C4B4","margin":"sm"},
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#E89B82","weight":"bold","flex":3},
                     {"type":"text","text":f"AI 信心 {confidence}","size":"xxs","color":"#9B6B5A","align":"end","flex":2}
                 ]},
-                {"type":"text","text":"⚠ 僅供參考，非投資建議","size":"xxs","color":"#C9A89A","align":"center","margin":"sm"}
             ]}
     }
 
-def make_rec_flex(scored:list, mkt:dict, source_note:str)->dict:
-    now_str=now_taipei().strftime("%m/%d %H:%M")
-    overview={
+def make_rec_flex(scored:list, mkt:dict, source_note:str,
+                   filter_type:str="", market_flag:str="🇹🇼 台股")->dict:
+    """v10.9.138：封面重寫
+    - 加 AI 四層判斷說明
+    - 動態顯示本分類權重 + 4 層權重（不是寫死）
+    - 推薦數量說明
+    - 底部警告：推薦不等於買進
+    """
+    now_str = now_taipei().strftime("%Y-%m-%d %H:%M")
+    subtitle = REC_CATEGORY_SUBTITLE.get(filter_type, "")
+    c4 = CATEGORY_4LAYER_WEIGHTS.get(filter_type, {})
+    has_4w = bool(c4)
+    n_picks = len([s for s in scored if s])
+
+    overview = {
         "type":"bubble","size":"mega",
-        "header":{"type":"box","layout":"vertical","backgroundColor":"#E89B82","paddingAll":"14px",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#E89B82",
+            "paddingAll":"14px","spacing":"xs",
             "contents":[
                 {"type":"text","text":"⭐ 慧股觀察榜","size":"xl","color":"#FFFFFF","weight":"bold"},
-                {"type":"text","text":f"🇹🇼 台股　{now_str}","size":"xs","color":"#F0D0C0"}
+                *([{"type":"text","text":subtitle,"size":"sm","color":"#FFFFFF","weight":"bold"}]
+                  if subtitle else []),
+                {"type":"text","text":f"{market_flag} ‧ {now_str}","size":"xxs","color":"#F0D0C0"},
             ]},
-        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"md",
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0",
+            "paddingAll":"14px","spacing":"md",
             "contents":[
-                {"type":"text","text":mkt["str"],"size":"sm","color":"#5B4040","wrap":True},
+                # 市場狀態
+                {"type":"text","text":mkt.get("str","--"),"size":"sm","color":"#5B4040","wrap":True},
                 {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":source_note,"size":"xs","color":"#9B6B5A","wrap":True},
-                {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":"📊 評分維度","size":"sm","color":"#A05A48","weight":"bold"},
+
+                # ── AI 四層判斷說明（封面凸顯 Lumistock 不是亂推）──
+                {"type":"text","text":"🧭 AI 四層判斷","size":"sm","color":"#A05A48","weight":"bold"},
                 {"type":"box","layout":"vertical","spacing":"xs","contents":[
                     {"type":"box","layout":"horizontal","contents":[
-                        {"type":"text","text":"技術面","size":"xs","color":"#9B6B5A","flex":2},
-                        {"type":"text","text":"均線 RSI 漲幅","size":"xs","color":"#5B4040","flex":3},
-                        {"type":"text","text":"40分","size":"xs","color":"#E89B82","flex":1,"align":"end"}
+                        {"type":"text","text":"品質","size":"xs","color":"#A05A48","weight":"bold","flex":2},
+                        {"type":"text","text":"公司體質與成長性","size":"xs","color":"#5B4040","flex":5,"wrap":True},
                     ]},
                     {"type":"box","layout":"horizontal","contents":[
-                        {"type":"text","text":"籌碼面","size":"xs","color":"#9B6B5A","flex":2},
-                        {"type":"text","text":"外資 投信 同買","size":"xs","color":"#5B4040","flex":3},
-                        {"type":"text","text":"30分","size":"xs","color":"#E89B82","flex":1,"align":"end"}
+                        {"type":"text","text":"趨勢","size":"xs","color":"#A05A48","weight":"bold","flex":2},
+                        {"type":"text","text":"股價、量能與籌碼方向","size":"xs","color":"#5B4040","flex":5,"wrap":True},
                     ]},
                     {"type":"box","layout":"horizontal","contents":[
-                        {"type":"text","text":"新聞情緒","size":"xs","color":"#9B6B5A","flex":2},
-                        {"type":"text","text":"白名單財經媒體","size":"xs","color":"#5B4040","flex":3},
-                        {"type":"text","text":"30分","size":"xs","color":"#E89B82","flex":1,"align":"end"}
+                        {"type":"text","text":"位置","size":"xs","color":"#A05A48","weight":"bold","flex":2},
+                        {"type":"text","text":"現在是否適合進場","size":"xs","color":"#5B4040","flex":5,"wrap":True},
+                    ]},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"風險","size":"xs","color":"#A05A48","weight":"bold","flex":2},
+                        {"type":"text","text":"大盤、消息與不確定性","size":"xs","color":"#5B4040","flex":5,"wrap":True},
                     ]},
                 ]},
                 {"type":"separator","color":"#E8C4B4"},
-                {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#E8B8A8","wrap":True}
+
+                # ── 本分類權重（動態，不是寫死）──
+                {"type":"text","text":"📊 本分類權重","size":"sm","color":"#A05A48","weight":"bold"},
+                {"type":"text","text":source_note,"size":"xs","color":"#5B4040","wrap":True},
+
+                # ── 本分類四層權重（凸顯每類不同）──
+                *([{"type":"separator","color":"#E8C4B4"},
+                   {"type":"text","text":"🧮 本分類四層權重","size":"sm","color":"#A05A48","weight":"bold"},
+                   {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                       {"type":"box","layout":"horizontal","contents":[
+                           {"type":"text","text":"品質","size":"xxs","color":"#9B6B5A","flex":2},
+                           {"type":"text","text":f"{c4.get('quality',0)}%","size":"xxs","color":"#E89B82","weight":"bold","flex":2,"align":"end"},
+                           {"type":"text","text":"位置","size":"xxs","color":"#9B6B5A","flex":2,"align":"end"},
+                           {"type":"text","text":f"{c4.get('position',0)}%","size":"xxs","color":"#E89B82","weight":"bold","flex":2,"align":"end"},
+                       ]},
+                       {"type":"box","layout":"horizontal","contents":[
+                           {"type":"text","text":"趨勢","size":"xxs","color":"#9B6B5A","flex":2},
+                           {"type":"text","text":f"{c4.get('trend',0)}%","size":"xxs","color":"#E89B82","weight":"bold","flex":2,"align":"end"},
+                           {"type":"text","text":"風險","size":"xxs","color":"#9B6B5A","flex":2,"align":"end"},
+                           {"type":"text","text":f"{c4.get('risk',0)}%","size":"xxs","color":"#E89B82","weight":"bold","flex":2,"align":"end"},
+                       ]},
+                   ]}] if has_4w else []),
+                {"type":"separator","color":"#E8C4B4"},
+
+                # ── 推薦數量說明 ──
+                {"type":"box","layout":"vertical","backgroundColor":"#FAE6DE",
+                 "cornerRadius":"6px","paddingAll":"8px","spacing":"xs","contents":[
+                    {"type":"text","text":f"📌 本次推薦 {n_picks} 檔","size":"xs","color":"#A05A48","weight":"bold"},
+                    {"type":"text",
+                     "text":(f"品質門檻 ≥ {MIN_SCORE_FOR_RECOMMENDATION}；最多 5-10 檔，"
+                             f"條件不足不硬湊。今日符合者僅 {n_picks} 檔。"),
+                     "size":"xxs","color":"#5B4040","wrap":True},
+                 ]},
+
+                # ── 底部警告（A：推薦不等於買進）──
+                {"type":"separator","color":"#E8C4B4"},
+                {"type":"box","layout":"vertical","backgroundColor":"#F8E1D2",
+                 "cornerRadius":"6px","paddingAll":"8px","contents":[
+                    {"type":"text","text":REC_WARNINGS["cover"],
+                     "size":"xxs","color":"#A05A48","wrap":True}
+                 ]},
             ]}
     }
     # v10.9.135：支援 3-10 檔（caller 已截斷，LINE carousel 上限 12）
@@ -10401,15 +10546,14 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
             emoji, label, summary = REC_STATUS_LABELS["no_recommendation"]
             push_message(user_id,
                 f"{display}\n━━━━━━━━━━━━━━\n"
-                f"{emoji} {label}\n"
-                f"今日大盤候選股皆未達品質門檻（score ≥ {MIN_SCORE_FOR_RECOMMENDATION}），"
-                f"或結構皆處於高風險狀態。\n\n"
+                f"{emoji} {label}\n\n"
+                f"{REC_WARNINGS['no_recommendation']}\n\n"
                 f"📌 寧可少推不要亂推 — Lumistock 不會為了湊數而硬推。\n"
                 f"建議今日觀望，可改看：\n"
                 f"  ‧ 自選股 / 持股檢視\n"
                 f"  ‧ 不同題材觀察清單\n"
                 f"  ‧ 明日早盤再來看看\n\n"
-                f"權重：{weights_label}")
+                f"本分類權重：{weights_label}")
             return
 
         # 取 top（最多 10，預設 5，至少 3 若候選夠）
@@ -10425,13 +10569,12 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
         for s in top_picks:
             s["ai"] = ai_map.get(s["sid"], {})
 
-        # 4. 推送 — source_note 同時顯示分類權重 & 4 層權重（凸顯每類不同）
-        c4 = CATEGORY_4LAYER_WEIGHTS.get(filter_type, {})
-        layer_label = (f"四層權重：品質{c4.get('quality',0)}/趨勢{c4.get('trend',0)}/"
-                       f"位置{c4.get('position',0)}/風險{c4.get('risk',0)}")
-        source_note = (f"分類權重：{weights_label}\n"
-                       f"{layer_label}　|　品質門檻 ≥ {MIN_SCORE_FOR_RECOMMENDATION}")
-        push_flex(user_id, make_rec_flex(top_picks, mkt, source_note), display)
+        # 4. 推送（v10.9.138：source_note 只放分類權重，4 層權重封面自行渲染）
+        source_note = weights_label
+        push_flex(user_id,
+                  make_rec_flex(top_picks, mkt, source_note,
+                                filter_type=filter_type, market_flag="🇹🇼 台股"),
+                  display)
     except Exception as e:
         dlog("REC_FILTER", f"{filter_type} 主流程失敗：{type(e).__name__}: {e}")
         push_message(user_id, f"系統處理中，請稍後再試")
@@ -10518,9 +10661,12 @@ def build_and_push_themed_tw_recommendation(user_id: str, theme_keys: list, disp
         ai_map = ai_analyze_top_picks_batch(top5, mkt)
         for s in top5:
             s["ai"] = ai_map.get(s["sid"], {})
-        # 5. 推送（沿用既有 make_rec_flex）
+        # 5. 推送（v10.9.138：題材榜走 concept 分類）
         source_note = " ‧ ".join([t[:20] for t in theme_keys])
-        push_flex(user_id, make_rec_flex(top5, mkt, source_note), display_name)
+        push_flex(user_id,
+                  make_rec_flex(top5, mkt, source_note,
+                                filter_type="concept", market_flag="🇹🇼 台股"),
+                  display_name)
     except Exception as e:
         dlog("REC_THEME", f"{display_name} 運算失敗：{type(e).__name__}: {e}")
         push_message(user_id, f"📊 {display_name}\n━━━━━━━━━━━━━━\n系統處理中，請稍後再試")
@@ -10608,7 +10754,11 @@ def build_and_push_recommendation(user_id:str):
         ai_map = ai_analyze_top_picks_batch(top5, mkt)
         for s in top5:
             s["ai"] = ai_map.get(s["sid"], {})
-        push_flex(user_id,make_rec_flex(top5,mkt,source_note),"慧股觀察榜")
+        # v10.9.138：通用觀察榜（未指定分類，封面不顯示分類四層權重）
+        push_flex(user_id,
+                  make_rec_flex(top5, mkt, source_note,
+                                filter_type="", market_flag="🇹🇼 台股"),
+                  "慧股觀察榜")
     except Exception as e:
         dlog("REC", f"觀察清單運算失敗：{e}")
         push_message(user_id,"⭐ 觀察清單\n━━━━━━━━━━━━━━\n　系統處理中發生錯誤\n　請稍後再試")
