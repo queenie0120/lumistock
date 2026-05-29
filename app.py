@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.134"
+VERSION              = "10.9.135"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9220,19 +9220,34 @@ def get_market_summary()->str:
 #  觀察清單 Flex
 # ══════════════════════════════════════════
 def make_rec_card(rank:int, s:dict)->dict:
-    """v10.9.80：觀察清單卡片 — AI 深度分析版。"""
+    """v10.9.135：觀察清單卡片 — AI 深度分析版 + 7 狀態徽章 + 5 段拆分。"""
     is_up=s["pct"]>=0; color="#D97A5C" if is_up else "#7AABBE"
     arrow="▲" if is_up else "▼"; pct_str=f"{arrow} {abs(s['pct']):.2f}%"
     filled=s["score"]//10; bar="█"*filled+"░"*(10-filled)
     ai = s.get("ai") or {}
     # AI 分析 fallback：若 AI 未回，用 signals 拼湊
     reason = ai.get("reason") or "—（AI 分析暫缺）"
+    entry  = ai.get("entry")  or "—"      # v10.9.135
+    fit    = ai.get("fit")    or "—"      # v10.9.135
+    watch  = ai.get("watch")  or "—"      # v10.9.135
     tech_txt = ai.get("tech") or ("、".join(s.get("tech_signals",[])[:3]) or "—")
     chip_txt = ai.get("chip") or ("、".join(s.get("chip_signals",[])[:3]) or "—")
     news_txt = ai.get("news") or s.get("sentiment","中性")
     style = ai.get("style", "波段")
     risk = ai.get("risk") or "短線波動仍需留意大盤與國際雜訊"
     confidence = ai.get("confidence", "中")
+    # v10.9.135：狀態徽章
+    status_emoji = s.get("status_emoji", "")
+    status_label = s.get("status_label", "")
+    status_summary = s.get("status_summary", "")
+    has_status = bool(status_label)
+    # 狀態對應 chip 底色
+    status_bg = {
+        "可積極觀察": "#C5E1B5", "偏多觀察": "#D4E6C3",
+        "強勢但偏熱": "#F8D9A8", "等待回測": "#F8D9A8",
+        "高風險觀察": "#F2B4A5",
+        "暫不推薦": "#E0D6CF", "暫無推薦": "#E0D6CF",
+    }.get(status_label, "#E8C4B4")
     # 價位區間（v10.9.80 新增）
     sl = s.get("stop_loss"); tg = s.get("target")
     sup = s.get("support"); res = s.get("resistance")
@@ -9256,10 +9271,21 @@ def make_rec_card(rank:int, s:dict)->dict:
                     {"type":"text","text":f"{s['price']:.2f}","size":"xxl","weight":"bold","color":color,"flex":1},
                     {"type":"text","text":pct_str,"size":"sm","color":color,"align":"end","flex":1,"gravity":"bottom"}
                 ]},
+                # v10.9.135：狀態徽章
+                *([{"type":"box","layout":"vertical","backgroundColor":status_bg,"cornerRadius":"6px",
+                    "paddingAll":"6px","spacing":"xs","contents":[
+                    {"type":"text","text":f"{status_emoji} {status_label}","size":"sm",
+                     "color":"#5B4040","weight":"bold"},
+                    {"type":"text","text":status_summary,"size":"xxs","color":"#5B4040","wrap":True}
+                ]}] if has_status else []),
                 {"type":"separator","color":"#E8C4B4"},
-                # 入選理由（AI）
-                {"type":"text","text":"💡 入選理由","size":"xxs","color":"#A05A48","weight":"bold"},
+                # 1️⃣ 推薦理由
+                {"type":"text","text":"💡 推薦理由","size":"xxs","color":"#A05A48","weight":"bold"},
                 {"type":"text","text":reason,"size":"xs","color":"#5B4040","wrap":True},
+                # 2️⃣ 進場建議（v10.9.135 新增）
+                {"type":"separator","color":"#E8C4B4"},
+                {"type":"text","text":"🎯 進場建議","size":"xxs","color":"#A05A48","weight":"bold"},
+                {"type":"text","text":entry,"size":"xs","color":"#5B4040","wrap":True},
                 {"type":"separator","color":"#E8C4B4"},
                 # 三面觀察（AI）
                 {"type":"box","layout":"vertical","spacing":"xs","contents":[
@@ -9291,11 +9317,30 @@ def make_rec_card(rank:int, s:dict)->dict:
                        {"type":"text","text":"目標","size":"xxs","color":"#9B6B5A","flex":1},
                        {"type":"text","text":f"{tg:.0f}","size":"xxs","color":"#E89B82","flex":2,"weight":"bold","align":"end"},
                    ]}] if has_levels else []),
-                # 風險
+                # 風險提醒
                 {"type":"separator","color":"#E8C4B4"},
+                {"type":"text","text":"⚠ 風險提醒","size":"xxs","color":"#A05A48","weight":"bold"},
                 {"type":"box","layout":"horizontal","backgroundColor":"#FAE6DE","cornerRadius":"6px","paddingAll":"6px","contents":[
-                    {"type":"text","text":f"⚠ {risk}","size":"xxs","color":"#A05A48","wrap":True}
+                    {"type":"text","text":risk,"size":"xxs","color":"#A05A48","wrap":True}
                 ]},
+                # v10.9.135：適合對象 + 觀察條件
+                {"type":"separator","color":"#E8C4B4"},
+                {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"👤 適合對象","size":"xxs","color":"#9B6B5A","flex":2},
+                        {"type":"text","text":fit,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
+                    ]},
+                    {"type":"box","layout":"horizontal","contents":[
+                        {"type":"text","text":"👀 觀察條件","size":"xxs","color":"#9B6B5A","flex":2},
+                        {"type":"text","text":watch,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
+                    ]},
+                ]},
+                # v10.9.135：風控警訊（若有 excludes）
+                *([{"type":"separator","color":"#E8C4B4"},
+                   {"type":"text","text":"🚧 系統風控警訊","size":"xxs","color":"#A05A48","weight":"bold"},
+                   {"type":"text","text":"・" + "\n・".join(s.get("excludes", [])[:3]),
+                    "size":"xxs","color":"#A05A48","wrap":True}]
+                  if s.get("excludes") else []),
                 # 評分 + AI 信心
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#E89B82","weight":"bold","flex":3},
@@ -9342,13 +9387,17 @@ def make_rec_flex(scored:list, mkt:dict, source_note:str)->dict:
                 {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#E8B8A8","wrap":True}
             ]}
     }
-    bubbles=[overview]+[make_rec_card(i+1,s) for i,s in enumerate(scored[:5])]
+    # v10.9.135：支援 3-10 檔（caller 已截斷，LINE carousel 上限 12）
+    bubbles=[overview]+[make_rec_card(i+1,s) for i,s in enumerate(scored[:10])]
     return {"type":"carousel","contents":bubbles}
 
 def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
-    """v10.9.80：批次 AI 分析 top 5 候選股，回傳 {sid: {reason, tech, chip, news, style, risk, confidence}}
-    一次 Groq call 處理 5 檔，節省 API 配額。
+    """v10.9.135：批次 AI 分析 top 候選股，回傳
+    {sid: {reason, entry, risk, fit, watch, tech, chip, news, style, confidence}}
+
+    一次 Groq call 處理多檔，節省 API 配額。
     嚴格 grounding：只能根據提供的資料分析，不可編造。
+    v10.9.135 新增：拆分「推薦理由 / 進場建議 / 風險提醒 / 適合對象 / 觀察條件」5 段
     """
     if not GROQ_AVAILABLE or not stocks:
         return {}
@@ -9367,29 +9416,55 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
         lines.append(f"   籌碼訊號：{chip_sig}")
         lines.append(f"   近期新聞標題：{news_titles}")
         lines.append(f"   分類：{s.get('category', '綜合')}　評分 {s.get('score', 0)}/100")
+        # v10.9.135：狀態與過熱資訊餵給 AI（讓 AI 不要與分級互相矛盾）
+        if s.get("status_label"):
+            lines.append(f"   狀態：{s.get('status_emoji','')} {s.get('status_label','')}"
+                         f"（{s.get('status_summary','')}）")
+        if s.get("overheating") and s["overheating"] != "normal":
+            ot_label = "健康過熱（強勢但結構仍 OK）" if s["overheating"] == "healthy_hot" \
+                       else "危險過熱（追高風險）"
+            lines.append(f"   過熱判斷：{ot_label}")
+        if s.get("excludes"):
+            lines.append(f"   風控警訊：{'；'.join(s['excludes'][:2])}")
     data_block = "\n".join(lines)
 
-    system_prompt = """你是台股觀察清單分析師。對每檔候選股做專業觀察分析。
+    system_prompt = """你是台股觀察清單分析師（20 年台股經驗的投資顧問口吻）。
+對每檔候選股做專業觀察分析，輸出 5 段拆分（推薦理由 / 進場建議 / 風險提醒 / 適合對象 / 觀察條件）。
 
 【最高原則：不可編造】
 - 只能根據「候選股資料」分析，不可虛構數字、新聞、財報。
 - 資料不足就說「資料不足」。
+- 不可與「狀態」「過熱判斷」「風控警訊」互相矛盾（例如系統已判定危險過熱，你不能寫「建議積極進場」）。
 
 【用詞合規】
 - 禁用：建議買進、建議賣出、保證、明牌、必賺、一定漲跌
-- 改用：偏多、偏空、觀察重點、需留意、可考慮觀察
+- 改用：偏多、偏空、可考慮觀察、可分批佈局、需留意、接近壓力、等回測再評估
 - 不預測股價。
+
+【5 段拆分（重點！）】
+- reason（推薦理由）：為什麼這檔上榜，1-2 句，要具體（例如「外資連 3 買 + 突破 60 日高」）
+- entry（進場建議）：依狀態給條件式建議
+    · 可積極觀察 / 偏多觀察 → 可分批佈局，分 X 次進場
+    · 強勢但偏熱 → 小量試單或等回測 X 元再評估
+    · 等回測 → 暫不進場，回到支撐 X 元附近再評估
+    · 高風險觀察 → 暫不建議進場，旁觀為主
+- risk（風險提醒）：1-2 句，要具體（停損位 / 風險事件）
+- fit（適合對象）：短線/波段/中長線/存股，加適合的投資人類型
+- watch（觀察條件）：用什麼訊號決定加碼或退場（例如「跌破 20 日線停損」「KD 死亡交叉減碼」）
 
 【輸出格式：純 JSON array，沒有 markdown 包裝】
 [
   {
     "sid": "2330",
-    "reason": "入選理由 1 句（為何在觀察清單，需具體）",
-    "tech": "技術面觀察 1-2 句",
-    "chip": "籌碼面觀察 1-2 句",
-    "news": "消息面觀察 1 句",
-    "style": "短線/波段/長期 其中一種",
-    "risk": "主要風險 1 句",
+    "reason": "推薦理由 1-2 句",
+    "entry": "進場建議 1-2 句（要與狀態一致）",
+    "risk": "風險提醒 1-2 句（含停損）",
+    "fit": "適合對象 1 句",
+    "watch": "觀察條件 1 句",
+    "tech": "技術面 1 句",
+    "chip": "籌碼面 1 句",
+    "news": "消息面 1 句",
+    "style": "短線/波段/中長線/存股 擇一",
     "confidence": "高/中/低"
   },
   ...
@@ -9928,8 +10003,117 @@ def _get_tw_swing_candidates() -> list:
     return list(sids)
 
 
+# ─────────────────────────────────────────
+# v10.9.135：推薦品質門檻 + 過熱判斷 + 7 狀態分級
+# 規格出處：project_recommendation_spec.md（補充規格）
+# 核心精神：寧可少推不要亂推；不為了湊數硬選；過熱不直接排除而是分級
+# ─────────────────────────────────────────
+MIN_SCORE_FOR_RECOMMENDATION = 60   # 品質門檻：低於此分數不推薦
+REC_MAX_COUNT = 10                  # 上限（若品質夠多）
+REC_TARGET_COUNT = 5                # 一般目標數量
+REC_MIN_COUNT_IF_AVAILABLE = 3      # 有合格股票時至少這麼多（除非真的不夠）
+
+# 7 狀態（給卡片標示）— key: (emoji, label, summary)
+REC_STATUS_LABELS = {
+    "aggressive":      ("🟢", "可積極觀察",   "趨勢明確 + 位置健康，較適合進場觀察"),
+    "positive":        ("🟢", "偏多觀察",     "結構偏多但未過熱，可分批佈局"),
+    "strong_hot":      ("🟡", "強勢但偏熱",   "強勢續攻型，需小量試單或等回測"),
+    "wait_pullback":   ("🟡", "等待回測",     "趨勢健康但短線已漲多，等回測較佳"),
+    "high_risk":       ("🔴", "高風險觀察",   "技術已過熱或籌碼出現警訊，建議旁觀"),
+    "not_recommend":   ("⚪", "暫不推薦",     "未達品質門檻或結構轉弱"),
+    "no_recommendation": ("⚪", "暫無推薦",   "今日無符合高品質條件的股票"),
+}
+
+
+def _assess_overheating(tw: dict, closes: list, score_breakdown: dict) -> str:
+    """v10.9.135：過熱判斷 — 健康過熱 vs 危險過熱 vs 正常
+    回傳：'normal' / 'healthy_hot' / 'dangerous_hot'
+
+    核心邏輯：
+    - 正常 (normal)：RSI < 70、5日漲 < 10%、技術結構未過熱
+    - 健康過熱 (healthy_hot)：強勢但結構仍健康（多頭排列 + 量價配合 + RSI 70-78 + 5日漲 10-20%）
+      → 不應直接排除，分到「強勢但偏熱」或「等回測」
+    - 危險過熱 (dangerous_hot)：RSI > 80、5日漲 > 25%、價格遠離均線、量價背離
+      → 進入「高風險觀察」狀態
+    """
+    if not closes or len(closes) < 20:
+        return "normal"
+
+    price = tw.get("price", 0)
+    pct_5d  = score_breakdown.get("pct_5d",  _chg_pct(closes, 5))
+    pct_20d = score_breakdown.get("pct_20d", _chg_pct(closes, 20))
+    rsi     = score_breakdown.get("rsi",     _rsi(closes))
+    ma5  = _ma(closes, 5)
+    ma20 = _ma(closes, 20)
+    ma60 = _ma(closes, 60)
+
+    # 危險過熱訊號（命中 ≥2 即視為危險）
+    danger_hits = 0
+    if rsi and rsi > 80:                        danger_hits += 1
+    if pct_5d  > 25:                            danger_hits += 1
+    if pct_20d > 50:                            danger_hits += 1
+    # 價格遠離 20MA 太多（>15%）
+    if ma20 and price and price > ma20 * 1.15:  danger_hits += 1
+
+    if danger_hits >= 2:
+        return "dangerous_hot"
+
+    # 健康過熱訊號（強但結構仍 OK）
+    is_uptrend = bool(ma5 and ma20 and ma60 and ma5 > ma20 > ma60)
+    is_above_ma = bool(ma20 and price and price > ma20)
+    rsi_warm = bool(rsi and 70 <= rsi <= 78)
+    short_strong = pct_5d >= 10 and pct_5d <= 20
+
+    if is_uptrend and is_above_ma and (rsi_warm or short_strong):
+        return "healthy_hot"
+
+    # RSI 偏高但結構未確認 → 也視為健康過熱（保守）
+    if rsi and 70 <= rsi <= 78 and is_above_ma:
+        return "healthy_hot"
+
+    return "normal"
+
+
+def _determine_recommendation_status(score: int, overheating: str,
+                                     excludes: list, filter_type: str) -> str:
+    """v10.9.135：依「品質 + 趨勢 + 位置 + 風險」決定 7 狀態
+    回傳 key（對應 REC_STATUS_LABELS）
+
+    4 層判斷：
+      1. 品質：score 是否達門檻
+      2. 趨勢：是否仍偏多（用 score 細項與 excludes）
+      3. 位置：過熱程度（normal / healthy_hot / dangerous_hot）
+      4. 風險：excludes 是否包含跌破支撐 / 趨勢轉弱
+    """
+    # 品質不足
+    if score < MIN_SCORE_FOR_RECOMMENDATION:
+        return "not_recommend"
+
+    # 危險訊號（exclude 提到「跌破」「轉弱」「虧損」「殖利率陷阱」）
+    danger_keywords = ["跌破", "轉弱", "虧損", "陷阱", "EPS"]
+    has_danger = any(any(k in e for k in danger_keywords) for e in (excludes or []))
+
+    # 位置：危險過熱 → 高風險觀察
+    if overheating == "dangerous_hot":
+        return "high_risk"
+
+    # 位置：健康過熱
+    if overheating == "healthy_hot":
+        if score >= 80:
+            return "strong_hot"      # 強勢但偏熱（仍可小量試單）
+        else:
+            return "wait_pullback"   # 等回測
+
+    # 位置：正常（normal）
+    if has_danger and score < 75:
+        return "wait_pullback"       # 有警訊但結構未完全壞，等回測
+    if score >= 80:
+        return "aggressive"          # 可積極觀察
+    return "positive"                # 偏多觀察（60-79）
+
+
 def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
-    """v10.9.133：依分類跑獨立評分流程。
+    """v10.9.135：依分類跑獨立評分流程 + 品質門檻 + 過熱分級。
     filter_type ∈ {'trend', 'growth', 'stable', 'swing'}"""
     try:
         # 1. 取候選池
@@ -10029,20 +10213,55 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
                 continue
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        top5 = scored[:5]
-        if not top5:
-            push_message(user_id, f"{display}\n候選資料不足，請稍後再試")
+
+        # v10.9.135：品質門檻過濾 + 過熱分級
+        qualified = []
+        for s in scored:
+            if s["score"] < MIN_SCORE_FOR_RECOMMENDATION:
+                continue
+            closes_for_assess = get_tw_closes(s["sid"]) or []
+            overheat = _assess_overheating(
+                {"price": s["price"]}, closes_for_assess, s["breakdown"])
+            status_key = _determine_recommendation_status(
+                s["score"], overheat, s.get("excludes", []), filter_type)
+            s["overheating"] = overheat
+            s["status_key"]  = status_key
+            s["status_emoji"], s["status_label"], s["status_summary"] = \
+                REC_STATUS_LABELS.get(status_key, ("⚪", "—", ""))
+            qualified.append(s)
+
+        # 變動數量：3-10 檔；若全部不合格 → 暫無推薦
+        if not qualified:
+            emoji, label, summary = REC_STATUS_LABELS["no_recommendation"]
+            push_message(user_id,
+                f"{display}\n━━━━━━━━━━━━━━\n"
+                f"{emoji} {label}\n"
+                f"今日大盤候選股皆未達品質門檻（score ≥ {MIN_SCORE_FOR_RECOMMENDATION}），"
+                f"或結構皆處於高風險狀態。\n\n"
+                f"📌 寧可少推不要亂推 — Lumistock 不會為了湊數而硬推。\n"
+                f"建議今日觀望，可改看：\n"
+                f"  ‧ 自選股 / 持股檢視\n"
+                f"  ‧ 不同題材觀察清單\n"
+                f"  ‧ 明日早盤再來看看\n\n"
+                f"權重：{weights_label}")
             return
 
-        # 3. AI 批次分析
+        # 取 top（最多 10，預設 5，至少 3 若候選夠）
+        top_n = max(REC_MIN_COUNT_IF_AVAILABLE,
+                    min(REC_TARGET_COUNT, len(qualified)))
+        if len(qualified) > REC_TARGET_COUNT and len(qualified) <= REC_MAX_COUNT:
+            top_n = min(len(qualified), REC_MAX_COUNT)
+        top_picks = qualified[:top_n]
+
+        # 3. AI 批次分析（用新 prompt 拆 推薦理由/進場/風險/適合對象/觀察條件）
         mkt = get_market_status()
-        ai_map = ai_analyze_top_picks_batch(top5, mkt)
-        for s in top5:
+        ai_map = ai_analyze_top_picks_batch(top_picks, mkt)
+        for s in top_picks:
             s["ai"] = ai_map.get(s["sid"], {})
 
-        # 4. 推送（沿用既有 carousel，v10.9.134 會升級顯示子分數）
-        source_note = f"權重：{weights_label}"
-        push_flex(user_id, make_rec_flex(top5, mkt, source_note), display)
+        # 4. 推送
+        source_note = f"權重：{weights_label}　|　品質門檻 ≥ {MIN_SCORE_FOR_RECOMMENDATION}"
+        push_flex(user_id, make_rec_flex(top_picks, mkt, source_note), display)
     except Exception as e:
         dlog("REC_FILTER", f"{filter_type} 主流程失敗：{type(e).__name__}: {e}")
         push_message(user_id, f"系統處理中，請稍後再試")
