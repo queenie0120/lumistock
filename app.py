@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.136"
+VERSION              = "10.9.137"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10287,12 +10287,14 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
             push_message(user_id, f"{display}\n候選為空")
             return
 
-        # 2. 對每檔抓資料 + 評分
-        scored = []
-        for sid in sids:
+        # 2. v10.9.137：並行抓資料 + 評分（8 路 ThreadPoolExecutor）
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _fetch_and_score_one(sid):
+            """單一候選股的 fetch + 評分（給並行 worker 用）— 失敗回 None。"""
             try:
                 tw = get_tw_stock(sid)
-                if not tw: continue
+                if not tw: return None
                 closes = get_tw_closes(sid) or []
                 chip = _load_finmind_chip_recent(sid, days=5) or {}
                 nl = get_tw_stock_news(sid, tw["name"], count=3) or []
@@ -10317,14 +10319,14 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
                 elif filter_type == "swing":
                     s = score_swing_stock(tw, closes, ns.get("score", 0))
                     excludes = exclude_swing_stock(closes, s)
+                else:
+                    return None
 
                 if excludes:
-                    # 不淘汰，但顯示警語且扣分 30
                     s["total"] = max(0, s.get("total", 0) - 30)
                     s["excludes"] = excludes
 
-                # 加進 scored
-                scored.append({
+                rec = {
                     "sid": sid, "name": tw["name"], "price": tw["price"], "pct": tw["pct"],
                     "score": s.get("total", 0),
                     "breakdown": s,
@@ -10333,19 +10335,32 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
                     "category": filter_type,
                     "tech_signals": [],
                     "chip_signals": [],
-                    "support": None, "resistance": None, "stop_loss": None, "target": None,
-                })
+                    "support": None, "resistance": None,
+                    "stop_loss": None, "target": None,
+                }
                 # 算支撐壓力
                 if closes and len(closes) >= 5:
                     recent = closes[-60:]
                     lo, hi = min(recent), max(recent)
-                    scored[-1]["support"] = lo
-                    scored[-1]["resistance"] = hi
-                    scored[-1]["stop_loss"] = lo * 0.95
-                    scored[-1]["target"] = hi * 1.05
+                    rec["support"] = lo
+                    rec["resistance"] = hi
+                    rec["stop_loss"] = lo * 0.95
+                    rec["target"] = hi * 1.05
+                return rec
             except Exception as e:
                 dlog("REC_FILTER", f"{sid} 評分失敗：{type(e).__name__}: {e}")
-                continue
+                return None
+
+        scored = []
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_and_score_one, sid): sid for sid in sids}
+            for fut in as_completed(futures):
+                rec = fut.result()
+                if rec: scored.append(rec)
+        dlog("REC_FILTER",
+             f"{filter_type} 並行 fetch 完成：{len(scored)}/{len(sids)} 檔 "
+             f"耗時 {time.time()-t0:.1f}s")
 
         scored.sort(key=lambda x: x["score"], reverse=True)
 
@@ -10447,39 +10462,52 @@ def build_and_push_themed_tw_recommendation(user_id: str, theme_keys: list, disp
             push_message(user_id,
                 f"📊 {display_name}\n━━━━━━━━━━━━━━\n暫無對應股票")
             return
-        # 3. 抓資料 + 評分
+        # 3. v10.9.137：並行抓資料 + 評分
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         mkt = get_market_status()
-        scored = []
-        for sid in sids:
-            tw = get_tw_stock(sid)
-            if not tw: continue
-            closes = get_tw_closes(sid)
-            tech = score_technical(closes, tw["pct"]) if closes else {"score": 50, "signals": []}
-            nl = get_tw_stock_news(sid, tw["name"], count=3) or []
-            sentiment = analyze_news_sentiment(nl) if nl else {"score": 0, "label": ""}
-            ts = tech.get("score", 0) + sentiment.get("score", 0) + 50  # base 50
-            # 加近期動能（避免太冷的股都被選上）
-            ts += int(tw["pct"] * 2) if tw.get("pct") else 0
-            support = resistance = stop_loss = target = None
+
+        def _fetch_themed_one(sid):
             try:
+                tw = get_tw_stock(sid)
+                if not tw: return None
+                closes = get_tw_closes(sid)
+                tech = score_technical(closes, tw["pct"]) if closes else {"score": 50, "signals": []}
+                nl = get_tw_stock_news(sid, tw["name"], count=3) or []
+                sentiment = analyze_news_sentiment(nl) if nl else {"score": 0, "label": ""}
+                ts = tech.get("score", 0) + sentiment.get("score", 0) + 50
+                ts += int(tw["pct"] * 2) if tw.get("pct") else 0
+                support = resistance = stop_loss = target = None
                 if closes and len(closes) >= 5:
                     recent = closes[-60:]
                     lo, hi = min(recent), max(recent)
                     support, resistance = lo, hi
                     stop_loss = lo * 0.95
                     target = hi * 1.05
-            except: pass
-            scored.append({
-                "sid": sid, "name": tw["name"], "price": tw["price"], "pct": tw["pct"],
-                "sentiment": sentiment.get("label", ""),
-                "tech_signals": tech.get("signals", []),
-                "chip_signals": [],  # 題材榜不一定有法人資料
-                "news_list": nl,
-                "category": classify_stock(tech, {"score": 0}, tw["pct"]),
-                "score": ts,
-                "support": support, "resistance": resistance,
-                "stop_loss": stop_loss, "target": target,
-            })
+                return {
+                    "sid": sid, "name": tw["name"], "price": tw["price"], "pct": tw["pct"],
+                    "sentiment": sentiment.get("label", ""),
+                    "tech_signals": tech.get("signals", []),
+                    "chip_signals": [],
+                    "news_list": nl,
+                    "category": classify_stock(tech, {"score": 0}, tw["pct"]),
+                    "score": ts,
+                    "support": support, "resistance": resistance,
+                    "stop_loss": stop_loss, "target": target,
+                }
+            except Exception as e:
+                dlog("REC_THEME", f"{sid} 失敗：{type(e).__name__}: {e}")
+                return None
+
+        scored = []
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(_fetch_themed_one, sid) for sid in sids]
+            for fut in as_completed(futures):
+                r = fut.result()
+                if r: scored.append(r)
+        dlog("REC_THEME",
+             f"{display_name} 並行 fetch 完成：{len(scored)}/{len(sids)} 檔 "
+             f"耗時 {time.time()-t0:.1f}s")
         scored.sort(key=lambda x: x["score"], reverse=True)
         top5 = scored[:5]
         if not top5:
