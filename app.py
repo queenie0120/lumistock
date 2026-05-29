@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.126"
+VERSION              = "10.9.127"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6375,9 +6375,22 @@ def format_portfolio_import_preview(items: list) -> str:
 #  核心：grounding（先查資料再回答）+ 不亂答 + 合規 + 商品比較/族群分析
 # ══════════════════════════════════════════
 
-AI_QA_SYSTEM_PROMPT = """你是 Lumistock（慧股拾光）的 AI 投資研究助理，由 Hui 開發。
-角色：AI 投資助理 / 市場研究員 / 商品比較顧問 / 投資教育助理 / 功能客服。
-全程使用繁體中文，語氣專業但好懂。
+AI_QA_SYSTEM_PROMPT = """你是 Lumistock（慧股拾光）的資深台股投資顧問，由 Hui 開發。
+角色：20 年資歷的台股研究員 + 投資顧問 + 商品比較顧問 + 投資教育助理 + 功能客服。
+全程使用繁體中文，**語氣專業、有實質內容**，**像券商研究員寫研究報告**那樣的水準。
+不能只是 ChatGPT 那種空泛的「可能、也許、需要進一步研究」回答。
+
+【個股深度回答必須的結構（依問題類型彈性運用，但欄位不可漏）】
+當使用者問「為什麼漲/跌、最近怎樣、在做什麼、是什麼公司、深度分析」時，請依下列結構回答：
+
+① **公司概覽**：產業 / 主要產品或業務（資料區有產業就用，業務用你的既有知識補；若不確定就講大方向）
+② **財務體質**（資料區有就用）：EPS、毛利率、營業利益率、月營收年增率
+③ **技術面**：趨勢（多頭/空頭/盤整）、RSI 解讀、關鍵均線位置、支撐/壓力
+④ **籌碼面**：外資/投信/自營近 5 日買賣超數字解讀（連 N 日買超 / 大量倒貨等）
+⑤ **近期動態**（資料區「近期重點/新聞」）：具體事件 + 對股價的意義
+⑥ **觀察重點**：3-5 個關鍵盯盤點（例：第三季財報、產業庫存週期、Fed 利率決議）
+⑦ **風險提醒**：估值風險 / 政策風險 / 產業循環風險 / 公司治理風險
+⑧ **AI 信心**：高/中/低 + 理由（資料完整度、指標一致性、有無重大事件干擾）
 
 【最高原則：用好資料區，不要逃避】
 1. 「資料區」**提供什麼就用什麼**，**禁止整體性回答「我沒資料」**。
@@ -6474,6 +6487,61 @@ def _ai_qa_resolve_pronoun(user_id: str, question: str) -> list:
             dlog("AI_QA", f"代名詞解析：{user_id[-6:]} 「{question[:20]}」→ 沿用上次 {stocks}")
             return stocks
     return []
+
+
+def _load_finmind_financials(sid: str) -> dict:
+    """v10.9.127：抓近期財報關鍵數字（EPS / 毛利率 / 營業利益率 / ROE）。
+    FinMind Backer 有 TaiwanStockFinancialStatements。
+    回傳 {latest_quarter, eps, gross_margin, operating_margin, roe}（最近 1 期，找不到回 {}）"""
+    if not FINMIND_TOKEN: return {}
+    end_date = now_taipei().strftime("%Y-%m-%d")
+    start_date = (now_taipei() - timedelta(days=400)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockFinancialStatements",
+        "data_id": sid,
+        "start_date": start_date,
+        "end_date": end_date,
+        "token": FINMIND_TOKEN,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200: return {}
+        payload = r.json()
+        if payload.get("status") != 200: return {}
+        rows = payload.get("data") or []
+        if not rows: return {}
+        # 用 date 分組找最新一季
+        from collections import defaultdict
+        by_quarter = defaultdict(dict)
+        for row in rows:
+            date = (row.get("date") or "")[:10]
+            t = (row.get("type") or "").strip()
+            v = row.get("value")
+            if v is None: continue
+            try: v = float(v)
+            except: continue
+            by_quarter[date][t] = v
+        if not by_quarter: return {}
+        latest_q = sorted(by_quarter.keys(), reverse=True)[0]
+        q = by_quarter[latest_q]
+        # FinMind 常見 type：EPS, GrossProfit, OperatingIncome, NetIncomeLoss, Revenue, TotalAsset
+        eps = q.get("EPS") or q.get("BasicEPS")
+        rev = q.get("Revenue") or q.get("OperatingRevenue")
+        gp  = q.get("GrossProfit")
+        oi  = q.get("OperatingIncome")
+        gross_m = (gp / rev * 100) if (gp and rev) else None
+        op_m = (oi / rev * 100) if (oi and rev) else None
+        return {
+            "quarter": latest_q[:7],   # YYYY-MM
+            "eps": eps,
+            "gross_margin": gross_m,
+            "operating_margin": op_m,
+            "revenue_million": int(rev/1_000_000) if rev else None,
+        }
+    except Exception as e:
+        dlog("AI_QA", f"financials {sid} fail: {type(e).__name__}: {e}")
+        return {}
 
 
 def _load_finmind_monthly_revenue(sid: str) -> list:
@@ -6716,6 +6784,18 @@ def _build_stock_context(sid: str) -> str:
             for r in rev[:3]:
                 parts.append(f"{r['date']}（{r['revenue_million']:,}M / 年增 {r['yoy_pct']:+.1f}%）")
             lines.append(f"　月營收近 3 期：{' ‧ '.join(parts)}")
+    except: pass
+    # v10.9.127：近期財報關鍵指標（EPS / 毛利率）
+    try:
+        fin = _load_finmind_financials(sid)
+        if fin and fin.get("quarter"):
+            parts = []
+            if fin.get("eps") is not None: parts.append(f"EPS {fin['eps']:.2f}")
+            if fin.get("gross_margin") is not None: parts.append(f"毛利率 {fin['gross_margin']:.1f}%")
+            if fin.get("operating_margin") is not None: parts.append(f"營業利益率 {fin['operating_margin']:.1f}%")
+            if fin.get("revenue_million") is not None: parts.append(f"營收 {fin['revenue_million']:,}M")
+            if parts:
+                lines.append(f"　最新一季財報（{fin['quarter']}）：{' / '.join(parts)}")
     except: pass
     return "\n".join(lines)
 
