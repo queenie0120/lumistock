@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.127"
+VERSION              = "10.9.128"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6380,6 +6380,16 @@ AI_QA_SYSTEM_PROMPT = """你是 Lumistock（慧股拾光）的資深台股投資
 全程使用繁體中文，**語氣專業、有實質內容**，**像券商研究員寫研究報告**那樣的水準。
 不能只是 ChatGPT 那種空泛的「可能、也許、需要進一步研究」回答。
 
+【當使用者問「題材 / 趨勢 / 概念股 / 龍頭 / 受惠股 / XX 提到的相關公司」時】
+你必須像專業投資顧問一樣，主動列出該題材的：
+① **龍頭股**（資料區「題材→台股對應」的 leaders；若沒列出，用你的既有知識補）
+② **潛力股**（中小型有題材但尚未飆漲的；指出為何有潛力）
+③ **合作 / 供應鏈關係明確的公司**（誰跟誰簽約、誰是誰的客戶）
+④ **背景重點**（為什麼這題材重要、技術或市場面的本質）
+⑤ **挖深的角度**：例如黃仁勳提到 → 該領域的相關訪談 / GTC keynote 連動股 / 上下游
+⑥ **風險**：題材股 vs 真正受惠的差距、估值風險
+⑦ 結尾標註：⚠ 僅供參考，不構成投資建議
+
 【個股深度回答必須的結構（依問題類型彈性運用，但欄位不可漏）】
 當使用者問「為什麼漲/跌、最近怎樣、在做什麼、是什麼公司、深度分析」時，請依下列結構回答：
 
@@ -6487,6 +6497,135 @@ def _ai_qa_resolve_pronoun(user_id: str, question: str) -> list:
             dlog("AI_QA", f"代名詞解析：{user_id[-6:]} 「{question[:20]}」→ 沿用上次 {stocks}")
             return stocks
     return []
+
+
+# v10.9.128 Phase 6：題材 → 台股對應表（讓 AI 看到「黃仁勳提到矽光子」就知道哪幾檔台股受惠）
+TW_CONCEPT_STOCKS = {
+    "AI 伺服器": {
+        "leaders": ["2330 台積電", "3017 奇鋐", "2308 台達電", "2382 廣達", "2376 技嘉"],
+        "potential": ["3711 日月光投控", "6669 緯穎", "4938 和碩"],
+        "notes": "AI 算力需求驅動；台積電獨家代工 H100/B100/B200 系列",
+    },
+    "矽光子": {
+        "leaders": ["3661 世芯-KY", "5274 信驊", "3036 文曄"],
+        "potential": ["2059 川湖", "8081 致新"],
+        "notes": "下一代資料中心光通訊技術；黃仁勳 GTC 多次提到 2027 主流；CPO 共封裝光元件是台廠機會",
+    },
+    "半導體封測": {
+        "leaders": ["3711 日月光投控", "6147 頎邦", "2449 京元電子", "3105 穩懋"],
+        "potential": ["6515 穎崴", "8081 致新"],
+        "notes": "AI 晶片先進封裝（CoWoS、HBM 整合）是熱點",
+    },
+    "半導體": {
+        "leaders": ["2330 台積電", "2454 聯發科", "2303 聯電", "3711 日月光投控"],
+        "potential": ["6515 穎崴", "8016 矽創"],
+        "notes": "台股主軸；受惠 AI / HPC / 高階手機晶片",
+    },
+    "蘋概股": {
+        "leaders": ["2317 鴻海", "3008 大立光", "3406 玉晶光", "2454 聯發科"],
+        "potential": ["4938 和碩", "2392 正崴"],
+        "notes": "Apple 訂單比重高；受 iPhone / Mac / Vision Pro 銷售影響",
+    },
+    "電動車": {
+        "leaders": ["2308 台達電", "2317 鴻海", "3661 世芯-KY"],
+        "potential": ["1597 凱大", "1532 勤美"],
+        "notes": "Tesla / 鴻海 MIH 平台 / 各大車廠電動化加速",
+    },
+    "HBM 記憶體": {
+        "leaders": ["2408 南亞科", "3260 威剛"],
+        "potential": ["3260 威剛", "8081 致新"],
+        "notes": "高頻寬記憶體；AI 訓練必需；台廠主要參與封測 / 模組",
+    },
+    "玻璃基板": {
+        "leaders": ["3037 欣興", "3189 景碩", "4961 天鈺"],
+        "potential": ["6213 突破"],
+        "notes": "下一代 IC 載板技術，預計 2027-2028 量產",
+    },
+    "散熱 / 液冷": {
+        "leaders": ["3017 奇鋐", "3324 雙鴻", "6230 超眾", "8044 網家"],
+        "potential": ["8081 致新"],
+        "notes": "AI 伺服器熱密度暴增；液冷散熱滲透率快速提升",
+    },
+    "機器人": {
+        "leaders": ["2317 鴻海", "2308 台達電", "2049 上銀"],
+        "potential": ["3596 智易", "1597 凱大"],
+        "notes": "Nvidia 人形機器人推動；鴻海布局 MIH 機器人平台",
+    },
+    "低軌衛星 / 太空": {
+        "leaders": ["3596 智易", "2059 川湖", "3037 欣興"],
+        "potential": ["8081 致新"],
+        "notes": "Starlink / OneWeb / 鴻海 LEO 衛星布局",
+    },
+    "第三代半導體": {
+        "leaders": ["2455 全新", "8064 東捷", "5347 世界"],
+        "potential": ["6770 力積電"],
+        "notes": "SiC / GaN 電動車 / 工業電源 / 充電樁需求",
+    },
+    "生成式 AI / ChatGPT": {
+        "leaders": ["2330 台積電", "3017 奇鋐", "2308 台達電", "2382 廣達"],
+        "potential": ["6669 緯穎", "3711 日月光投控"],
+        "notes": "OpenAI / Anthropic / Google 模型訓練驅動算力基建",
+    },
+    "面板": {
+        "leaders": ["2409 友達", "3481 群創"],
+        "potential": ["6116 彩晶"],
+        "notes": "電視、車載、Mini-LED；近年受 AI 顯示器帶動",
+    },
+    "金融": {
+        "leaders": ["2881 富邦金", "2882 國泰金", "2891 中信金", "2886 兆豐金"],
+        "potential": ["2884 玉山金", "2887 台新金"],
+        "notes": "受利率、外匯、台股交易量影響；高股息族群核心",
+    },
+    "綠能 / 太陽能": {
+        "leaders": ["6443 元晶", "3704 合勤控"],
+        "potential": ["3686 達能"],
+        "notes": "政策支持 + 企業 RE100；ESG 主軸",
+    },
+}
+
+def _detect_themes_in_question(text: str) -> list:
+    """v10.9.128：偵測問題中提到的題材關鍵字，回傳 [theme_name, ...]。"""
+    tl = text.lower()
+    keyword_map = {
+        "AI 伺服器": ["ai 伺服器", "ai server", "伺服器", "算力", "gpu 伺服器", "h100", "b100", "b200"],
+        "矽光子": ["矽光子", "silicon photonics", "光通訊", "cpo", "光元件"],
+        "半導體封測": ["封測", "cowos", "封裝"],
+        "半導體": ["半導體", "晶圓", "晶片", "tsmc"],
+        "蘋概股": ["apple", "蘋果", "iphone", "macbook", "vision pro", "蘋概"],
+        "電動車": ["電動車", "ev", "tesla", "特斯拉", "三電"],
+        "HBM 記憶體": ["hbm", "高頻寬記憶體", "dram"],
+        "玻璃基板": ["玻璃基板", "abf", "ic 載板", "載板"],
+        "散熱 / 液冷": ["散熱", "液冷", "水冷"],
+        "機器人": ["機器人", "人形機器人", "robotics", "ai robot"],
+        "低軌衛星 / 太空": ["低軌衛星", "leo", "starlink", "衛星", "太空"],
+        "第三代半導體": ["第三代半導體", "sic", "gan", "碳化矽", "氮化鎵"],
+        "生成式 AI / ChatGPT": ["生成式 ai", "generative ai", "chatgpt", "claude", "openai", "anthropic", "大型語言模型", "llm"],
+        "面板": ["面板", "lcd", "oled", "mini led", "mini-led"],
+        "金融": ["金融股", "金控", "壽險", "銀行股"],
+        "綠能 / 太陽能": ["綠能", "太陽能", "光電", "re100", "esg"],
+    }
+    found = []
+    for theme, kws in keyword_map.items():
+        if any(kw in tl for kw in kws):
+            if theme not in found:
+                found.append(theme)
+    return found[:4]  # 最多 4 個題材避免 context 太長
+
+def _build_theme_context(themes: list) -> str:
+    """v10.9.128：組題材對應的「龍頭/潛力/重點」內容塞進 AI context。"""
+    if not themes: return ""
+    lines = ["【題材 → 台股對應（請優先用這份資料，列出具體標的）】"]
+    for t in themes:
+        d = TW_CONCEPT_STOCKS.get(t, {})
+        if not d: continue
+        lines.append(f"◆ {t}")
+        if d.get("leaders"):
+            lines.append(f"　龍頭股：{' / '.join(d['leaders'])}")
+        if d.get("potential"):
+            lines.append(f"　潛力股：{' / '.join(d['potential'])}")
+        if d.get("notes"):
+            lines.append(f"　重點：{d['notes']}")
+    return "\n".join(lines)
 
 
 def _load_finmind_financials(sid: str) -> dict:
@@ -6900,6 +7039,16 @@ def ai_qa_answer(user_id: str, question: str) -> str:
             if qtype == "general":
                 qtype = "market"
             context_parts.append(_build_market_context())
+
+        # v10.9.128：偵測題材關鍵字，把對應的台股龍頭/潛力/合作公司塞進 context
+        themes = _detect_themes_in_question(q)
+        if themes:
+            if qtype == "general":
+                qtype = "theme"
+            theme_ctx = _build_theme_context(themes)
+            if theme_ctx:
+                context_parts.append(theme_ctx)
+                dlog("AI_QA", f"題材偵測：{themes}")
 
         # 4) 商品比較 / 知識（不需即時資料，靠 LLM 知識 + 規則）
         if _is_compare_or_knowledge(q) and qtype in ("general",):
