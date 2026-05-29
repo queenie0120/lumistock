@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.129"
+VERSION              = "10.9.130"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3948,9 +3948,15 @@ def make_ai_menu_flex() -> dict:
         [("💬 問 AI 助理","問AI"),                # v10.9.69：AI 智能問答入口
          ("🇹🇼 台股觀察清單","台股觀察"),         # v10.9.129
          ("🇺🇸 美股觀察清單","美股觀察"),         # v10.9.129
-         ("📈 趨勢觀察","趨勢觀察"),
-         ("🌱 成長觀察","成長觀察"), ("💰 存股觀察","存股觀察"),
-         ("🌊 波段觀察","波段觀察"), ("🤖 AI概念觀察","AI概念觀察"),
+         ("🤖 AI 概念觀察","AI概念觀察"),         # v10.9.130
+         ("💎 半導體觀察","半導體觀察"),
+         ("🍎 蘋概股觀察","蘋概股觀察"),
+         ("💊 醫療觀察","醫療觀察"),
+         ("🛡️ 軍工觀察","軍工觀察"),
+         ("🚢 航運觀察","航運觀察"),
+         ("🚗 電動車觀察","電動車觀察"),
+         ("🤖 機器人觀察","機器人觀察"),
+         ("🌱 綠能觀察","綠能觀察"),
          ("💬 意見回饋","意見回饋")]            # v10.9.87：使用者建議直送 Owner
     )
 
@@ -6582,6 +6588,32 @@ TW_CONCEPT_STOCKS = {
         "leaders": ["6443 元晶", "3704 合勤控"],
         "potential": ["3686 達能"],
         "notes": "政策支持 + 企業 RE100；ESG 主軸",
+    },
+    # v10.9.130 新增：醫療 / 軍工 / 航運 / 食品 / 觀光
+    "醫療 / 生技": {
+        "leaders": ["4174 浩鼎", "6446 藥華藥", "4123 晟德", "1789 神隆"],
+        "potential": ["4128 中天", "4142 國光生技", "1733 五鼎"],
+        "notes": "新藥研發 / 高階學名藥 / 醫材；台灣生技股波動大但題材性強",
+    },
+    "軍工 / 國防": {
+        "leaders": ["2059 川湖", "4523 永彰", "2049 上銀", "2025 千興"],
+        "potential": ["1582 信錦", "6664 群翊", "8104 錸寶"],
+        "notes": "地緣政治 + 美國國防預算 + 台美軍售；上銀工具機/精密零件也受惠軍工自動化",
+    },
+    "航運": {
+        "leaders": ["2603 長榮", "2609 陽明", "2615 萬海", "2618 長榮航"],
+        "potential": ["2606 裕民", "2610 華航"],
+        "notes": "貨櫃 / 散裝 / 客運；運價週期循環大，受紅海局勢、油價、出貨旺季影響",
+    },
+    "食品": {
+        "leaders": ["1216 統一", "1227 佳格", "1229 聯華", "1234 黑松"],
+        "potential": ["1218 泰山", "1232 大統益"],
+        "notes": "防禦型穩健股 + 高股息；受原物料成本與消費景氣影響",
+    },
+    "觀光": {
+        "leaders": ["2702 華園", "2705 六福", "2706 第一店"],
+        "potential": ["2731 雄獅", "2727 王品", "5703 亞都"],
+        "notes": "陸客 / 日韓客觀光復甦 + 內需消費；夏季出遊旺季題材",
     },
 }
 
@@ -9441,6 +9473,82 @@ def make_us_rec_flex(top5: list) -> dict:
     return {"type":"carousel","contents":bubbles}
 
 
+def build_and_push_themed_tw_recommendation(user_id: str, theme_keys: list, display_name: str):
+    """v10.9.130：依題材推薦 — 從 TW_CONCEPT_STOCKS 取候選做分析。
+    theme_keys：題材 dict key list（可多個合併，例如 AI 概念合併 4 個主軸）
+    display_name：顯示給使用者看的名稱（例如「🤖 AI 概念觀察清單」）"""
+    try:
+        # 1. 合併所有題材的 leaders + potential
+        all_entries = []
+        notes = []
+        for tk in theme_keys:
+            d = TW_CONCEPT_STOCKS.get(tk, {})
+            if not d: continue
+            all_entries += d.get("leaders", []) + d.get("potential", [])
+            if d.get("notes"): notes.append(f"【{tk}】{d['notes']}")
+        # 2. 取代號（"2330 台積電" → "2330"），去重
+        seen = set()
+        sids = []
+        for entry in all_entries:
+            sid = entry.split()[0] if entry else ""
+            if not sid or sid in seen: continue
+            seen.add(sid)
+            sids.append(sid)
+        if not sids:
+            push_message(user_id,
+                f"📊 {display_name}\n━━━━━━━━━━━━━━\n暫無對應股票")
+            return
+        # 3. 抓資料 + 評分
+        mkt = get_market_status()
+        scored = []
+        for sid in sids:
+            tw = get_tw_stock(sid)
+            if not tw: continue
+            closes = get_tw_closes(sid)
+            tech = score_technical(closes, tw["pct"]) if closes else {"score": 50, "signals": []}
+            nl = get_tw_stock_news(sid, tw["name"], count=3) or []
+            sentiment = analyze_news_sentiment(nl) if nl else {"score": 0, "label": ""}
+            ts = tech.get("score", 0) + sentiment.get("score", 0) + 50  # base 50
+            # 加近期動能（避免太冷的股都被選上）
+            ts += int(tw["pct"] * 2) if tw.get("pct") else 0
+            support = resistance = stop_loss = target = None
+            try:
+                if closes and len(closes) >= 5:
+                    recent = closes[-60:]
+                    lo, hi = min(recent), max(recent)
+                    support, resistance = lo, hi
+                    stop_loss = lo * 0.95
+                    target = hi * 1.05
+            except: pass
+            scored.append({
+                "sid": sid, "name": tw["name"], "price": tw["price"], "pct": tw["pct"],
+                "sentiment": sentiment.get("label", ""),
+                "tech_signals": tech.get("signals", []),
+                "chip_signals": [],  # 題材榜不一定有法人資料
+                "news_list": nl,
+                "category": classify_stock(tech, {"score": 0}, tw["pct"]),
+                "score": ts,
+                "support": support, "resistance": resistance,
+                "stop_loss": stop_loss, "target": target,
+            })
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        top5 = scored[:5]
+        if not top5:
+            push_message(user_id,
+                f"📊 {display_name}\n━━━━━━━━━━━━━━\n候選資料不足，請稍後再試")
+            return
+        # 4. AI 批次分析
+        ai_map = ai_analyze_top_picks_batch(top5, mkt)
+        for s in top5:
+            s["ai"] = ai_map.get(s["sid"], {})
+        # 5. 推送（沿用既有 make_rec_flex）
+        source_note = " ‧ ".join([t[:20] for t in theme_keys])
+        push_flex(user_id, make_rec_flex(top5, mkt, source_note), display_name)
+    except Exception as e:
+        dlog("REC_THEME", f"{display_name} 運算失敗：{type(e).__name__}: {e}")
+        push_message(user_id, f"📊 {display_name}\n━━━━━━━━━━━━━━\n系統處理中，請稍後再試")
+
+
 def build_and_push_us_recommendation(user_id: str):
     """v10.9.129：美股觀察清單 — 從 universe 中挑 top 5 並做 AI 分析。"""
     try:
@@ -10785,11 +10893,61 @@ def handle_message(event):
         t.daemon=True; t.start()
         return
 
-    if text in ["趨勢觀察","成長觀察","存股觀察","波段觀察","AI概念觀察",
-                "趨勢股","成長股","存股","波段股","AI概念股"]:
-        reply_text(event.reply_token,
-            f"🤖 {text} 分析功能開發中...\n━━━━━━━━━━━━━━\n"
-            f"目前請使用「觀察清單」功能\n後續版本將加入更多 AI 分析類別 🚀")
+    # v10.9.130：AI 概念股 — 合併 AI 伺服器 + 生成式 AI + HBM + 矽光子 4 個主軸
+    if text in ["AI概念觀察", "AI概念股", "AI觀察清單", "AI 概念觀察", "AI 概念股"]:
+        dlog("HANDLER", "→ AI 概念觀察清單")
+        log_to_sheets(user_id, "查詢觀察清單", "AI 概念", "成功")
+        reply_text_with_qr(event.reply_token,
+            "🤖 AI 概念觀察清單分析中...\n━━━━━━━━━━━━━━\n"
+            "整合 AI 伺服器 / 生成式 AI / HBM / 矽光子\n約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
+            [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察")])
+        t = threading.Thread(target=build_and_push_themed_tw_recommendation,
+                             args=(user_id, ["AI 伺服器", "生成式 AI / ChatGPT", "HBM 記憶體", "矽光子"],
+                                   "🤖 AI 概念觀察清單"))
+        t.daemon = True; t.start()
+        return
+
+    # v10.9.130：題材觀察清單統一處理
+    THEMED_TRIGGERS = {
+        # (觸發詞 list, 題材 key list, 顯示名稱)
+        ("醫療觀察", "醫療股", "生技觀察", "生技股"): (["醫療 / 生技"], "💊 醫療生技觀察清單"),
+        ("軍工觀察", "軍工股", "國防股", "國防觀察"): (["軍工 / 國防"], "🛡️ 軍工國防觀察清單"),
+        ("航運觀察", "航運股"): (["航運"], "🚢 航運觀察清單"),
+        ("食品觀察", "食品股"): (["食品"], "🍱 食品觀察清單"),
+        ("觀光觀察", "觀光股"): (["觀光"], "🏖️ 觀光觀察清單"),
+        ("電動車觀察", "電動車股"): (["電動車"], "🚗 電動車觀察清單"),
+        ("半導體觀察", "半導體股"): (["半導體", "半導體封測"], "💎 半導體觀察清單"),
+        ("蘋概股觀察", "蘋概觀察"): (["蘋概股"], "🍎 蘋概股觀察清單"),
+        ("機器人觀察", "機器人股"): (["機器人"], "🤖 機器人觀察清單"),
+        ("綠能觀察", "綠能股", "太陽能觀察"): (["綠能 / 太陽能"], "🌱 綠能觀察清單"),
+        ("金融觀察", "金融股觀察"): (["金融"], "💰 金融股觀察清單"),
+    }
+    for triggers, (theme_keys, display_name) in THEMED_TRIGGERS.items():
+        if text in triggers:
+            dlog("HANDLER", f"→ {display_name}")
+            log_to_sheets(user_id, "查詢觀察清單", display_name, "成功")
+            reply_text_with_qr(event.reply_token,
+                f"{display_name}\n━━━━━━━━━━━━━━\n"
+                f"題材：{' / '.join(theme_keys)}\n"
+                f"約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
+                [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察")])
+            t = threading.Thread(target=build_and_push_themed_tw_recommendation,
+                                 args=(user_id, theme_keys, display_name))
+            t.daemon = True; t.start()
+            return
+
+    # 其他 filter 類型仍開發中（v10.9.131 預定做）
+    if text in ["趨勢觀察","成長觀察","存股觀察","波段觀察",
+                "趨勢股","成長股","存股","波段股"]:
+        reply_text_with_qr(event.reply_token,
+            f"🤖 {text}\n━━━━━━━━━━━━━━\n"
+            f"v10.9.131 將上線此 filter 類型\n目前可用：\n"
+            f"・台股觀察 / 美股觀察\n"
+            f"・AI 概念觀察 / 醫療觀察 / 軍工觀察\n"
+            f"・航運觀察 / 食品觀察 / 觀光觀察\n"
+            f"・電動車觀察 / 半導體觀察 / 蘋概觀察\n"
+            f"・機器人觀察 / 綠能觀察 / 金融觀察",
+            [("🇹🇼 台股觀察", "台股觀察"), ("🤖 AI 概念", "AI概念觀察")])
         return
 
     # ══ Owner 專屬指令 ══
