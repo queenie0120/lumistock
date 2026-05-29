@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.125"
+VERSION              = "10.9.126"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6616,10 +6616,14 @@ def _load_finmind_chip_recent(sid: str, days: int = 5) -> dict:
 
 
 def _detect_stocks_in_question(text: str) -> list:
-    """從問題中辨識股票代號（4-6 位數字）或常見名稱，回傳 [stock_id, ...]（最多 3 檔）。"""
+    """從問題中辨識股票代號（4-6 位數字）或常見名稱，回傳 [stock_id, ...]（最多 3 檔）。
+    v10.9.126：用 lookahead/lookbehind 取代 \\b
+      原因：Python 在 Unicode 模式中文字也算 word char，
+            「6147是在做什麼的」這種題目 \\b 不會在 7/是 之間斷 → regex fail。
+      改用 (?<!\\d) 跟 (?!\\d) 排除前後是數字，純粹判斷「不在更長數字串中」。"""
     found = []
-    # 1. 直接的數字代號
-    for m in re.findall(r"\b(\d{4,6}[A-Za-z]?)\b", text):
+    # 1. 直接的數字代號（v10.9.126 修中文混雜偵測 bug）
+    for m in re.findall(r"(?<!\d)(\d{4,6}[A-Za-z]?)(?!\d)", text):
         code = m.upper()
         if code not in found:
             found.append(code)
