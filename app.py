@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.124"
+VERSION              = "10.9.125"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10018,15 +10018,17 @@ def handle_message(event):
         q = text[2:].strip()
         dlog("HANDLER", f"→ AI 問答（前綴）：{q[:30]}")
         WAITING_AI_QA[user_id] = time.time()  # v10.9.74：進入模式，之後可連續問
-        reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
-        def _bg_qa():
-            try:
-                ans = ai_qa_answer(user_id, q)
-            except Exception as e:
-                ans = f"🤖 回答失敗：{type(e).__name__}"
-            push_text_with_qr(user_id, ans,
-                [("🔚 結束問答", "結束問答")])
-        threading.Thread(target=_bg_qa, daemon=True).start()
+        # v10.9.125：改為 inline reply（避免 push 429 配額用完導致回答送不出去）
+        try:
+            ans = ai_qa_answer(user_id, q)
+        except Exception as e:
+            ans = f"🤖 回答失敗：{type(e).__name__}"
+        try:
+            reply_text_with_qr(event.reply_token, ans, [("🔚 結束問答", "結束問答")])
+        except Exception as e:
+            dlog("AI_QA", f"reply 失敗 → 試 push fallback：{e}")
+            try: push_text_with_qr(user_id, ans, [("🔚 結束問答", "結束問答")])
+            except: pass
         return
 
     # ══ 主選單觸發 ══
@@ -11431,15 +11433,17 @@ def handle_message(event):
         if not (_t_check.isdigit() and 4 <= len(_t_check) <= 6):
             WAITING_AI_QA[user_id] = time.time()  # 更新活動時間
             dlog("HANDLER", f"→ AI 問答（連續模式）：{text[:30]}")
-            reply_text(event.reply_token, "🤖 AI 思考中...\n約 10-20 秒後回覆")
-            def _bg_qa_mode():
-                try:
-                    ans = ai_qa_answer(user_id, text)
-                except Exception as e:
-                    ans = f"🤖 回答失敗：{type(e).__name__}"
-                # v10.9.74：每次回答附「結束問答」浮標，可連續問下一題
-                push_text_with_qr(user_id, ans, [("🔚 結束問答", "結束問答")])
-            threading.Thread(target=_bg_qa_mode, daemon=True).start()
+            # v10.9.125：改為 inline reply（避免 push 429 配額用完導致回答送不出去）
+            try:
+                ans = ai_qa_answer(user_id, text)
+            except Exception as e:
+                ans = f"🤖 回答失敗：{type(e).__name__}"
+            try:
+                reply_text_with_qr(event.reply_token, ans, [("🔚 結束問答", "結束問答")])
+            except Exception as e:
+                dlog("AI_QA", f"reply 失敗 → 試 push fallback：{e}")
+                try: push_text_with_qr(user_id, ans, [("🔚 結束問答", "結束問答")])
+                except: pass
             return
 
     # ══ 股票代號查詢 ══
