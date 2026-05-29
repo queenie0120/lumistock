@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.135"
+VERSION              = "10.9.136"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9341,6 +9341,44 @@ def make_rec_card(rank:int, s:dict)->dict:
                    {"type":"text","text":"・" + "\n・".join(s.get("excludes", [])[:3]),
                     "size":"xxs","color":"#A05A48","wrap":True}]
                   if s.get("excludes") else []),
+                # v10.9.136：4 層總檢查（顯示分類各自權重，凸顯每類權重不同）
+                *([{"type":"separator","color":"#E8C4B4"},
+                   {"type":"text","text":"🧭 四層總檢查（分類權重）","size":"xxs","color":"#A05A48","weight":"bold"},
+                   {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                       {"type":"box","layout":"horizontal","contents":[
+                           {"type":"text","text":"品質","size":"xxs","color":"#9B6B5A","flex":2},
+                           {"type":"text","text":f"{int(s['layer_scores'].get('quality',0))}/100",
+                            "size":"xxs","color":"#5B4040","flex":2},
+                           {"type":"text","text":f"權重 {s['category_4w'].get('quality',0)}%",
+                            "size":"xxs","color":"#E89B82","flex":2,"align":"end"}
+                       ]},
+                       {"type":"box","layout":"horizontal","contents":[
+                           {"type":"text","text":"趨勢","size":"xxs","color":"#9B6B5A","flex":2},
+                           {"type":"text","text":f"{int(s['layer_scores'].get('trend',0))}/100",
+                            "size":"xxs","color":"#5B4040","flex":2},
+                           {"type":"text","text":f"權重 {s['category_4w'].get('trend',0)}%",
+                            "size":"xxs","color":"#E89B82","flex":2,"align":"end"}
+                       ]},
+                       {"type":"box","layout":"horizontal","contents":[
+                           {"type":"text","text":"位置","size":"xxs","color":"#9B6B5A","flex":2},
+                           {"type":"text","text":f"{int(s['layer_scores'].get('position',0))}/100",
+                            "size":"xxs","color":"#5B4040","flex":2},
+                           {"type":"text","text":f"權重 {s['category_4w'].get('position',0)}%",
+                            "size":"xxs","color":"#E89B82","flex":2,"align":"end"}
+                       ]},
+                       {"type":"box","layout":"horizontal","contents":[
+                           {"type":"text","text":"風險","size":"xxs","color":"#9B6B5A","flex":2},
+                           {"type":"text","text":f"{int(s['layer_scores'].get('risk',0))}/100",
+                            "size":"xxs","color":"#5B4040","flex":2},
+                           {"type":"text","text":f"權重 {s['category_4w'].get('risk',0)}%",
+                            "size":"xxs","color":"#E89B82","flex":2,"align":"end"}
+                       ]},
+                       {"type":"box","layout":"horizontal","contents":[
+                           {"type":"text","text":"總檢查","size":"xxs","color":"#A05A48","weight":"bold","flex":2},
+                           {"type":"text","text":f"{s.get('final_check_score',0):.1f}/100",
+                            "size":"xxs","color":"#A05A48","weight":"bold","flex":4,"align":"end"}
+                       ]},
+                   ]}] if s.get("layer_scores") else []),
                 # 評分 + AI 信心
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":f"{bar} {s['score']}/100","size":"xxs","color":"#E89B82","weight":"bold","flex":3},
@@ -10074,42 +10112,139 @@ def _assess_overheating(tw: dict, closes: list, score_breakdown: dict) -> str:
     return "normal"
 
 
+# ─────────────────────────────────────────
+# v10.9.136：「品質 + 趨勢 + 位置 + 風險」分類各自 4 層權重
+# 鐵則：4 層是『共用總檢查框架』，不是統一公式
+# 每個分類有自己的權重 — 趨勢股看趨勢、存股看品質、籌碼股看風險⋯⋯
+# ─────────────────────────────────────────
+CATEGORY_4LAYER_WEIGHTS = {
+    # filter_type:  品質  趨勢  位置  風險
+    "trend":     {"quality": 20, "trend": 40, "position": 25, "risk": 15},
+    "growth":    {"quality": 45, "trend": 20, "position": 15, "risk": 20},
+    "stable":    {"quality": 50, "trend": 10, "position": 15, "risk": 25},
+    "swing":     {"quality": 15, "trend": 35, "position": 35, "risk": 15},
+    # 未來分類（v10.9.137+ 會補 score 函數）
+    "pullback":  {"quality": 25, "trend": 25, "position": 30, "risk": 20},  # 低基期轉強
+    "concept":   {"quality": 30, "trend": 25, "position": 15, "risk": 30},  # AI / 科技概念
+    "chip":      {"quality": 20, "trend": 25, "position": 20, "risk": 35},  # 籌碼集中
+    "defensive": {"quality": 45, "trend": 10, "position": 15, "risk": 30},  # 防禦型
+}
+
+
+def _compute_4layer_scores(filter_type: str, breakdown: dict,
+                           overheating: str, excludes: list,
+                           closes: list, tw: dict) -> dict:
+    """v10.9.136：把分類獨立 score 拆成 4 層分數（每層 0-100）
+    這 4 層分數會被分類各自的權重加權，得到 final_check_score。
+    breakdown 是 score_xxx_stock 回傳的 dict（已是該分類獨立評分）。
+    """
+    # ── 1. 品質 ──：直接用分類獨立評分的 total
+    #    （趨勢股 total 已套技術 40/籌碼 25/動能 20/新聞 15；存股已套配息 35/財安 30/...）
+    quality = max(0, min(100, breakdown.get("total", 0)))
+
+    # ── 2. 趨勢 ──：均線排列 + 短中期動能 + excludes 跌破訊號
+    trend = 50
+    pct_5d  = breakdown.get("pct_5d",  _chg_pct(closes, 5)  if closes else 0)
+    pct_20d = breakdown.get("pct_20d", _chg_pct(closes, 20) if closes else 0)
+    if closes and len(closes) >= 60:
+        price = tw.get("price") or closes[-1]
+        ma5  = _ma(closes, 5)
+        ma20 = _ma(closes, 20)
+        ma60 = _ma(closes, 60)
+        if ma5 and ma20 and ma60 and ma5 > ma20 > ma60:  trend += 15  # 多頭排列
+        elif ma20 and price > ma20:                       trend += 8
+        if ma60 and price < ma60:                         trend -= 10
+    if pct_20d > 10:  trend += 12
+    elif pct_20d > 0: trend += 5
+    elif pct_20d < -10: trend -= 20
+    if pct_5d > 5:    trend += 5
+    elif pct_5d < -5: trend -= 8
+    # excludes 有「跌破」「轉弱」明顯扣
+    if any(("跌破" in e) or ("轉弱" in e) for e in (excludes or [])):
+        trend -= 25
+    trend = max(0, min(100, trend))
+
+    # ── 3. 位置 ──：過熱程度（越冷越好進場、危險過熱很差）
+    if overheating == "dangerous_hot":   position = 25
+    elif overheating == "healthy_hot":   position = 55
+    else:                                 position = 80
+    # 接近 60 日高/低也微調
+    if closes and len(closes) >= 60:
+        recent = closes[-60:]
+        lo, hi = min(recent), max(recent)
+        price = tw.get("price") or closes[-1]
+        if hi > lo:
+            pos_pct = (price - lo) / (hi - lo)   # 0 = 60 日低、1 = 60 日高
+            if pos_pct < 0.3: position += 10     # 接近低檔（好進場）
+            elif pos_pct > 0.9: position -= 10   # 已在高檔
+    position = max(0, min(100, position))
+
+    # ── 4. 風險 ──：excludes 數量與嚴重度 + 危險過熱加扣
+    danger_keywords = ["跌破", "虧損", "陷阱", "EPS", "過熱", "轉弱", "估值"]
+    n_danger = sum(1 for e in (excludes or [])
+                   if any(k in e for k in danger_keywords))
+    risk_score = 100 - n_danger * 18
+    if overheating == "dangerous_hot": risk_score -= 20
+    elif overheating == "healthy_hot": risk_score -= 5
+    risk_score = max(0, min(100, risk_score))
+
+    return {"quality": quality, "trend": trend,
+            "position": position, "risk": risk_score}
+
+
+def _compute_final_check_score(filter_type: str, layer_scores: dict) -> float:
+    """v10.9.136：用分類自己的 4 層權重加權算 final_check_score（0-100）"""
+    w = CATEGORY_4LAYER_WEIGHTS.get(filter_type, CATEGORY_4LAYER_WEIGHTS["trend"])
+    total_w = sum(w.values()) or 100
+    return sum(layer_scores.get(k, 0) * w[k] / total_w for k in w)
+
+
 def _determine_recommendation_status(score: int, overheating: str,
-                                     excludes: list, filter_type: str) -> str:
-    """v10.9.135：依「品質 + 趨勢 + 位置 + 風險」決定 7 狀態
+                                     excludes: list, filter_type: str,
+                                     layer_scores: dict = None,
+                                     final_check_score: float = None) -> str:
+    """v10.9.136：依「品質 + 趨勢 + 位置 + 風險」決定 7 狀態
     回傳 key（對應 REC_STATUS_LABELS）
 
-    4 層判斷：
-      1. 品質：score 是否達門檻
-      2. 趨勢：是否仍偏多（用 score 細項與 excludes）
-      3. 位置：過熱程度（normal / healthy_hot / dangerous_hot）
-      4. 風險：excludes 是否包含跌破支撐 / 趨勢轉弱
+    4 層判斷（每個分類自己的權重，不是統一公式）：
+      1. 品質：分類獨立評分 total（已套分類權重）
+      2. 趨勢：均線、動能、跌破訊號
+      3. 位置：過熱程度 + 60 日相對位置
+      4. 風險：excludes 嚴重度 + 過熱扣分
+
+    score：分類獨立評分 total（品質層）
+    final_check_score：4 層加權後分數（0-100）；若沒給就只用 score 走簡易判斷
     """
-    # 品質不足
+    # 品質門檻不過 → 暫不推薦
     if score < MIN_SCORE_FOR_RECOMMENDATION:
         return "not_recommend"
 
-    # 危險訊號（exclude 提到「跌破」「轉弱」「虧損」「殖利率陷阱」）
-    danger_keywords = ["跌破", "轉弱", "虧損", "陷阱", "EPS"]
-    has_danger = any(any(k in e for k in danger_keywords) for e in (excludes or []))
+    fcs = final_check_score if final_check_score is not None else score
+    layer = layer_scores or {}
 
-    # 位置：危險過熱 → 高風險觀察
+    # ── 危險過熱：高風險觀察 ──
     if overheating == "dangerous_hot":
         return "high_risk"
 
-    # 位置：健康過熱
-    if overheating == "healthy_hot":
-        if score >= 80:
-            return "strong_hot"      # 強勢但偏熱（仍可小量試單）
-        else:
-            return "wait_pullback"   # 等回測
+    # ── 趨勢層特別低（< 35）→ 等回測或不推薦 ──
+    if layer.get("trend", 100) < 35:
+        # 但若風險與品質都還好，給「等回測」而非直接砍
+        if fcs >= 55 and layer.get("risk", 100) >= 50:
+            return "wait_pullback"
+        return "not_recommend"
 
-    # 位置：正常（normal）
-    if has_danger and score < 75:
-        return "wait_pullback"       # 有警訊但結構未完全壞，等回測
-    if score >= 80:
-        return "aggressive"          # 可積極觀察
-    return "positive"                # 偏多觀察（60-79）
+    # ── 風險層極低（< 30）→ 高風險觀察 ──
+    if layer.get("risk", 100) < 30:
+        return "high_risk"
+
+    # ── 健康過熱 ──
+    if overheating == "healthy_hot":
+        if fcs >= 75: return "strong_hot"     # 強勢但偏熱（小量試單）
+        return "wait_pullback"                 # 等回測
+
+    # ── 正常 ──：依 final_check_score 分級
+    if fcs >= 78: return "aggressive"          # 可積極觀察
+    return "positive"                          # 偏多觀察
 
 
 def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
@@ -10214,21 +10349,37 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
 
         scored.sort(key=lambda x: x["score"], reverse=True)
 
-        # v10.9.135：品質門檻過濾 + 過熱分級
+        # v10.9.136：品質門檻過濾 + 4 層總檢查（分類各自權重）+ 過熱分級
         qualified = []
         for s in scored:
             if s["score"] < MIN_SCORE_FOR_RECOMMENDATION:
                 continue
             closes_for_assess = get_tw_closes(s["sid"]) or []
-            overheat = _assess_overheating(
-                {"price": s["price"]}, closes_for_assess, s["breakdown"])
+            tw_min = {"price": s["price"]}
+            overheat = _assess_overheating(tw_min, closes_for_assess, s["breakdown"])
+
+            # v10.9.136：算 4 層分數 + 分類加權的 final_check_score
+            layer = _compute_4layer_scores(
+                filter_type, s["breakdown"], overheat,
+                s.get("excludes", []), closes_for_assess, tw_min)
+            final_check = _compute_final_check_score(filter_type, layer)
+
             status_key = _determine_recommendation_status(
-                s["score"], overheat, s.get("excludes", []), filter_type)
-            s["overheating"] = overheat
-            s["status_key"]  = status_key
+                s["score"], overheat, s.get("excludes", []), filter_type,
+                layer_scores=layer, final_check_score=final_check)
+
+            s["overheating"]       = overheat
+            s["layer_scores"]      = layer
+            s["final_check_score"] = round(final_check, 1)
+            s["category_4w"]       = CATEGORY_4LAYER_WEIGHTS.get(filter_type, {})
+            s["status_key"]        = status_key
             s["status_emoji"], s["status_label"], s["status_summary"] = \
                 REC_STATUS_LABELS.get(status_key, ("⚪", "—", ""))
             qualified.append(s)
+
+        # 排序改用 final_check_score（不是 raw score）— 更貼近「適合推薦」順序
+        qualified.sort(key=lambda x: x.get("final_check_score", x["score"]),
+                       reverse=True)
 
         # 變動數量：3-10 檔；若全部不合格 → 暫無推薦
         if not qualified:
@@ -10259,8 +10410,12 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
         for s in top_picks:
             s["ai"] = ai_map.get(s["sid"], {})
 
-        # 4. 推送
-        source_note = f"權重：{weights_label}　|　品質門檻 ≥ {MIN_SCORE_FOR_RECOMMENDATION}"
+        # 4. 推送 — source_note 同時顯示分類權重 & 4 層權重（凸顯每類不同）
+        c4 = CATEGORY_4LAYER_WEIGHTS.get(filter_type, {})
+        layer_label = (f"四層權重：品質{c4.get('quality',0)}/趨勢{c4.get('trend',0)}/"
+                       f"位置{c4.get('position',0)}/風險{c4.get('risk',0)}")
+        source_note = (f"分類權重：{weights_label}\n"
+                       f"{layer_label}　|　品質門檻 ≥ {MIN_SCORE_FOR_RECOMMENDATION}")
         push_flex(user_id, make_rec_flex(top_picks, mkt, source_note), display)
     except Exception as e:
         dlog("REC_FILTER", f"{filter_type} 主流程失敗：{type(e).__name__}: {e}")
