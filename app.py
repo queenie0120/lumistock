@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.128"
+VERSION              = "10.9.129"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3946,7 +3946,9 @@ def make_ai_menu_flex() -> dict:
     return make_menu_flex(
         "🤖 AI 分析", "智慧選股・多維度評分", "#E89B82",
         [("💬 問 AI 助理","問AI"),                # v10.9.69：AI 智能問答入口
-         ("⭐ 觀察清單","觀察清單"), ("📈 趨勢觀察","趨勢觀察"),
+         ("🇹🇼 台股觀察清單","台股觀察"),         # v10.9.129
+         ("🇺🇸 美股觀察清單","美股觀察"),         # v10.9.129
+         ("📈 趨勢觀察","趨勢觀察"),
          ("🌱 成長觀察","成長觀察"), ("💰 存股觀察","存股觀察"),
          ("🌊 波段觀察","波段觀察"), ("🤖 AI概念觀察","AI概念觀察"),
          ("💬 意見回饋","意見回饋")]            # v10.9.87：使用者建議直送 Owner
@@ -9248,6 +9250,229 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
         return {}
 
 
+# v10.9.129：美股觀察清單 universe（精選 32 檔大型 / 熱門 / 有題材的）
+US_WATCHLIST_UNIVERSE = [
+    # AI / 半導體（規格七：AI 主軸）
+    "NVDA", "AMD", "AVGO", "MU", "TSM", "ARM", "ASML", "QCOM", "MRVL",
+    # 巨型科技
+    "AAPL", "MSFT", "GOOG", "GOOGL", "META", "AMZN", "ORCL", "CRM",
+    # 電動車 / 自駕
+    "TSLA",
+    # 金融（規格五：市場情緒指標）
+    "JPM", "GS", "V", "MA",
+    # 醫療 / 製藥
+    "LLY", "JNJ",
+    # 消費 / 物流
+    "COST", "WMT", "MCD",
+    # 通訊娛樂
+    "NFLX",
+    # 工業 / 國防
+    "BA", "RTX",
+    # 重點 ETF（給市場情緒參考）
+    "SPY", "QQQ",
+]
+
+
+def _fetch_us_batch_quotes(symbols: list) -> dict:
+    """v10.9.129：用 Yahoo v7 quote 一次拉多檔。回傳 {symbol: data, ...}。"""
+    if not symbols: return {}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={','.join(symbols)}"
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code != 200:
+            dlog("US_REC", f"v7 batch HTTP {r.status_code}")
+            return {}
+        results = r.json().get("quoteResponse", {}).get("result", [])
+        out = {}
+        for d in results:
+            sym = d.get("symbol", "")
+            rmp = d.get("regularMarketPrice")
+            if not sym or not rmp: continue
+            out[sym] = {
+                "symbol": sym,
+                "name": d.get("shortName") or d.get("longName") or sym,
+                "price": float(rmp),
+                "chg": float(d.get("regularMarketChange", 0) or 0),
+                "pct": float(d.get("regularMarketChangePercent", 0) or 0),
+                "vol": int(d.get("regularMarketVolume", 0) or 0),
+                "day_high": d.get("regularMarketDayHigh"),
+                "day_low":  d.get("regularMarketDayLow"),
+                "52w_high": d.get("fiftyTwoWeekHigh"),
+                "52w_low":  d.get("fiftyTwoWeekLow"),
+                "marketCap": d.get("marketCap"),
+                "ms": d.get("marketState", ""),
+            }
+        dlog("US_REC", f"batch quote: {len(symbols)} 請求 / {len(out)} 拿到")
+        return out
+    except Exception as e:
+        dlog("US_REC", f"batch fail: {type(e).__name__}: {e}")
+        return {}
+
+
+def _score_us_candidate(q: dict) -> int:
+    """v10.9.129：簡單評分（不重技術指標，主要看動能 + 估值位置）。
+    0-100 分；越高越值得觀察。"""
+    score = 50
+    pct = q.get("pct", 0)
+    if pct > 3: score += 15
+    elif pct > 1: score += 8
+    elif pct < -3: score -= 10
+    # 在 52 週區間的位置（接近高點扣分、接近低點加分）
+    p = q.get("price", 0)
+    hi = q.get("52w_high")
+    lo = q.get("52w_low")
+    if p and hi and lo and hi > lo:
+        pos = (p - lo) / (hi - lo)   # 0=底, 1=頂
+        if pos < 0.3: score += 12   # 低基期
+        elif pos > 0.9: score -= 8   # 高檔
+    # 市值越大越穩定（先 weight 給大型）
+    mc = q.get("marketCap") or 0
+    if mc > 1e12: score += 5    # $1T+
+    elif mc > 1e11: score += 3  # $100B+
+    return max(0, min(100, score))
+
+
+def ai_analyze_us_top_picks_batch(top_picks: list, market_status: dict) -> dict:
+    """v10.9.129：一次 Groq 呼叫對 top 5 美股做專業分析。
+    回傳 {symbol: {summary, reason, risk, tw_connection, ai_confidence}}"""
+    if not top_picks or not GROQ_AVAILABLE: return {}
+    picks_text = []
+    for p in top_picks:
+        chain = _us_supply_chain_text(p["symbol"])
+        chain_note = f"（台股連動：{chain}）" if chain else ""
+        picks_text.append(
+            f"- {p['symbol']} {p.get('name','')}：現價 {p['price']:.2f} "
+            f"漲幅 {p['pct']:+.2f}%{chain_note}"
+        )
+    sys_prompt = """你是 20 年資歷的美股投資顧問。針對以下候選美股，做專業觀察分析。
+對每檔回傳 JSON object：
+- "summary": 25 字內公司精華（產業地位、競爭優勢）
+- "reason": 為何值得觀察（具體事件 / 業績 / 題材，30 字內）
+- "risk": 主要風險（估值 / 競爭 / 政策 / 產業，20 字內）
+- "tw_connection": 對台股供應鏈的影響（10-15 字；無連動寫「無直接連動」）
+- "ai_confidence": "高" / "中" / "低" 之一
+只輸出 JSON 陣列，順序對應輸入；不要 markdown。"""
+    response = groq_chat([
+        {"role":"system","content":sys_prompt},
+        {"role":"user","content":"\n".join(picks_text)}
+    ], max_tokens=1500, temperature=0.3, timeout=15)
+    out = {}
+    try:
+        m = re.search(r'\[.*\]', response, re.DOTALL)
+        if m:
+            ai_data = json.loads(m.group(0))
+            if isinstance(ai_data, list):
+                for i, ai in enumerate(ai_data[:len(top_picks)]):
+                    if isinstance(ai, dict):
+                        out[top_picks[i]["symbol"]] = {
+                            "summary": str(ai.get("summary",""))[:40],
+                            "reason": str(ai.get("reason",""))[:50],
+                            "risk": str(ai.get("risk",""))[:40],
+                            "tw_connection": str(ai.get("tw_connection",""))[:30],
+                            "ai_confidence": str(ai.get("ai_confidence","中"))[:2],
+                        }
+    except Exception as e:
+        dlog("US_REC", f"AI 解析失敗：{e}")
+    return out
+
+
+def make_us_rec_flex(top5: list) -> dict:
+    """v10.9.129：美股觀察清單 Flex carousel。"""
+    if not top5: return None
+    bubbles = []
+    # 標頭 bubble
+    bubbles.append({
+        "type":"bubble","size":"kilo",
+        "header":{"type":"box","layout":"vertical",
+                  "backgroundColor":"#C9B0DB","paddingAll":"14px",
+                  "contents":[
+                      {"type":"text","text":"🇺🇸 美股觀察清單","size":"md",
+                       "color":"#FFFFFF","weight":"bold"},
+                      {"type":"text","text":f"Top {len(top5)} ‧ {now_taipei().strftime('%m/%d %H:%M')}",
+                       "size":"xxs","color":"#FDF6F0","margin":"xs"}]},
+        "body":{"type":"box","layout":"vertical",
+                "backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"sm",
+                "contents":[
+                    {"type":"text","text":"⚠ 僅供觀察 / 研究參考","size":"xxs",
+                     "color":"#A05A48","align":"center"},
+                    {"type":"text","text":"不構成投資建議","size":"xxs",
+                     "color":"#A05A48","align":"center"}]},
+    })
+    for i, s in enumerate(top5, 1):
+        ai = s.get("ai", {})
+        pct = s.get("pct", 0)
+        is_up = pct >= 0
+        color = "#D97A5C" if is_up else "#7AABBE"
+        arrow = "▲" if is_up else "▼"
+        body_contents = [
+            {"type":"text","text":f"{s['symbol']} {s.get('name','')[:18]}",
+             "size":"sm","color":"#5B4040","weight":"bold","wrap":True},
+            {"type":"text","text":f"{arrow} {s['price']:.2f}　{pct:+.2f}%",
+             "size":"md","color":color,"weight":"bold"},
+            {"type":"separator","color":"#E8C4B4","margin":"sm"},
+        ]
+        if ai.get("summary"):
+            body_contents.append({"type":"text","text":f"📌 {ai['summary']}",
+                                  "size":"xxs","color":"#5B4040","margin":"sm","wrap":True})
+        if ai.get("reason"):
+            body_contents.append({"type":"text","text":f"💡 {ai['reason']}",
+                                  "size":"xxs","color":"#A05A48","margin":"xs","wrap":True})
+        if ai.get("tw_connection"):
+            body_contents.append({"type":"text","text":f"🇹🇼 {ai['tw_connection']}",
+                                  "size":"xxs","color":"#7AABBE","margin":"xs","wrap":True})
+        if ai.get("risk"):
+            body_contents.append({"type":"text","text":f"⚠ {ai['risk']}",
+                                  "size":"xxs","color":"#D97A5C","margin":"xs","wrap":True})
+        conf = ai.get("ai_confidence", "中")
+        conf_emoji = {"高":"🟢","中":"🟡","低":"🔵"}.get(conf, "🟡")
+        body_contents.append({"type":"text","text":f"{conf_emoji} AI 信心 {conf}",
+                              "size":"xxs","color":"#9B6B5A","margin":"sm","align":"end"})
+        bubble = {
+            "type":"bubble","size":"kilo",
+            "header":{"type":"box","layout":"vertical","backgroundColor":color,"paddingAll":"10px",
+                "contents":[{"type":"text","text":f"#{i}",
+                             "size":"sm","color":"#FFFFFF","weight":"bold"}]},
+            "body":{"type":"box","layout":"vertical",
+                    "backgroundColor":"#FDF6F0","paddingAll":"12px","spacing":"xs",
+                    "contents":body_contents},
+        }
+        bubbles.append(bubble)
+    return {"type":"carousel","contents":bubbles}
+
+
+def build_and_push_us_recommendation(user_id: str):
+    """v10.9.129：美股觀察清單 — 從 universe 中挑 top 5 並做 AI 分析。"""
+    try:
+        # 1. Batch 抓所有候選 quote
+        quotes = _fetch_us_batch_quotes(US_WATCHLIST_UNIVERSE)
+        if not quotes:
+            push_message(user_id,
+                "🇺🇸 美股觀察清單\n━━━━━━━━━━━━━━\n"
+                "暫時無法取得資料，請稍後再試")
+            return
+        # 2. 評分 + 排序
+        scored = []
+        for sym, q in quotes.items():
+            q["score"] = _score_us_candidate(q)
+            scored.append(q)
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        top5 = scored[:5]
+        # 3. AI batch 分析
+        ai_map = ai_analyze_us_top_picks_batch(top5, {})
+        for s in top5:
+            s["ai"] = ai_map.get(s["symbol"], {})
+        # 4. 輸出
+        flex = make_us_rec_flex(top5)
+        if flex:
+            push_flex(user_id, flex, "🇺🇸 美股觀察清單")
+        else:
+            push_message(user_id, "🇺🇸 美股觀察清單\n━━━━━━━━━━━━━━\n候選為空")
+    except Exception as e:
+        dlog("US_REC", f"觀察清單運算失敗：{type(e).__name__}: {e}")
+        push_message(user_id, "🇺🇸 美股觀察清單\n━━━━━━━━━━━━━━\n系統處理中，請稍後再試")
+
+
 def build_and_push_recommendation(user_id:str):
     try:
         mkt=get_market_status()
@@ -10536,14 +10761,27 @@ def handle_message(event):
             [("台積電","2330"),("聯發科","2454"),("鴻海","2317"),("廣達","2382")])
         return
 
-    # ══ AI 選股（v10.9.48：新詞優先，舊詞保留向後相容） ══
-    if text in ["觀察清單","今日觀察","推薦股","今日推薦股"]:
-        dlog("HANDLER", "→ 觀察清單（背景執行）")
-        log_to_sheets(user_id,"查詢觀察清單","","成功")
-        reply_text(event.reply_token,
-              "⭐ 觀察清單分析中...\n━━━━━━━━━━━━━━\n"
-              "正在整合法人籌碼、技術面、新聞情緒\n約 15～30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議")
+    # ══ AI 選股 — 台股版（v10.9.48；v10.9.129 加切換浮標）══
+    if text in ["觀察清單","今日觀察","推薦股","今日推薦股","台股觀察","台股觀察清單"]:
+        dlog("HANDLER", "→ 台股觀察清單（背景執行）")
+        log_to_sheets(user_id,"查詢觀察清單","tw","成功")
+        reply_text_with_qr(event.reply_token,
+              "⭐ 台股觀察清單分析中...\n━━━━━━━━━━━━━━\n"
+              "正在整合法人籌碼、技術面、新聞情緒\n約 15～30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
+              [("🇺🇸 改看美股", "美股觀察")])
         t=threading.Thread(target=build_and_push_recommendation,args=(user_id,))
+        t.daemon=True; t.start()
+        return
+
+    # v10.9.129：美股版觀察清單
+    if text in ["美股觀察", "美股觀察清單", "美股推薦股", "今日美股觀察"]:
+        dlog("HANDLER", "→ 美股觀察清單（背景執行）")
+        log_to_sheets(user_id,"查詢觀察清單","us","成功")
+        reply_text_with_qr(event.reply_token,
+              "🇺🇸 美股觀察清單分析中...\n━━━━━━━━━━━━━━\n"
+              "正在從 32 檔大型美股中挑出 Top 5\n整合動能、估值位置、AI 分析\n約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
+              [("🇹🇼 改看台股", "台股觀察")])
+        t=threading.Thread(target=build_and_push_us_recommendation,args=(user_id,))
         t.daemon=True; t.start()
         return
 
