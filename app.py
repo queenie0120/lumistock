@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.139"
+VERSION              = "10.9.140"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2074,6 +2074,54 @@ def _should_alert(uid: str, sid: str, alert_type: str) -> bool:
     return True
 
 
+# ──────────────────────────────────────────
+# v10.9.140：用戶自訂停損 / 目標價（覆蓋系統建議）
+# 結構：{user_id: {sid: {"stop_loss": float, "target": float, "updated": ts}}}
+# ──────────────────────────────────────────
+USER_ALERTS_FILE = "/tmp/lumistock_user_alerts.json"
+
+def _load_user_alerts() -> dict:
+    try:
+        if os.path.exists(USER_ALERTS_FILE):
+            with open(USER_ALERTS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        dlog("USER_ALERT", f"讀取失敗：{e}")
+    return {}
+
+def _save_user_alerts(data: dict) -> None:
+    try:
+        with open(USER_ALERTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dlog("USER_ALERT", f"寫入失敗：{e}")
+
+USER_ALERTS = _load_user_alerts()
+
+def set_user_alert(uid: str, sid: str, alert_type: str, price: float) -> None:
+    """alert_type ∈ {'stop_loss', 'target'}；price=0 表示清除"""
+    USER_ALERTS.setdefault(uid, {}).setdefault(sid, {})
+    if price > 0:
+        USER_ALERTS[uid][sid][alert_type] = float(price)
+        USER_ALERTS[uid][sid]["updated"] = time.time()
+    else:
+        USER_ALERTS[uid][sid].pop(alert_type, None)
+        # 整檔都沒設定就清掉
+        if not any(k in USER_ALERTS[uid][sid] for k in ("stop_loss", "target")):
+            USER_ALERTS[uid].pop(sid, None)
+        if not USER_ALERTS[uid]:
+            USER_ALERTS.pop(uid, None)
+    _save_user_alerts(USER_ALERTS)
+
+def get_user_alert(uid: str, sid: str) -> dict:
+    """回傳 {} 或 {'stop_loss': x, 'target': y, 'updated': ts}"""
+    return USER_ALERTS.get(uid, {}).get(sid, {})
+
+def list_user_alerts(uid: str) -> dict:
+    """列該 user 所有自訂提醒"""
+    return USER_ALERTS.get(uid, {})
+
+
 def run_portfolio_alerts(force: bool = False) -> dict:
     """v10.9.63：掃描所有使用者持股，收集警報。
     v10.9.65：加 24h dedup（同一筆 user × stock × type 一日只發一次）。
@@ -2112,24 +2160,28 @@ def run_portfolio_alerts(force: bool = False) -> dict:
                 name  = tw.get("name", sid)
                 if not price: continue
                 adv = _get_portfolio_advice(sid)
+                # v10.9.140：用戶自訂值優先（覆蓋系統建議）
+                ua = get_user_alert(uid, sid)
+                sl = ua.get("stop_loss") or adv.get("stop_loss")
+                tg = ua.get("target")    or adv.get("target")
+                sl_source = "自訂" if ua.get("stop_loss") else "系統"
+                tg_source = "自訂" if ua.get("target")    else "系統"
                 # 觸發 a) 跌破停損
-                sl = adv.get("stop_loss")
                 if sl and price <= sl and (force or _should_alert(uid, sid, "stop_loss")):
                     pct_below = (price - sl) / sl * 100
                     user_alerts.append(
                         f"⚠️ {symbol} {name}\n"
-                        f"　現價 {price:,.2f} 跌破系統停損 {sl:,.2f}\n"
+                        f"　現價 {price:,.2f} 跌破{sl_source}停損 {sl:,.2f}\n"
                         f"　已破位 {pct_below:+.1f}%，建議檢視持倉"
                     )
                 # 觸發 b) 接近目標（不重疊 a）
-                tg = adv.get("target")
                 if (tg and not (sl and price <= sl)
                     and price >= tg * 0.95
                     and (force or _should_alert(uid, sid, "near_target"))):
                     diff = (tg - price) / tg * 100
                     user_alerts.append(
                         f"📈 {symbol} {name}\n"
-                        f"　現價 {price:,.2f} 接近系統目標 {tg:,.2f}\n"
+                        f"　現價 {price:,.2f} 接近{tg_source}目標 {tg:,.2f}\n"
                         f"　距目標 {abs(diff):.1f}%，可考慮停利"
                     )
                 # 觸發 c) 今日除息
@@ -12502,8 +12554,131 @@ def handle_message(event):
             reply_text(event.reply_token,
                 "格式：賣出 代號 股數 賣價\n範例：賣出 6742 1000 59.5")
         return
-    if text=="停損提醒說明": reply_text(event.reply_token,"停損提醒功能開發中 🚧\n後續版本將開放設定"); return
-    if text=="目標價提醒說明": reply_text(event.reply_token,"目標價提醒功能開發中 🚧\n後續版本將開放設定"); return
+    # v10.9.140：停損 / 目標價自訂功能
+    if text == "停損提醒說明":
+        ua_all = list_user_alerts(user_id)
+        sl_settings = [(sid, v.get("stop_loss")) for sid, v in ua_all.items()
+                       if v.get("stop_loss")]
+        lines = [
+            "🔴 停損提醒設定",
+            "━━━━━━━━━━━━━━",
+            "📌 系統會自動算每檔持股的建議停損價（近 60 日低點 × 0.95）。",
+            "若想用自己的價位，可輸入指令覆蓋：",
+            "",
+            "✏️ 設定停損：",
+            "　停損 [代號] [價格]",
+            "　例：停損 2330 850",
+            "",
+            "🗑 清除停損：",
+            "　停損 [代號] 0",
+            "　例：停損 2330 0",
+            "",
+            "📋 查看所有設定：",
+            "　我的提醒",
+            "",
+            "━━━━━━━━━━━━━━",
+        ]
+        if sl_settings:
+            lines.append(f"目前已設定 {len(sl_settings)} 檔自訂停損：")
+            for sid, v in sl_settings[:10]:
+                lines.append(f"　• {sid}　{v:,.2f}")
+        else:
+            lines.append("目前尚無自訂停損（一律使用系統建議）")
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+
+    if text == "目標價提醒說明":
+        ua_all = list_user_alerts(user_id)
+        tg_settings = [(sid, v.get("target")) for sid, v in ua_all.items()
+                       if v.get("target")]
+        lines = [
+            "🎯 目標價提醒設定",
+            "━━━━━━━━━━━━━━",
+            "📌 系統會自動算每檔持股的建議目標價（近 60 日高點 × 1.05）。",
+            "若想用自己的價位，可輸入指令覆蓋：",
+            "",
+            "✏️ 設定目標：",
+            "　目標 [代號] [價格]",
+            "　例：目標 2330 1100",
+            "",
+            "🗑 清除目標：",
+            "　目標 [代號] 0",
+            "　例：目標 2330 0",
+            "",
+            "📋 查看所有設定：",
+            "　我的提醒",
+            "",
+            "━━━━━━━━━━━━━━",
+        ]
+        if tg_settings:
+            lines.append(f"目前已設定 {len(tg_settings)} 檔自訂目標：")
+            for sid, v in tg_settings[:10]:
+                lines.append(f"　• {sid}　{v:,.2f}")
+        else:
+            lines.append("目前尚無自訂目標（一律使用系統建議）")
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+
+    # v10.9.140：「我的提醒」列出所有自訂設定
+    if text in ["我的提醒", "我的提醒設定", "提醒設定"]:
+        ua_all = list_user_alerts(user_id)
+        if not ua_all:
+            reply_text(event.reply_token,
+                "📋 我的提醒設定\n━━━━━━━━━━━━━━\n"
+                "目前尚無自訂設定。\n"
+                "所有持股皆使用系統自動算出的停損/目標。\n\n"
+                "可輸入「停損提醒」或「目標價提醒」了解設定方式。")
+            return
+        lines = ["📋 我的提醒設定", "━━━━━━━━━━━━━━"]
+        for sid, v in sorted(ua_all.items()):
+            parts = [f"📊 {sid}"]
+            if v.get("stop_loss"): parts.append(f"停損 {v['stop_loss']:,.2f}")
+            if v.get("target"):    parts.append(f"目標 {v['target']:,.2f}")
+            lines.append("　".join(parts))
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append("輸入「停損 [代號] 0」或「目標 [代號] 0」可清除")
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+
+    # v10.9.140：「停損 2330 850」/「目標 2330 1100」/「停損 2330 0」設定指令
+    m_alert = re.match(r"^(停損|目標)\s+(\d{4,6}[A-Za-z]?)\s+(\d+(?:\.\d+)?)\s*$", text)
+    if m_alert:
+        atype_zh = m_alert.group(1)
+        sid      = m_alert.group(2)
+        price    = float(m_alert.group(3))
+        atype    = "stop_loss" if atype_zh == "停損" else "target"
+        # 驗證股票存在
+        tw = get_tw_stock(sid)
+        if not tw:
+            reply_text(event.reply_token, f"❌ 找不到股票 {sid}，請確認代號")
+            return
+        name = tw.get("name", sid)
+        cur_price = tw.get("price", 0)
+        if price == 0:
+            set_user_alert(user_id, sid, atype, 0)
+            reply_text(event.reply_token,
+                f"✅ 已清除 {sid} {name} 的{atype_zh}設定\n"
+                f"之後將恢復使用系統建議價")
+            return
+        # 合理性檢查
+        if atype == "stop_loss" and cur_price and price >= cur_price:
+            reply_text(event.reply_token,
+                f"⚠️ {sid} 停損價 {price:,.2f} 已高於現價 {cur_price:,.2f}\n"
+                f"請確認後重新輸入（停損應低於現價）")
+            return
+        if atype == "target" and cur_price and price <= cur_price:
+            reply_text(event.reply_token,
+                f"⚠️ {sid} 目標價 {price:,.2f} 已低於現價 {cur_price:,.2f}\n"
+                f"請確認後重新輸入（目標應高於現價）")
+            return
+        set_user_alert(user_id, sid, atype, price)
+        diff_pct = (price - cur_price) / cur_price * 100 if cur_price else 0
+        reply_text(event.reply_token,
+            f"✅ 已設定 {sid} {name} {atype_zh}\n"
+            f"　自訂價：{price:,.2f}\n"
+            f"　現價：{cur_price:,.2f}（差 {diff_pct:+.1f}%）\n"
+            f"　到價時會自動推播提醒")
+        return
     if text in ["損益分析", "我的損益", "損益總覽"]:
         # v10.9.103：gunicorn timeout 已從 30s 拉到 120s，可以再用 Flex
         # 單 bubble（不是 carousel），比較安全
