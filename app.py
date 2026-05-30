@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.145"
+VERSION              = "10.9.146"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10731,6 +10731,50 @@ def _get_tw_swing_candidates() -> list:
 # 規格出處：project_recommendation_spec.md（補充規格）
 # 核心精神：寧可少推不要亂推；不為了湊數硬選；過熱不直接排除而是分級
 # ─────────────────────────────────────────
+# v10.9.146：連按防呆 — 追蹤每個 user 進行中分析數
+REC_MAX_CONCURRENT_PER_USER = 1     # 同一 user 同時最多 1 個分析跑（避免 worker 排隊）
+REC_PENDING_LOCK = threading.Lock()
+REC_PENDING_COUNT = {}              # {user_id: int}
+
+def _rec_pending_acquire(user_id: str) -> bool:
+    """嘗試取得分析 slot。成功 True / 已滿 False。"""
+    with REC_PENDING_LOCK:
+        n = REC_PENDING_COUNT.get(user_id, 0)
+        if n >= REC_MAX_CONCURRENT_PER_USER:
+            return False
+        REC_PENDING_COUNT[user_id] = n + 1
+        return True
+
+def _rec_pending_release(user_id: str):
+    with REC_PENDING_LOCK:
+        n = REC_PENDING_COUNT.get(user_id, 0)
+        if n <= 1:
+            REC_PENDING_COUNT.pop(user_id, None)
+        else:
+            REC_PENDING_COUNT[user_id] = n - 1
+
+def _rec_pending_count(user_id: str) -> int:
+    with REC_PENDING_LOCK:
+        return REC_PENDING_COUNT.get(user_id, 0)
+
+def launch_rec_thread(target, user_id: str, *args) -> tuple:
+    """v10.9.146：包裝 thread 啟動 — 自動 acquire / release pending slot
+    回傳 (started: bool, msg_if_blocked: str)"""
+    if not _rec_pending_acquire(user_id):
+        return False, (
+            f"⏳ 你已有 {_rec_pending_count(user_id)} 個分析正在跑\n"
+            f"系統只有 1 個 worker，連按會排隊。\n"
+            f"請等上一個完成（約 30-60 秒）後再按下一個。")
+    def wrapper():
+        try:
+            target(user_id, *args)
+        finally:
+            _rec_pending_release(user_id)
+    t = threading.Thread(target=wrapper, daemon=True)
+    t.start()
+    return True, ""
+
+
 MIN_SCORE_FOR_RECOMMENDATION = 60   # 品質門檻：低於此分數不推薦
 REC_MAX_COUNT = 10                  # 上限（若品質夠多）
 REC_TARGET_COUNT = 5                # 一般目標數量
@@ -12809,8 +12853,8 @@ def handle_message(event):
               "⭐ 台股觀察清單分析中...\n━━━━━━━━━━━━━━\n"
               "正在整合法人籌碼、技術面、新聞情緒\n約 15～30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
               [("🇺🇸 改看美股", "美股觀察")])
-        t=threading.Thread(target=build_and_push_recommendation,args=(user_id,))
-        t.daemon=True; t.start()
+        ok, blocked = launch_rec_thread(build_and_push_recommendation, user_id)
+        if not ok: push_message(user_id, blocked)
         return
 
     # v10.9.129：美股版觀察清單
@@ -12821,8 +12865,8 @@ def handle_message(event):
               "🇺🇸 美股觀察清單分析中...\n━━━━━━━━━━━━━━\n"
               "正在從 32 檔大型美股中挑出 Top 5\n整合動能、估值位置、AI 分析\n約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
               [("🇹🇼 改看台股", "台股觀察")])
-        t=threading.Thread(target=build_and_push_us_recommendation,args=(user_id,))
-        t.daemon=True; t.start()
+        ok, blocked = launch_rec_thread(build_and_push_us_recommendation, user_id)
+        if not ok: push_message(user_id, blocked)
         return
 
     # v10.9.130：AI 概念股 — 合併 AI 伺服器 + 生成式 AI + HBM + 矽光子 4 個主軸
@@ -12833,10 +12877,11 @@ def handle_message(event):
             "🤖 AI 概念觀察清單分析中...\n━━━━━━━━━━━━━━\n"
             "整合 AI 伺服器 / 生成式 AI / HBM / 矽光子\n約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
             [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察")])
-        t = threading.Thread(target=build_and_push_themed_tw_recommendation,
-                             args=(user_id, ["AI 伺服器", "生成式 AI / ChatGPT", "HBM 記憶體", "矽光子"],
-                                   "🤖 AI 概念觀察清單"))
-        t.daemon = True; t.start()
+        ok, blocked = launch_rec_thread(
+            build_and_push_themed_tw_recommendation, user_id,
+            ["AI 伺服器", "生成式 AI / ChatGPT", "HBM 記憶體", "矽光子"],
+            "🤖 AI 概念觀察清單")
+        if not ok: push_message(user_id, blocked)
         return
 
     # v10.9.130：題材觀察清單統一處理
@@ -12863,9 +12908,10 @@ def handle_message(event):
                 f"題材：{' / '.join(theme_keys)}\n"
                 f"約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
                 [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察")])
-            t = threading.Thread(target=build_and_push_themed_tw_recommendation,
-                                 args=(user_id, theme_keys, display_name))
-            t.daemon = True; t.start()
+            ok, blocked = launch_rec_thread(
+                build_and_push_themed_tw_recommendation, user_id,
+                theme_keys, display_name)
+            if not ok: push_message(user_id, blocked)
             return
 
     # v10.9.133：4 分類獨立評分（對應 project_recommendation_spec.md）
@@ -12891,9 +12937,9 @@ def handle_message(event):
                 f"約 30-60 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
                 [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察"),
                  ("🤖 AI 概念", "AI概念觀察")])
-            t = threading.Thread(target=build_and_push_filtered_recommendation,
-                                 args=(user_id, ft))
-            t.daemon = True; t.start()
+            ok, blocked = launch_rec_thread(
+                build_and_push_filtered_recommendation, user_id, ft)
+            if not ok: push_message(user_id, blocked)
             return
 
     # ══ Owner 專屬指令 ══
