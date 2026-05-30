@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.144"
+VERSION              = "10.9.145"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4068,6 +4068,11 @@ def make_forex_menu_flex() -> dict:
     return {"type":"carousel","contents":bubbles}
 
 def make_ai_menu_flex() -> dict:
+    """v10.9.145：拿掉 4 個固定題材（半導體/蘋概/醫療/軍工）
+    - 跟 AI 概念分類重疊
+    - 選單過擠
+    - 題材本來就會輪動，硬編 4 個過時風險高
+    - 用戶想看題材改用『問 AI 助理』→「最近哪些題材在漲？」更彈性"""
     return make_menu_flex(
         "🤖 AI 分析", "智慧選股・多維度評分", "#E89B82",
         [("💬 問 AI 助理","問AI"),                # v10.9.69：AI 智能問答入口
@@ -4083,11 +4088,6 @@ def make_ai_menu_flex() -> dict:
          ("🔄 低基期股","低基期股"),
          ("💼 籌碼集中","籌碼集中"),
          ("🛡️ 防禦股","防禦股"),
-         # ── 題材觀察（v10.9.130）
-         ("💎 半導體","半導體觀察"),
-         ("🍎 蘋概股","蘋概股觀察"),
-         ("💊 醫療","醫療觀察"),
-         ("🛡️ 軍工","軍工觀察"),
          ("💬 意見回饋","意見回饋")]
     )
 
