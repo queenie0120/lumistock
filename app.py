@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.143"
+VERSION              = "10.9.144"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9492,6 +9492,7 @@ REC_CATEGORY_SUBTITLE = {
     "concept":   "🤖 AI / 科技概念股觀察清單",
     "chip":      "💼 籌碼集中股觀察清單",
     "defensive": "🛡️ 防禦型股票觀察清單",
+    "us_general":"🇺🇸 美股綜合觀察清單",
 }
 
 
@@ -10810,11 +10811,13 @@ CATEGORY_4LAYER_WEIGHTS = {
     "growth":    {"quality": 45, "trend": 20, "position": 15, "risk": 20},
     "stable":    {"quality": 50, "trend": 10, "position": 15, "risk": 25},
     "swing":     {"quality": 15, "trend": 35, "position": 35, "risk": 15},
-    # 未來分類（v10.9.137+ 會補 score 函數）
+    # v10.9.141 補
     "pullback":  {"quality": 25, "trend": 25, "position": 30, "risk": 20},  # 低基期轉強
     "concept":   {"quality": 30, "trend": 25, "position": 15, "risk": 30},  # AI / 科技概念
     "chip":      {"quality": 20, "trend": 25, "position": 20, "risk": 35},  # 籌碼集中
     "defensive": {"quality": 45, "trend": 10, "position": 15, "risk": 30},  # 防禦型
+    # v10.9.144：美股觀察清單（暫時通用權重，後續會分美股趨勢/成長/價值/波段）
+    "us_general":{"quality": 30, "trend": 30, "position": 20, "risk": 20},
 }
 
 
@@ -11286,7 +11289,8 @@ def build_and_push_themed_tw_recommendation(user_id: str, theme_keys: list, disp
 
 
 def build_and_push_us_recommendation(user_id: str):
-    """v10.9.129：美股觀察清單 — 從 universe 中挑 top 5 並做 AI 分析。"""
+    """v10.9.129：美股觀察清單。
+    v10.9.144：改用通用 make_rec_flex（同樣的封面 + 警告模組 + 4 層判斷）。"""
     try:
         # 1. Batch 抓所有候選 quote
         quotes = _fetch_us_batch_quotes(US_WATCHLIST_UNIVERSE)
@@ -11306,12 +11310,58 @@ def build_and_push_us_recommendation(user_id: str):
         ai_map = ai_analyze_us_top_picks_batch(top5, {})
         for s in top5:
             s["ai"] = ai_map.get(s["symbol"], {})
-        # 4. 輸出
-        flex = make_us_rec_flex(top5)
-        if flex:
-            push_flex(user_id, flex, "🇺🇸 美股觀察清單")
-        else:
+
+        # 4. v10.9.144：轉成 make_rec_flex 可吃的格式 + 套狀態 / 警告
+        recs = []
+        for s in top5:
+            score = int(s.get("score", 0))
+            # US 沒有 closes 拉技術指標，這裡只用 score 算 4 層
+            layer = {"quality": score, "trend": score, "position": 60, "risk": 70}
+            final = _compute_final_check_score("us_general", layer)
+            # 簡化版狀態判斷：依 score 分級
+            if score >= 75:   status_key = "aggressive"
+            elif score >= 60: status_key = "positive"
+            elif score >= 50: status_key = "wait_pullback"
+            else:             status_key = "not_recommend"
+            status_emoji, status_label, status_summary = \
+                REC_STATUS_LABELS.get(status_key, ("⚪", "—", ""))
+            rec = {
+                "sid": s.get("symbol", ""),
+                "name": s.get("name", ""),
+                "price": s.get("price", 0) or 0,
+                "pct": s.get("pct", 0) or 0,
+                "score": score,
+                "category": "us_general",
+                "category_4w": CATEGORY_4LAYER_WEIGHTS["us_general"],
+                "layer_scores": layer,
+                "final_check_score": round(final, 1),
+                "status_key": status_key,
+                "status_emoji": status_emoji,
+                "status_label": status_label,
+                "status_summary": status_summary,
+                "breakdown": {"total": score},
+                "overheating": "normal",
+                "excludes": [],
+                "ai": s.get("ai", {}),
+                "tech_signals": [],
+                "chip_signals": [],
+                "news_list": [],
+                "support": s.get("52w_low"),
+                "resistance": s.get("52w_high"),
+                "stop_loss": None,
+                "target": None,
+            }
+            recs.append(rec)
+
+        if not recs:
             push_message(user_id, "🇺🇸 美股觀察清單\n━━━━━━━━━━━━━━\n候選為空")
+            return
+        mkt = {"str": f"📊 美股觀察池 {len(US_WATCHLIST_UNIVERSE)} 檔篩選 top {len(recs)}"}
+        source_note = "動能 + 52 週位置 + 漲跌"
+        push_flex(user_id,
+                  make_rec_flex(recs, mkt, source_note,
+                                filter_type="us_general", market_flag="🇺🇸 美股"),
+                  "🇺🇸 美股觀察清單")
     except Exception as e:
         dlog("US_REC", f"觀察清單運算失敗：{type(e).__name__}: {e}")
         push_message(user_id, "🇺🇸 美股觀察清單\n━━━━━━━━━━━━━━\n系統處理中，請稍後再試")
