@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.141"
+VERSION              = "10.9.142"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2122,6 +2122,59 @@ def list_user_alerts(uid: str) -> dict:
     return USER_ALERTS.get(uid, {})
 
 
+# ──────────────────────────────────────────
+# v10.9.142：推播管理設定（owner 控制）
+# ──────────────────────────────────────────
+PUSH_SETTINGS_FILE = "/tmp/lumistock_push_settings.json"
+DEFAULT_PUSH_SETTINGS = {
+    "morning_report_time": "06:30",       # 每日健檢 + 持股警報時間
+    "portfolio_alerts_enabled": True,     # 持股警報總開關
+    "healthcheck_enabled": True,          # 自動健檢總開關
+    "broadcast_history": [],              # 全體公告歷史（最多保留 20 筆）
+}
+
+def _load_push_settings() -> dict:
+    try:
+        if os.path.exists(PUSH_SETTINGS_FILE):
+            with open(PUSH_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                # 補預設值（升級時新加 key 不會缺）
+                for k, v in DEFAULT_PUSH_SETTINGS.items():
+                    d.setdefault(k, v)
+                return d
+    except Exception as e:
+        dlog("PUSH_SETTING", f"讀取失敗：{e}")
+    return dict(DEFAULT_PUSH_SETTINGS)
+
+def _save_push_settings(d: dict) -> None:
+    try:
+        with open(PUSH_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dlog("PUSH_SETTING", f"寫入失敗：{e}")
+
+PUSH_SETTINGS = _load_push_settings()
+
+def get_push_setting(key: str, default=None):
+    return PUSH_SETTINGS.get(key, default)
+
+def set_push_setting(key: str, value) -> None:
+    PUSH_SETTINGS[key] = value
+    _save_push_settings(PUSH_SETTINGS)
+
+def get_all_user_ids() -> list:
+    """從 portfolio 撈所有 user_id（全體公告用）"""
+    uids = set()
+    try:
+        pf = load_portfolio()
+        for key, data in pf.items():
+            uid = data.get("user_id")
+            if uid: uids.add(uid)
+    except Exception as e:
+        dlog("BROADCAST", f"撈 user_ids 失敗：{e}")
+    return list(uids)
+
+
 def run_portfolio_alerts(force: bool = False) -> dict:
     """v10.9.63：掃描所有使用者持股，收集警報。
     v10.9.65：加 24h dedup（同一筆 user × stock × type 一日只發一次）。
@@ -2218,29 +2271,38 @@ def format_portfolio_alerts_msg(alerts: list) -> str:
 
 
 def _run_daily_healthcheck():
-    """執行每日自動健檢 + 持股警報 + 排下一次"""
+    """執行每日自動健檢 + 持股警報 + 排下一次。
+    v10.9.142：依 PUSH_SETTINGS 開關決定是否執行各區塊。"""
     dlog("HEALTHCHECK-AUTO", "🔄 開始每日自動健檢")
     try:
-        results = run_healthcheck_tests()
-        ok_n = sum(1 for r in results if r[1])
-        total = len(results)
-        report = format_healthcheck_report(results, brief_on_success=True)
-        dlog("HEALTHCHECK-AUTO", f"完成：{ok_n}/{total} 通過")
-        try:
-            push_to_owner(report)
-        except Exception as e:
-            dlog("HEALTHCHECK-AUTO", f"推播失敗：{e}")
-        # v10.9.63：持股警報
-        try:
-            alerts_by_user = run_portfolio_alerts()
-            for uid, alerts in alerts_by_user.items():
-                msg = format_portfolio_alerts_msg(alerts)
-                push_message(uid, msg)
-            dlog("HEALTHCHECK-AUTO",
-                 f"持股警報：{len(alerts_by_user)} 位 user / "
-                 f"{sum(len(a) for a in alerts_by_user.values())} 則訊息")
-        except Exception as e:
-            dlog("HEALTHCHECK-AUTO", f"持股警報執行失敗：{type(e).__name__}: {e}")
+        # 健檢區塊（可關）
+        if get_push_setting("healthcheck_enabled", True):
+            results = run_healthcheck_tests()
+            ok_n = sum(1 for r in results if r[1])
+            total = len(results)
+            report = format_healthcheck_report(results, brief_on_success=True)
+            dlog("HEALTHCHECK-AUTO", f"完成：{ok_n}/{total} 通過")
+            try:
+                push_to_owner(report)
+            except Exception as e:
+                dlog("HEALTHCHECK-AUTO", f"推播失敗：{e}")
+        else:
+            dlog("HEALTHCHECK-AUTO", "🔕 自動健檢已關閉（owner 設定）")
+
+        # 持股警報區塊（可關）
+        if get_push_setting("portfolio_alerts_enabled", True):
+            try:
+                alerts_by_user = run_portfolio_alerts()
+                for uid, alerts in alerts_by_user.items():
+                    msg = format_portfolio_alerts_msg(alerts)
+                    push_message(uid, msg)
+                dlog("HEALTHCHECK-AUTO",
+                     f"持股警報：{len(alerts_by_user)} 位 user / "
+                     f"{sum(len(a) for a in alerts_by_user.values())} 則訊息")
+            except Exception as e:
+                dlog("HEALTHCHECK-AUTO", f"持股警報執行失敗：{type(e).__name__}: {e}")
+        else:
+            dlog("HEALTHCHECK-AUTO", "🔕 持股警報已關閉（owner 設定）")
     except Exception as e:
         dlog("HEALTHCHECK-AUTO", f"❌ 例外：{type(e).__name__}: {e}")
         try:
@@ -2251,10 +2313,16 @@ def _run_daily_healthcheck():
 
 
 def _schedule_next_healthcheck():
-    """計算到下一個台北時間 06:30 的秒數，設定 Timer"""
+    """計算到下一個台北時間 morning_report_time 的秒數，設定 Timer
+    v10.9.142：時間從 PUSH_SETTINGS['morning_report_time'] 讀（預設 06:30）"""
     try:
+        time_str = get_push_setting("morning_report_time", "06:30")
+        try:
+            hh, mm = [int(x) for x in time_str.split(":")]
+        except Exception:
+            hh, mm = 6, 30
         now = now_taipei()
-        next_run = now.replace(hour=6, minute=30, second=0, microsecond=0)
+        next_run = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if now >= next_run:
             next_run += timedelta(days=1)
         delay_seconds = (next_run - now).total_seconds()
@@ -2262,7 +2330,8 @@ def _schedule_next_healthcheck():
         timer.daemon = True
         timer.start()
         hours = delay_seconds / 3600
-        dlog("HEALTHCHECK-AUTO", f"⏰ 下次自動健檢：{next_run.strftime('%m/%d %H:%M')}（{hours:.1f} 小時後）")
+        dlog("HEALTHCHECK-AUTO",
+             f"⏰ 下次自動健檢：{next_run.strftime('%m/%d %H:%M')}（{hours:.1f} 小時後）")
     except Exception as e:
         dlog("HEALTHCHECK-AUTO", f"❌ 排程設定失敗：{type(e).__name__}: {e}")
 
@@ -12297,13 +12366,102 @@ def handle_message(event):
         dlog("HANDLER", "→ 系統管理")
         reply_flex(event.reply_token, make_system_mgmt_flex(), "系統管理")
         return
-    if text=="推播管理" and is_owner(user_id):
-        dlog("HANDLER", "→ 推播管理（開發中）")
-        reply_text(event.reply_token,
-            "📢 推播管理\n━━━━━━━━━━━━━━\n功能開發中 🚧\n\n後續版本將開放：\n　• 晨報推播\n　• 夜報推播\n　• 全體公告")
+    # v10.9.142：推播管理（owner only）
+    if text == "推播管理" and is_owner(user_id):
+        dlog("HANDLER", "→ 推播管理")
+        st = PUSH_SETTINGS
+        user_count = len(get_all_user_ids())
+        history = st.get("broadcast_history", [])
+        lines = [
+            "📢 推播管理（Owner）",
+            "━━━━━━━━━━━━━━",
+            "🕒 晨報時間：" + st.get("morning_report_time", "06:30"),
+            "💗 持股警報：" + ("✅ 開" if st.get("portfolio_alerts_enabled", True) else "❌ 關"),
+            "🩺 自動健檢：" + ("✅ 開" if st.get("healthcheck_enabled", True) else "❌ 關"),
+            f"👥 全體用戶數：{user_count}",
+            "",
+            "📝 設定指令：",
+            "　推播時間 HH:MM",
+            "　　例：推播時間 09:00",
+            "　推播 警報 on/off",
+            "　推播 健檢 on/off",
+            "　全體公告 [訊息]",
+            "　　例：全體公告 系統維護 22:00-23:00",
+            "",
+        ]
+        if history:
+            lines.append("📜 最近公告：")
+            for h in history[-3:]:
+                lines.append(f"　• {h.get('time','')}：{h.get('text','')[:30]}")
+        reply_text(event.reply_token, "\n".join(lines))
         return
+
+    # 設定晨報時間
+    m_time = re.match(r"^推播時間\s+(\d{1,2}):(\d{2})\s*$", text)
+    if m_time and is_owner(user_id):
+        hh, mm = int(m_time.group(1)), int(m_time.group(2))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            reply_text(event.reply_token, "❌ 時間格式錯誤，請用 HH:MM（24 小時制）")
+            return
+        set_push_setting("morning_report_time", f"{hh:02d}:{mm:02d}")
+        reply_text(event.reply_token,
+            f"✅ 已設定晨報時間：{hh:02d}:{mm:02d}\n"
+            f"⚠️ 排程在重啟後或下次觸發後生效")
+        return
+
+    # 開關設定
+    m_toggle = re.match(r"^推播\s+(警報|健檢)\s+(on|off|開|關)\s*$", text)
+    if m_toggle and is_owner(user_id):
+        target_zh = m_toggle.group(1)
+        flag = m_toggle.group(2).lower() in ("on", "開")
+        key = "portfolio_alerts_enabled" if target_zh == "警報" else "healthcheck_enabled"
+        set_push_setting(key, flag)
+        reply_text(event.reply_token,
+            f"✅ 已設定 {target_zh}：{'✅ 開' if flag else '❌ 關'}")
+        return
+
+    # 全體公告
+    if text.startswith("全體公告 ") and is_owner(user_id):
+        msg = text.replace("全體公告 ", "", 1).strip()
+        if not msg:
+            reply_text(event.reply_token, "❌ 公告內容為空")
+            return
+        uids = get_all_user_ids()
+        if not uids:
+            reply_text(event.reply_token, "❌ 沒有可推播的用戶")
+            return
+        full_msg = f"📢 慧股拾光官方公告\n━━━━━━━━━━━━━━\n{msg}"
+        ok_n = 0
+        for uid in uids:
+            try:
+                push_message(uid, full_msg)
+                ok_n += 1
+            except Exception as e:
+                dlog("BROADCAST", f"推給 {uid[:8]}... 失敗：{e}")
+        # 記錄歷史
+        history = PUSH_SETTINGS.get("broadcast_history", [])
+        history.append({
+            "time": now_taipei().strftime("%Y-%m-%d %H:%M"),
+            "text": msg[:200],
+            "sent": ok_n,
+            "total": len(uids),
+        })
+        # 只保留最近 20 筆
+        PUSH_SETTINGS["broadcast_history"] = history[-20:]
+        _save_push_settings(PUSH_SETTINGS)
+        reply_text(event.reply_token,
+            f"✅ 全體公告已送出\n推送：{ok_n}/{len(uids)} 位用戶")
+        return
+
+    # 舊版開發中訊息（fallback；只剩非 owner 才會看到）
+    if text == "推播管理":
+        reply_text(event.reply_token,
+            "📢 推播管理僅限 Owner 使用")
+        return
+    # AI 管理（v10.9.143 將取代為實際功能）
     if text=="AI管理" and is_owner(user_id):
-        dlog("HANDLER", "→ AI 管理（開發中）")
+        dlog("HANDLER", "→ AI 管理")
+        # 將在 v10.9.143 實作完整內容；此處先保留 placeholder
         reply_text(event.reply_token,
             "🤖 AI 管理\n━━━━━━━━━━━━━━\n功能開發中 🚧\n\n後續版本將開放：\n　• AI 模型參數調整\n　• 觀察演算法設定\n　• 評分權重配置")
         return
