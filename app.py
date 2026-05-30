@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.142"
+VERSION              = "10.9.143"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5413,10 +5413,71 @@ GROQ_AVAILABLE = bool(GROQ_API_KEY)
 NEWS_AI_CACHE = {}
 NEWS_AI_CACHE_TTL = 3600  # 1 小時
 
+# ──────────────────────────────────────────
+# v10.9.143：AI 統計 / 開關（owner 控制）
+# ──────────────────────────────────────────
+AI_STATS_FILE = "/tmp/lumistock_ai_stats.json"
+DEFAULT_AI_STATS = {
+    "ai_enabled": True,                 # owner runtime 開關
+    "calls_today": 0,
+    "calls_total": 0,
+    "errors_today": [],                 # [(ts, error_str), ...] 最多 10 筆
+    "last_reset_date": "",
+    "last_call_ts": 0,
+    "last_model": GROQ_MODEL,
+}
+
+def _load_ai_stats() -> dict:
+    try:
+        if os.path.exists(AI_STATS_FILE):
+            with open(AI_STATS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                for k, v in DEFAULT_AI_STATS.items():
+                    d.setdefault(k, v)
+                return d
+    except Exception as e:
+        dlog("AI_STATS", f"讀取失敗：{e}")
+    return dict(DEFAULT_AI_STATS)
+
+def _save_ai_stats(d: dict) -> None:
+    try:
+        with open(AI_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dlog("AI_STATS", f"寫入失敗：{e}")
+
+AI_STATS = _load_ai_stats()
+
+def _maybe_reset_ai_daily():
+    """每日台北 0 點重置 calls_today / errors_today"""
+    today = now_taipei().strftime("%Y-%m-%d")
+    if AI_STATS.get("last_reset_date") != today:
+        AI_STATS["calls_today"] = 0
+        AI_STATS["errors_today"] = []
+        AI_STATS["last_reset_date"] = today
+        _save_ai_stats(AI_STATS)
+
+def ai_record_call(success: bool, error_str: str = ""):
+    _maybe_reset_ai_daily()
+    AI_STATS["calls_today"] += 1
+    AI_STATS["calls_total"] += 1
+    AI_STATS["last_call_ts"] = time.time()
+    if not success and error_str:
+        # 只保留最近 10 筆錯誤
+        AI_STATS["errors_today"].append(
+            (now_taipei().strftime("%H:%M"), error_str[:120]))
+        AI_STATS["errors_today"] = AI_STATS["errors_today"][-10:]
+    _save_ai_stats(AI_STATS)
+
+def is_ai_enabled() -> bool:
+    """runtime 開關 + API key 雙條件"""
+    return bool(GROQ_AVAILABLE) and AI_STATS.get("ai_enabled", True)
+
 
 def groq_chat(messages: list, max_tokens: int = 1500, temperature: float = 0.2, timeout: int = 8) -> str:
-    """呼叫 Groq Chat API，回傳純文字。失敗時回傳空字串"""
-    if not GROQ_AVAILABLE:
+    """呼叫 Groq Chat API，回傳純文字。失敗時回傳空字串
+    v10.9.143：受 is_ai_enabled() 控制 + 統計呼叫次數 / 錯誤"""
+    if not is_ai_enabled():
         return ""
     try:
         headers = {
@@ -5433,26 +5494,32 @@ def groq_chat(messages: list, max_tokens: int = 1500, temperature: float = 0.2, 
         if r.status_code == 200:
             data = r.json()
             record_health("Groq AI", True)
+            ai_record_call(True)
             return data["choices"][0]["message"]["content"].strip()
         elif r.status_code == 429:
             dlog("GROQ", f"⏸️ 達到速率限制（429），暫時降級為規則式")
             record_health("Groq AI", False, "rate limit 429")
+            ai_record_call(False, "429 rate limit")
             return ""
         elif r.status_code == 413:
             dlog("GROQ", f"📏 請求太大（413），可能批次太多新聞")
             record_health("Groq AI", False, "payload too large 413")
+            ai_record_call(False, "413 payload")
             return ""
         else:
             dlog("GROQ", f"❌ API 錯誤 HTTP {r.status_code}: {r.text[:200]}")
             record_health("Groq AI", False, f"HTTP {r.status_code}")
+            ai_record_call(False, f"HTTP {r.status_code}")
             return ""
     except requests.Timeout:
         dlog("GROQ", "⏱️ API 超時（>8s）")
         record_health("Groq AI", False, "timeout")
+        ai_record_call(False, "timeout")
         return ""
     except Exception as e:
         dlog("GROQ", f"❌ 呼叫失敗：{e}")
         record_health("Groq AI", False, f"{type(e).__name__}: {e}")
+        ai_record_call(False, f"{type(e).__name__}")
         return ""
 
 
@@ -12458,12 +12525,65 @@ def handle_message(event):
         reply_text(event.reply_token,
             "📢 推播管理僅限 Owner 使用")
         return
-    # AI 管理（v10.9.143 將取代為實際功能）
-    if text=="AI管理" and is_owner(user_id):
+    # v10.9.143：AI 管理（owner only）
+    if text in ["AI管理", "AI 管理"] and is_owner(user_id):
         dlog("HANDLER", "→ AI 管理")
-        # 將在 v10.9.143 實作完整內容；此處先保留 placeholder
-        reply_text(event.reply_token,
-            "🤖 AI 管理\n━━━━━━━━━━━━━━\n功能開發中 🚧\n\n後續版本將開放：\n　• AI 模型參數調整\n　• 觀察演算法設定\n　• 評分權重配置")
+        _maybe_reset_ai_daily()
+        ai_on = is_ai_enabled()
+        api_ok = bool(GROQ_AVAILABLE)
+        runtime_on = AI_STATS.get("ai_enabled", True)
+        last_ts = AI_STATS.get("last_call_ts", 0)
+        last_str = (datetime.fromtimestamp(last_ts).strftime("%m/%d %H:%M")
+                    if last_ts else "尚無")
+        errors = AI_STATS.get("errors_today", [])
+        lines = [
+            "🤖 AI 管理（Owner）",
+            "━━━━━━━━━━━━━━",
+            f"🔌 API 狀態：{'✅ 已設定' if api_ok else '❌ 未設定 (GROQ_API_KEY)'}",
+            f"🎛 Runtime 開關：{'✅ 啟用' if runtime_on else '❌ 關閉'}",
+            f"💡 實際是否可用：{'✅ 可用' if ai_on else '❌ 不可用'}",
+            f"🧠 模型：{AI_STATS.get('last_model', GROQ_MODEL)}",
+            "",
+            "📊 今日統計",
+            f"　呼叫次數：{AI_STATS.get('calls_today', 0)}",
+            f"　累計呼叫：{AI_STATS.get('calls_total', 0)}",
+            f"　今日錯誤：{len(errors)}",
+            f"　最後呼叫：{last_str}",
+            "",
+        ]
+        if errors:
+            lines.append("⚠️ 今日最近錯誤：")
+            for t, msg in errors[-5:]:
+                lines.append(f"　{t}　{msg}")
+            lines.append("")
+        lines += [
+            "📝 控制指令：",
+            "　AI 開　／　AI 關",
+            "　AI 重置統計（清除 calls_today / errors）",
+            "",
+            "ℹ️ AI 關閉時：問答、新聞 AI 解讀、",
+            "　觀察清單 AI 分析全部走規則式 fallback，",
+            "　但 LINE bot 其他功能照常運作。",
+        ]
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+
+    # AI 開 / 關
+    if text in ["AI 開", "AI開", "AI on", "ai on"] and is_owner(user_id):
+        AI_STATS["ai_enabled"] = True
+        _save_ai_stats(AI_STATS)
+        reply_text(event.reply_token, "✅ AI 已啟用\n問答 / 新聞解讀 / 觀察清單 AI 分析皆恢復")
+        return
+    if text in ["AI 關", "AI關", "AI off", "ai off"] and is_owner(user_id):
+        AI_STATS["ai_enabled"] = False
+        _save_ai_stats(AI_STATS)
+        reply_text(event.reply_token, "🔕 AI 已關閉\n所有 AI 功能將降級為規則式 fallback")
+        return
+    if text in ["AI 重置統計", "AI重置統計", "AI reset"] and is_owner(user_id):
+        AI_STATS["calls_today"] = 0
+        AI_STATS["errors_today"] = []
+        _save_ai_stats(AI_STATS)
+        reply_text(event.reply_token, "✅ 已重置今日 AI 統計")
         return
 
     # ══ 子選單 ══
