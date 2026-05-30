@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.138"
+VERSION              = "10.9.139"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3719,11 +3719,15 @@ def push_to_owner(text):
         return False
 
 def push_message(user_id: str, text: str):
+    """v10.9.139：原本 except: pass 完全靜默吞錯，現在記 log 才看得到 LINE API 失敗（429/token 過期/網路）。"""
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(
                 PushMessageRequest(to=user_id, messages=[TextMessage(text=text)]))
-    except: pass
+    except Exception as e:
+        # 截前 80 字以免 log 爆
+        preview = (text or "")[:80].replace("\n", " ")
+        dlog("PUSH_MSG", f"❌ {type(e).__name__}: {str(e)[:120]} | text='{preview}'")
 
 def push_text_with_qr(user_id: str, text: str, qr_pairs: list):
     """v10.9.74：push 文字訊息並附 Quick Reply 浮標。qr_pairs = [(label, text), ...]"""
@@ -10222,7 +10226,10 @@ def _assess_overheating(tw: dict, closes: list, score_breakdown: dict) -> str:
     if not closes or len(closes) < 20:
         return "normal"
 
-    price = tw.get("price", 0)
+    # v10.9.139：price 可能是 None，保護後續算術
+    price = (tw or {}).get("price") or 0
+    if not price:
+        return "normal"
     pct_5d  = score_breakdown.get("pct_5d",  _chg_pct(closes, 5))
     pct_20d = score_breakdown.get("pct_20d", _chg_pct(closes, 20))
     rsi     = score_breakdown.get("rsi",     _rsi(closes))
@@ -10292,13 +10299,14 @@ def _compute_4layer_scores(filter_type: str, breakdown: dict,
     pct_5d  = breakdown.get("pct_5d",  _chg_pct(closes, 5)  if closes else 0)
     pct_20d = breakdown.get("pct_20d", _chg_pct(closes, 20) if closes else 0)
     if closes and len(closes) >= 60:
-        price = tw.get("price") or closes[-1]
+        # v10.9.139：price 可能 None
+        price = (tw or {}).get("price") or closes[-1]
         ma5  = _ma(closes, 5)
         ma20 = _ma(closes, 20)
         ma60 = _ma(closes, 60)
         if ma5 and ma20 and ma60 and ma5 > ma20 > ma60:  trend += 15  # 多頭排列
-        elif ma20 and price > ma20:                       trend += 8
-        if ma60 and price < ma60:                         trend -= 10
+        elif ma20 and price and price > ma20:             trend += 8
+        if ma60 and price and price < ma60:               trend -= 10
     if pct_20d > 10:  trend += 12
     elif pct_20d > 0: trend += 5
     elif pct_20d < -10: trend -= 20
@@ -10317,8 +10325,9 @@ def _compute_4layer_scores(filter_type: str, breakdown: dict,
     if closes and len(closes) >= 60:
         recent = closes[-60:]
         lo, hi = min(recent), max(recent)
-        price = tw.get("price") or closes[-1]
-        if hi > lo:
+        # v10.9.139：price 可能 None
+        price = (tw or {}).get("price") or closes[-1]
+        if price and hi > lo:
             pos_pct = (price - lo) / (hi - lo)   # 0 = 60 日低、1 = 60 日高
             if pos_pct < 0.3: position += 10     # 接近低檔（好進場）
             elif pos_pct > 0.9: position -= 10   # 已在高檔
@@ -10472,7 +10481,9 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
                     s["excludes"] = excludes
 
                 rec = {
-                    "sid": sid, "name": tw["name"], "price": tw["price"], "pct": tw["pct"],
+                    "sid": sid, "name": tw["name"],
+                    "price": tw.get("price") or 0,        # v10.9.139：防 None
+                    "pct": tw.get("pct") or 0,
                     "score": s.get("total", 0),
                     "breakdown": s,
                     "excludes": s.get("excludes", []),
@@ -10482,6 +10493,7 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
                     "chip_signals": [],
                     "support": None, "resistance": None,
                     "stop_loss": None, "target": None,
+                    "_closes_cache": closes,              # v10.9.139：reuse 避免重抓
                 }
                 # 算支撐壓力
                 if closes and len(closes) >= 5:
@@ -10498,24 +10510,34 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
 
         scored = []
         t0 = time.time()
+        n_err = 0
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(_fetch_and_score_one, sid): sid for sid in sids}
             for fut in as_completed(futures):
-                rec = fut.result()
-                if rec: scored.append(rec)
+                # v10.9.139：單檔 worker exception 不能擊垮整個流程
+                try:
+                    rec = fut.result()
+                    if rec: scored.append(rec)
+                except Exception as e:
+                    n_err += 1
+                    dlog("REC_FILTER",
+                         f"{filter_type} worker {futures[fut]} raise："
+                         f"{type(e).__name__}: {str(e)[:120]}")
         dlog("REC_FILTER",
              f"{filter_type} 並行 fetch 完成：{len(scored)}/{len(sids)} 檔 "
-             f"耗時 {time.time()-t0:.1f}s")
+             f"耗時 {time.time()-t0:.1f}s (worker error {n_err})")
 
         scored.sort(key=lambda x: x["score"], reverse=True)
 
         # v10.9.136：品質門檻過濾 + 4 層總檢查（分類各自權重）+ 過熱分級
+        # v10.9.139：reuse 並行 fetch 已抓的 closes，避免重抓；price=None 防護
         qualified = []
         for s in scored:
             if s["score"] < MIN_SCORE_FOR_RECOMMENDATION:
                 continue
-            closes_for_assess = get_tw_closes(s["sid"]) or []
-            tw_min = {"price": s["price"]}
+            closes_for_assess = s.get("_closes_cache") or []
+            safe_price = s.get("price") or 0
+            tw_min = {"price": safe_price}
             overheat = _assess_overheating(tw_min, closes_for_assess, s["breakdown"])
 
             # v10.9.136：算 4 層分數 + 分類加權的 final_check_score
@@ -10643,14 +10665,22 @@ def build_and_push_themed_tw_recommendation(user_id: str, theme_keys: list, disp
 
         scored = []
         t0 = time.time()
+        n_err = 0
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(_fetch_themed_one, sid) for sid in sids]
             for fut in as_completed(futures):
-                r = fut.result()
-                if r: scored.append(r)
+                # v10.9.139：worker exception 不擊垮整個 flow
+                try:
+                    r = fut.result()
+                    if r: scored.append(r)
+                except Exception as e:
+                    n_err += 1
+                    dlog("REC_THEME",
+                         f"{display_name} worker raise："
+                         f"{type(e).__name__}: {str(e)[:120]}")
         dlog("REC_THEME",
              f"{display_name} 並行 fetch 完成：{len(scored)}/{len(sids)} 檔 "
-             f"耗時 {time.time()-t0:.1f}s")
+             f"耗時 {time.time()-t0:.1f}s (worker error {n_err})")
         scored.sort(key=lambda x: x["score"], reverse=True)
         top5 = scored[:5]
         if not top5:
