@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.140"
+VERSION              = "10.9.141"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4006,11 +4006,14 @@ def make_ai_menu_flex() -> dict:
          ("🇹🇼 台股觀察清單","台股觀察"),
          ("🇺🇸 美股觀察清單","美股觀察"),
          ("🤖 AI 概念","AI概念觀察"),
-         # ── 4 大 filter（v10.9.133 對應規格）
+         # ── 8 大 filter（v10.9.133 / v10.9.141 對應規格）
          ("📈 趨勢股","趨勢股"),
          ("🌱 成長股","成長股"),
          ("💰 存股","存股"),
          ("🌊 波段股","波段股"),
+         ("🔄 低基期股","低基期股"),
+         ("💼 籌碼集中","籌碼集中"),
+         ("🛡️ 防禦股","防禦股"),
          # ── 題材觀察（v10.9.130）
          ("💎 半導體","半導體觀察"),
          ("🍎 蘋概股","蘋概股觀察"),
@@ -10220,6 +10223,350 @@ def exclude_swing_stock(closes: list, score_breakdown: dict) -> list:
     return reasons
 
 
+# ═══════════════════════════════════════════════════════════════
+# v10.9.141：補 4 個分類評分（低基期轉強 / AI 概念 / 籌碼集中 / 防禦型）
+# 每個分類有自己的子權重（不是統一公式）；4 層總檢查走 CATEGORY_4LAYER_WEIGHTS
+# ═══════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────
+# 5️⃣ 低基期轉強股（位階 35 + 轉強訊號 30 + 籌碼回補 20 + 風控 15）
+# 重點：股價低位階、基本面止穩、籌碼轉強、技術剛轉多
+# ─────────────────────────────────────────
+def score_pullback_stock(tw: dict, closes: list, chip: dict,
+                         financials: dict, monthly_revenue: list) -> dict:
+    price = tw.get("price", 0) or 0
+    pct_5d  = _chg_pct(closes, 5)  if closes else 0
+    pct_20d = _chg_pct(closes, 20) if closes else 0
+    pct_60d = _chg_pct(closes, 60) if closes else 0
+    pct_120d = _chg_pct(closes, 120) if closes else 0
+
+    # ── 1. 位階 0-35 ──：股價在過去 120/60 日相對低位
+    pos = 0
+    if closes and len(closes) >= 120 and price:
+        recent120 = closes[-120:]
+        lo120, hi120 = min(recent120), max(recent120)
+        if hi120 > lo120:
+            pos_pct = (price - lo120) / (hi120 - lo120)  # 0=低、1=高
+            if pos_pct < 0.30: pos += 20       # 接近 120 日低
+            elif pos_pct < 0.45: pos += 14
+            elif pos_pct < 0.60: pos += 6
+    # 中長期跌幅大（低基期前提）
+    if pct_120d < -20: pos += 10
+    elif pct_120d < -10: pos += 5
+    # 60 日已止跌（不再續跌）
+    if -5 < pct_60d < 10: pos += 5
+
+    # ── 2. 轉強訊號 0-30 ──：短期由弱轉強
+    turn = 0
+    ma5 = _ma(closes, 5) if closes else None
+    ma20 = _ma(closes, 20) if closes else None
+    ma60 = _ma(closes, 60) if closes else None
+    # 站上 5 日線 + 20 日線（剛轉多）
+    if ma5 and price > ma5: turn += 8
+    if ma20 and price > ma20: turn += 8
+    # 5 日線突破 20 日線（黃金交叉前兆）
+    if ma5 and ma20 and ma5 > ma20: turn += 7
+    # 5/20 日漲幅轉正
+    if pct_5d > 2 and pct_20d > 0: turn += 7
+
+    # ── 3. 籌碼回補 0-20 ──：法人由賣轉買
+    chip_s = 0
+    fn = chip.get("foreign_net", 0) if chip else 0
+    tn = chip.get("trust_net", 0) if chip else 0
+    if fn > 0: chip_s += 10
+    if tn > 0: chip_s += 7
+    if fn > 500 and tn > 0: chip_s += 3   # 法人共同回補
+
+    # ── 4. 風控 0-15 ──：基本面有止穩跡象
+    risk = 0
+    if financials:
+        eps = financials.get("eps")
+        if eps is not None and eps > 0: risk += 8     # 還有獲利
+        elif eps is not None and eps > -1: risk += 4  # 微虧但不慘
+    if monthly_revenue and len(monthly_revenue) >= 2:
+        yoys = [r.get("yoy_pct", 0) for r in monthly_revenue[:2]]
+        avg_yoy = sum(yoys) / len(yoys)
+        if avg_yoy > -5: risk += 7       # 營收不再大幅衰退
+        elif avg_yoy > -15: risk += 3
+
+    return {
+        "total": pos + turn + chip_s + risk,
+        "position_score": pos, "turn": turn,
+        "chip": chip_s, "risk": risk,
+        "pct_5d": pct_5d, "pct_20d": pct_20d,
+        "pct_60d": pct_60d, "pct_120d": pct_120d,
+    }
+
+def exclude_pullback_stock(tw: dict, closes: list, financials: dict,
+                            monthly_revenue: list, score_breakdown: dict) -> list:
+    reasons = []
+    # 中長期仍續跌（沒有止跌）
+    pct_60d = score_breakdown.get("pct_60d", 0)
+    if pct_60d < -15:
+        reasons.append(f"60 日跌 {pct_60d:.0f}%，仍在主跌段")
+    # 基本面崩壞
+    eps = financials.get("eps") if financials else None
+    if eps is not None and eps < -1:
+        reasons.append(f"EPS {eps:.2f} 大虧，非單純低基期")
+    if monthly_revenue and len(monthly_revenue) >= 3:
+        recent = [r.get("yoy_pct", 0) for r in monthly_revenue[:3]]
+        if all(y < -15 for y in recent):
+            reasons.append("近 3 月營收年減 > 15%，基本面持續惡化")
+    # 短期反彈過頭（不是「剛轉強」而是「已轉強」）
+    pct_20d = score_breakdown.get("pct_20d", 0)
+    if pct_20d > 30:
+        reasons.append(f"20 日漲 {pct_20d:.0f}%，已不是低基期")
+    return reasons
+
+
+# ─────────────────────────────────────────
+# 6️⃣ AI / 科技概念股（題材實質性 30 + 趨勢 25 + 籌碼 20 + 風險 25）
+# 重點：產業題材、實質受惠程度、營收連動性、供應鏈位置、新聞可信度
+# ─────────────────────────────────────────
+def score_concept_stock(tw: dict, closes: list, chip: dict,
+                        financials: dict, monthly_revenue: list,
+                        industry: str, news_sentiment: int) -> dict:
+    # ── 1. 題材實質性 0-30 ──：用產業 + 營收成長確認「真受惠」
+    sub = 0
+    growth_inds = ["半導體", "電子零組件", "光電", "電腦及週邊", "通信網路",
+                   "其他電子", "電子工業", "電機機械"]
+    if industry and any(g in industry for g in growth_inds):
+        sub += 12
+    # 月營收年增（有營收 = 有實質受惠）
+    if monthly_revenue and len(monthly_revenue) >= 2:
+        yoys = [r.get("yoy_pct", 0) for r in monthly_revenue[:3]]
+        avg_yoy = sum(yoys) / len(yoys)
+        if avg_yoy > 30: sub += 18
+        elif avg_yoy > 15: sub += 13
+        elif avg_yoy > 5: sub += 7
+        elif avg_yoy < 0: sub -= 5
+
+    # ── 2. 趨勢 0-25 ──：技術走多 + 動能
+    trend = 0
+    price = tw.get("price", 0) or 0
+    ma5 = _ma(closes, 5) if closes else None
+    ma20 = _ma(closes, 20) if closes else None
+    ma60 = _ma(closes, 60) if closes else None
+    pct_20d = _chg_pct(closes, 20) if closes else 0
+    if ma5 and ma20 and ma60 and ma5 > ma20 > ma60: trend += 12  # 多頭排列
+    elif ma20 and price > ma20: trend += 7
+    if pct_20d > 15: trend += 8
+    elif pct_20d > 5: trend += 4
+    if news_sentiment > 0: trend += 5
+
+    # ── 3. 籌碼 0-20 ──：法人是否同步買
+    chip_s = 0
+    fn = chip.get("foreign_net", 0) if chip else 0
+    tn = chip.get("trust_net", 0) if chip else 0
+    if fn > 0: chip_s += 8
+    if tn > 0: chip_s += 7
+    if fn > 1000: chip_s += 5
+
+    # ── 4. 風險（這裡是加分項，等於「風險低」的程度）0-25 ──
+    safe = 25
+    eps = financials.get("eps") if financials else None
+    if eps is not None and eps < 0: safe -= 12   # 虧損 = 只有題材沒有實質
+    gm = financials.get("gross_margin") if financials else None
+    if gm is not None and gm < 10: safe -= 8
+    if pct_20d > 40: safe -= 8                   # 漲多了風險高
+
+    return {
+        "total": sub + trend + chip_s + safe,
+        "substance": sub, "trend": trend,
+        "chip": chip_s, "safety": safe,
+        "pct_20d": pct_20d,
+        "avg_yoy": (sum([r.get("yoy_pct",0) for r in monthly_revenue[:3]]) /
+                    max(1, len(monthly_revenue[:3]))) if monthly_revenue else 0,
+    }
+
+def exclude_concept_stock(tw: dict, financials: dict,
+                          monthly_revenue: list, score_breakdown: dict) -> list:
+    reasons = []
+    avg_yoy = score_breakdown.get("avg_yoy", 0)
+    eps = financials.get("eps") if financials else None
+    # 純題材無營收
+    if avg_yoy < -10:
+        reasons.append(f"近 3 月營收年減 {avg_yoy:.0f}%，題材未轉化為營收")
+    if eps is not None and eps < -1:
+        reasons.append(f"EPS {eps:.2f} 大虧，純題材無基本面")
+    # 漲過頭
+    pct_20d = score_breakdown.get("pct_20d", 0)
+    if pct_20d > 50:
+        reasons.append(f"20 日漲 {pct_20d:.0f}%，題材已被充分反映")
+    return reasons
+
+
+# ─────────────────────────────────────────
+# 7️⃣ 籌碼集中股（法人連買 40 + 集中度 25 + 量價配合 20 + 風控 15）
+# 重點：法人、投信、主力、融資融券、籌碼集中度
+# ─────────────────────────────────────────
+def score_chip_stock(tw: dict, closes: list, chip: dict,
+                     chip_history: list = None) -> dict:
+    # chip_history：近 5 日 chip 變化（list of dict），若有更精細
+    # ── 1. 法人連買 0-40 ──
+    inst = 0
+    fn = chip.get("foreign_net", 0) if chip else 0
+    tn = chip.get("trust_net", 0)   if chip else 0
+    dn = chip.get("dealer_net", 0)  if chip else 0
+    if fn > 0:    inst += 12
+    if fn > 500:  inst += 5
+    if fn > 2000: inst += 5
+    if tn > 0:    inst += 8
+    if tn > 200:  inst += 3
+    if dn > 0:    inst += 4
+    if fn > 0 and tn > 0:  inst += 3        # 外資+投信同買
+
+    # ── 2. 集中度 0-25 ──：用法人累積買超 / 流通張數估
+    conc = 0
+    # 簡化版：fn + tn 越大、相對股本越集中
+    total_inst = (fn or 0) + (tn or 0) + (dn or 0)
+    if total_inst > 5000: conc += 18
+    elif total_inst > 2000: conc += 12
+    elif total_inst > 500: conc += 6
+    if total_inst > 0 and (fn > 0 and tn > 0): conc += 7   # 多方共識
+
+    # ── 3. 量價配合 0-20 ──：股價漲 + 法人買 = 良性
+    vp = 0
+    pct_5d  = _chg_pct(closes, 5)  if closes else 0
+    pct_20d = _chg_pct(closes, 20) if closes else 0
+    if pct_5d > 0 and (fn > 0 or tn > 0): vp += 10
+    if pct_20d > 5 and total_inst > 0:    vp += 10
+
+    # ── 4. 風控 0-15 ──：籌碼穩定性
+    risk = 15
+    if pct_5d < -5: risk -= 8           # 股價跌但要看法人是否撐
+    if total_inst < 0: risk -= 7        # 法人轉賣
+    risk = max(0, risk)
+
+    return {
+        "total": inst + conc + vp + risk,
+        "inst": inst, "conc": conc, "vp": vp, "risk": risk,
+        "fn": fn, "tn": tn, "dn": dn,
+        "pct_5d": pct_5d, "pct_20d": pct_20d,
+    }
+
+def exclude_chip_stock(chip: dict, score_breakdown: dict) -> list:
+    reasons = []
+    fn = score_breakdown.get("fn", 0)
+    tn = score_breakdown.get("tn", 0)
+    # 法人賣
+    if fn < -500: reasons.append(f"外資賣 {abs(fn)} 張，籌碼鬆動")
+    if tn < -300: reasons.append(f"投信賣 {abs(tn)} 張，籌碼鬆動")
+    # 集中度不夠
+    total = (fn or 0) + (tn or 0)
+    if total < 100:
+        reasons.append("法人合計買超不足，未見明顯集中")
+    return reasons
+
+
+# ─────────────────────────────────────────
+# 8️⃣ 防禦型股票（穩定 40 + 配息 25 + 低波 20 + 抗跌 15）
+# 重點：電信、民生、公用、穩定現金流、高股息 ETF 類型
+# ─────────────────────────────────────────
+def score_defensive_stock(tw: dict, closes: list, financials: dict,
+                          ex_div_cash: float = 0) -> dict:
+    price = tw.get("price", 0) or 0
+
+    # ── 1. 穩定獲利 0-40 ──：營業利益、EPS 維持正
+    stable = 0
+    gm = financials.get("gross_margin") if financials else None
+    om = financials.get("operating_margin") if financials else None
+    eps = financials.get("eps") if financials else None
+    if gm is not None and gm > 20: stable += 12
+    elif gm is not None and gm > 10: stable += 7
+    if om is not None and om > 10: stable += 12
+    elif om is not None and om > 5: stable += 7
+    if eps is not None and eps > 2: stable += 16
+    elif eps is not None and eps > 1: stable += 10
+    elif eps is not None and eps > 0: stable += 5
+
+    # ── 2. 配息 0-25 ──
+    div = 0
+    if ex_div_cash and price:
+        y = ex_div_cash / price * 100
+        if y >= 5: div = 25
+        elif y >= 4: div = 20
+        elif y >= 3: div = 14
+        elif y >= 2: div = 8
+        else: div = 3
+
+    # ── 3. 低波動 0-20 ──：σ / 均價 越小越好
+    vol = 0
+    if closes and len(closes) >= 20:
+        recent = closes[-20:]
+        avg = sum(recent) / len(recent)
+        var = sum((c - avg) ** 2 for c in recent) / len(recent)
+        std = var ** 0.5
+        vp = std / avg * 100 if avg else 100
+        if vp < 1.5: vol = 20
+        elif vp < 3:  vol = 14
+        elif vp < 5:  vol = 7
+
+    # ── 4. 抗跌 0-15 ──：60 日跌幅小（市場跌時抗跌）
+    resist = 0
+    pct_60d = _chg_pct(closes, 60) if closes else 0
+    if pct_60d > 0: resist = 15
+    elif pct_60d > -5: resist = 10
+    elif pct_60d > -10: resist = 5
+
+    return {
+        "total": stable + div + vol + resist,
+        "stable": stable, "div": div,
+        "vol_score": vol, "resist": resist,
+        "yield_pct": (ex_div_cash / price * 100) if (ex_div_cash and price) else 0,
+        "pct_60d": pct_60d,
+    }
+
+def exclude_defensive_stock(tw: dict, closes: list, financials: dict,
+                            score_breakdown: dict) -> list:
+    reasons = []
+    eps = financials.get("eps") if financials else None
+    pct_60d = score_breakdown.get("pct_60d", 0)
+    if eps is not None and eps < 0:
+        reasons.append("EPS 虧損，不符防禦型條件")
+    if pct_60d < -15:
+        reasons.append(f"60 日跌 {pct_60d:.0f}%，抗跌性不足")
+    return reasons
+
+
+# 候選股池 — 4 個新分類
+TW_PULLBACK_UNIVERSE = []   # 動態：從整體 universe 篩 60 日跌 > 10% 的
+TW_CHIP_UNIVERSE = []       # 動態：從 institution top 法人買超榜
+TW_DEFENSIVE_UNIVERSE = [
+    # 電信
+    "2412","3045","4904",
+    # 民生 / 食品
+    "1216","1227","1229","1234","1326","1218","2912","2615",
+    # 公用 / 鋼鐵 / 大型穩健
+    "1101","1102","2002","2207","2105","9904",
+    # 高股息 ETF
+    "0056","00878","00919","00929","00940","00713",
+]
+
+def _get_tw_pullback_candidates() -> list:
+    """v10.9.141：低基期候選 — 從常見大型/題材股中找 60 日跌幅 > 10% 的"""
+    pool = set()
+    # 從 TW_CONCEPT_STOCKS 大池子撈
+    for t, d in TW_CONCEPT_STOCKS.items():
+        for entry in d.get("leaders", []) + d.get("potential", []):
+            sid = entry.split()[0] if entry else ""
+            if sid: pool.add(sid)
+    # 加上常見權值（不一定是題材股）
+    for sid in ["2330","2317","2454","2308","2412","6505","2882","2002"]:
+        pool.add(sid)
+    return list(pool)[:30]
+
+def _get_tw_chip_candidates() -> list:
+    """v10.9.141：籌碼集中候選 — 法人連買榜（已有 fetch_institution_data）"""
+    try:
+        tse_cands, _, _ = fetch_institution_data()
+        tpex = fetch_tpex_institution_data() or []
+        sids = list({c[0] for c in (tse_cands + tpex)})
+        return sids[:30]
+    except Exception:
+        return []
+
+
 # ─────────────────────────────────────────
 # 候選股池
 # ─────────────────────────────────────────
@@ -10485,6 +10832,32 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
             sids = _get_tw_swing_candidates()[:30]
             display = "🌊 台股波段股觀察清單"
             weights_label = "技術 45 / 量價 25 / 新聞 15 / 風控 15"
+        # v10.9.141：4 個新分類
+        elif filter_type == "pullback":
+            sids = _get_tw_pullback_candidates()
+            display = "🔄 台股低基期轉強股觀察清單"
+            weights_label = "位階 35 / 轉強訊號 30 / 籌碼回補 20 / 風控 15"
+        elif filter_type == "concept":
+            # AI / 科技概念合併池
+            sids = set()
+            for t in ["AI 伺服器", "半導體", "半導體封測", "電動車",
+                      "HBM 記憶體", "散熱 / 液冷", "機器人", "矽光子",
+                      "生成式 AI / ChatGPT"]:
+                d = TW_CONCEPT_STOCKS.get(t, {})
+                for entry in d.get("leaders", []) + d.get("potential", []):
+                    sid = entry.split()[0] if entry else ""
+                    if sid: sids.add(sid)
+            sids = list(sids)[:30]
+            display = "🤖 台股 AI / 科技概念股觀察清單"
+            weights_label = "題材實質 30 / 趨勢 25 / 籌碼 20 / 風險 25"
+        elif filter_type == "chip":
+            sids = _get_tw_chip_candidates()
+            display = "💼 台股籌碼集中股觀察清單"
+            weights_label = "法人連買 40 / 集中度 25 / 量價 20 / 風控 15"
+        elif filter_type == "defensive":
+            sids = TW_DEFENSIVE_UNIVERSE[:30]
+            display = "🛡️ 台股防禦型股觀察清單"
+            weights_label = "穩定獲利 40 / 配息 25 / 低波動 20 / 抗跌 15"
         else:
             push_message(user_id, f"❌ 未知分類：{filter_type}")
             return
@@ -10525,6 +10898,28 @@ def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
                 elif filter_type == "swing":
                     s = score_swing_stock(tw, closes, ns.get("score", 0))
                     excludes = exclude_swing_stock(closes, s)
+                # v10.9.141：4 個新分類
+                elif filter_type == "pullback":
+                    mthrev = _load_finmind_monthly_revenue(sid) or []
+                    fin = _load_finmind_financials(sid) or {}
+                    s = score_pullback_stock(tw, closes, chip, fin, mthrev)
+                    excludes = exclude_pullback_stock(tw, closes, fin, mthrev, s)
+                elif filter_type == "concept":
+                    mthrev = _load_finmind_monthly_revenue(sid) or []
+                    fin = _load_finmind_financials(sid) or {}
+                    ind = INDUSTRY_CACHE.get(sid, "")
+                    s = score_concept_stock(tw, closes, chip, fin, mthrev,
+                                            ind, ns.get("score", 0))
+                    excludes = exclude_concept_stock(tw, fin, mthrev, s)
+                elif filter_type == "chip":
+                    s = score_chip_stock(tw, closes, chip)
+                    excludes = exclude_chip_stock(chip, s)
+                elif filter_type == "defensive":
+                    fin = _load_finmind_financials(sid) or {}
+                    adv = _get_portfolio_advice(sid)
+                    cash_div = adv.get("ex_div_cash", 0) if adv else 0
+                    s = score_defensive_stock(tw, closes, fin, cash_div)
+                    excludes = exclude_defensive_stock(tw, closes, fin, s)
                 else:
                     return None
 
@@ -12146,11 +12541,16 @@ def handle_message(event):
             return
 
     # v10.9.133：4 分類獨立評分（對應 project_recommendation_spec.md）
+    # v10.9.141：補滿 8 分類
     FILTER_TRIGGER_MAP = {
         ("趨勢觀察", "趨勢股", "台股趨勢股", "趨勢觀察清單"): ("trend", "📈 台股趨勢股觀察清單", "技術 40% / 籌碼 25% / 動能 20% / 新聞 15%"),
         ("成長觀察", "成長股", "台股成長股", "成長觀察清單"): ("growth", "🌱 台股成長股觀察清單", "基本面 45% / 營收成長 25% / 產業 15% / 技術 15%"),
         ("存股觀察", "存股", "台股存股", "存股清單"): ("stable", "💰 台股存股觀察清單", "配息 35% / 財務安全 30% / 獲利穩定 20% / 低波動 15%"),
         ("波段觀察", "波段股", "台股波段股", "波段觀察清單"): ("swing", "🌊 台股波段股觀察清單", "技術 45% / 量價 25% / 新聞 15% / 風控 15%"),
+        ("低基期", "低基期股", "低基期轉強", "低基期觀察"): ("pullback", "🔄 台股低基期轉強股觀察清單", "位階 35% / 轉強訊號 30% / 籌碼回補 20% / 風控 15%"),
+        ("AI概念", "AI 概念", "AI 概念股", "科技概念股"): ("concept", "🤖 台股 AI / 科技概念股觀察清單", "題材實質 30% / 趨勢 25% / 籌碼 20% / 風險 25%"),
+        ("籌碼股", "籌碼集中", "籌碼集中股", "法人連買"): ("chip", "💼 台股籌碼集中股觀察清單", "法人連買 40% / 集中度 25% / 量價 20% / 風控 15%"),
+        ("防禦股", "防禦型", "防禦型股", "抗跌股"): ("defensive", "🛡️ 台股防禦型股觀察清單", "穩定獲利 40% / 配息 25% / 低波動 20% / 抗跌 15%"),
     }
     for triggers, (ft, display, weights_str) in FILTER_TRIGGER_MAP.items():
         if text in triggers:
