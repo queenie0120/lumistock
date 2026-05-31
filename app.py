@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.146"
+VERSION              = "10.9.147"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4899,9 +4899,20 @@ def _fetch_tw_yahoo(stock_id: str) -> dict:
         try:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=5d"
             r = requests.get(url, headers=headers, timeout=5)
-            result = r.json()["chart"]["result"][0]
-            meta = result["meta"]
-            quotes = result.get("indicators", {}).get("quote", [{}])[0]
+            # v10.9.147：防 result=None / 空陣列 / error 回應導致 NoneType TypeError
+            if r.status_code != 200:
+                dlog("TW_STOCK", f"Yahoo {stock_id}{suffix} HTTP {r.status_code}")
+                continue
+            j = r.json() or {}
+            chart = j.get("chart") or {}
+            results_arr = chart.get("result")
+            if not results_arr:
+                err = (chart.get("error") or {}).get("description", "result=None/[]")
+                dlog("TW_STOCK", f"Yahoo {stock_id}{suffix} 空回應：{err[:80]}")
+                continue
+            result = results_arr[0] or {}
+            meta = result.get("meta") or {}
+            quotes = (result.get("indicators", {}).get("quote") or [{}])[0]
             opens = [o for o in quotes.get("open", []) if o is not None]
             highs = [h for h in quotes.get("high", []) if h is not None]
             lows  = [l for l in quotes.get("low", []) if l is not None]
@@ -5035,7 +5046,8 @@ def get_tw_stock(stock_id: str) -> dict:
             result["ex_dividend"] = ex_div["cash"]
         return result
 
-    # 兩源全失敗 → 嘗試 STOCK_DAY（嚴格日期驗證，只接受今天）
+    # 兩源全失敗 → 嘗試 STOCK_DAY
+    # v10.9.147：放寬「只接受今天」→ 接受最近 7 天內的最後一筆（週末/假日仍可顯示週五收盤）
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&stockNo={stock_id}"
@@ -5044,13 +5056,22 @@ def get_tw_stock(stock_id: str) -> dict:
         if data.get("stat") == "OK" and data.get("data"):
             rows = data["data"]; last = rows[-1]
             today_t = now_taipei()
+            # 解析日期 + 計算與今天差幾天
+            last_date_str = ""
+            day_diff = 999
             try:
                 dparts = str(last[0]).split("/")
-                is_today = (int(dparts[0])+1911 == today_t.year
-                            and int(dparts[1]) == today_t.month
-                            and int(dparts[2]) == today_t.day)
-            except: is_today = False
-            if is_today:
+                last_year  = int(dparts[0]) + 1911
+                last_month = int(dparts[1])
+                last_day   = int(dparts[2])
+                last_date_str = f"{last_month:02d}/{last_day:02d}"
+                last_dt = today_t.replace(year=last_year, month=last_month,
+                                          day=last_day, hour=0, minute=0, second=0)
+                day_diff = (today_t.date() - last_dt.date()).days
+            except Exception:
+                pass
+            # 接受最近 7 天內（涵蓋週末 + 國定假日）
+            if 0 <= day_diff <= 7:
                 price = float(last[6].replace(",",""))
                 prev = float(rows[-2][6].replace(",","")) if len(rows) > 1 else price
                 chg = price - prev; pct = chg/prev*100 if prev else 0
@@ -5059,15 +5080,22 @@ def get_tw_stock(stock_id: str) -> dict:
                 name = NAME_CACHE.get(stock_id, "")
                 if not has_chinese(name): name = get_tw_stock_name_fallback(stock_id)
                 if not has_chinese(name): name = stock_id
+                # 標籤依照新鮮度
+                if day_diff == 0:
+                    status_label = "收盤"
+                    validation = "⚠ 末援 STOCK_DAY 收盤日報"
+                else:
+                    status_label = f"最後交易日 {last_date_str}"
+                    validation = f"⚠ 末援 STOCK_DAY（{last_date_str} 收盤，距今 {day_diff} 天）"
                 return {"name":name,"price":price,"chg":chg,"pct":pct,
                         "open":last[3].replace(",",""),"high":last[4].replace(",",""),
                         "low":last[5].replace(",",""),"vol":vol_str,
-                        "market_type":"台股","status":"收盤",
+                        "market_type":"台股","status":status_label,
                         "source":"TWSE STOCK_DAY",
-                        "validation":"⚠ 末援 STOCK_DAY 收盤日報",
+                        "validation":validation,
                         "meta": build_data_meta("TWSE 日線", is_realtime=False, is_fallback=True, delay_min=0)}
             else:
-                dlog("TW_STOCK", f"{stock_id} STOCK_DAY 最後日期 {last[0]} 非今天，跳過")
+                dlog("TW_STOCK", f"{stock_id} STOCK_DAY 最後日期 {last[0]} 距今 {day_diff} 天，跳過")
     except: pass
 
     try:
