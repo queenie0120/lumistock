@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.147"
+VERSION              = "10.9.148"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5098,28 +5098,55 @@ def get_tw_stock(stock_id: str) -> dict:
                 dlog("TW_STOCK", f"{stock_id} STOCK_DAY 最後日期 {last[0]} 距今 {day_diff} 天，跳過")
     except: pass
 
+    # v10.9.148：TPEx 末援同樣放寬「只接受今天」→ 向前找最近 7 天有資料的那天
     try:
-        today=now_taipei(); cy=today.year-1911
-        ds=f"{cy}/{today.month:02d}/{today.day:02d}"
-        url=f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&o=json&d={ds}&s=0,asc&q={stock_id}"
-        r=requests.get(url,headers=headers,timeout=8, verify=False)
-        rows=r.json().get("aaData",[])
-        if rows:
-            last=rows[-1]; price=float(last[2].replace(",",""))
-            prev=float(rows[-2][2].replace(",","")) if len(rows)>1 else price
-            chg=price-prev; pct=chg/prev*100 if prev else 0
-            try: vol_str=f"{int(float(last[0].replace(',',''))):,} 張"
-            except: vol_str="N/A"
-            name=NAME_CACHE.get(stock_id,"")
-            if not has_chinese(name): name=get_tw_stock_name_fallback(stock_id)
-            if not has_chinese(name): name=stock_id
-            return {"name":name,"price":price,"chg":chg,"pct":pct,
-                    "open":last[5].replace(",","") if len(last)>5 else "N/A",
-                    "high":last[6].replace(",","") if len(last)>6 else "N/A",
-                    "low":last[7].replace(",","") if len(last)>7 else "N/A","vol":vol_str,
-                    "market_type":"台股","status":"收盤","source":"TPEx",
-                    "meta": build_data_meta("TPEx 日線", is_realtime=False, is_fallback=True, delay_min=0)}
-    except: pass
+        today = now_taipei()
+        cy = today.year - 1911
+        for back in range(0, 8):  # 今天 + 過去 7 天
+            try_date = today - timedelta(days=back)
+            try_cy = try_date.year - 1911
+            ds = f"{try_cy}/{try_date.month:02d}/{try_date.day:02d}"
+            url = (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/"
+                   f"st43_result.php?l=zh-tw&o=json&d={ds}&s=0,asc&q={stock_id}")
+            try:
+                r = requests.get(url, headers=headers, timeout=8, verify=False)
+                rows = r.json().get("aaData", [])
+            except Exception:
+                continue
+            if not rows: continue
+
+            last = rows[-1]
+            price = float(last[2].replace(",", ""))
+            prev = float(rows[-2][2].replace(",", "")) if len(rows) > 1 else price
+            chg = price - prev; pct = chg / prev * 100 if prev else 0
+            try: vol_str = f"{int(float(last[0].replace(',',''))):,} 張"
+            except: vol_str = "N/A"
+            name = NAME_CACHE.get(stock_id, "")
+            if not has_chinese(name): name = get_tw_stock_name_fallback(stock_id)
+            if not has_chinese(name): name = stock_id
+
+            # 依新鮮度標 status / validation
+            if back == 0:
+                status_label = "收盤"
+                validation = "⚠ 末援 TPEx 收盤日報"
+            else:
+                last_str = f"{try_date.month:02d}/{try_date.day:02d}"
+                status_label = f"最後交易日 {last_str}"
+                validation = f"⚠ 末援 TPEx（{last_str} 收盤，距今 {back} 天）"
+
+            return {
+                "name": name, "price": price, "chg": chg, "pct": pct,
+                "open": last[5].replace(",", "") if len(last) > 5 else "N/A",
+                "high": last[6].replace(",", "") if len(last) > 6 else "N/A",
+                "low":  last[7].replace(",", "") if len(last) > 7 else "N/A",
+                "vol":  vol_str,
+                "market_type": "台股", "status": status_label,
+                "source": "TPEx", "validation": validation,
+                "meta": build_data_meta("TPEx 日線", is_realtime=False,
+                                         is_fallback=True, delay_min=0),
+            }
+    except Exception as e:
+        dlog("TW_STOCK", f"TPEx 末援例外：{type(e).__name__}: {e}")
 
     return None
 
