@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.150"
+VERSION              = "10.9.151"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4977,13 +4977,30 @@ def _validate_tw_sources(mis: dict, yahoo: dict) -> tuple:
         return mis, f"⚠ 雙源差距大 {diff_pct:.2f}%，採 TWSE 官方（請確認）"
 
 
+# v10.9.151：個股查詢結果快取（3 分鐘 TTL）
+# 連按多個推薦分類時候選股大量重疊（趨勢/低基期/AI 概念都會撈 2330 等）
+# 第二個推薦從 30s 變 5-10s
+TW_STOCK_CACHE = {}              # {sid: (result_dict, fetched_ts)}
+TW_STOCK_CACHE_TTL = 180         # 3 分鐘
+TW_CLOSES_CACHE = {}             # {sid: (closes_list, fetched_ts)}
+TW_CLOSES_CACHE_TTL = 600        # 10 分鐘（歷史收盤動得慢）
+
+
 def get_tw_stock(stock_id: str) -> dict:
     """v10.9.107：多源驗證版。
     1. 並行查 TWSE MIS + Yahoo（各 5 秒 timeout）
     2. 比對結果挑最可信
     3. 都失敗才 fallback STOCK_DAY（含日期驗證）
     4. 真的全失敗回 None（UI 顯示「資料暫時無法取得」）
+    v10.9.151：加 3 分鐘 TTL 快取（加速連按推薦）
     """
+    # v10.9.151：快取
+    cached = TW_STOCK_CACHE.get(stock_id)
+    if cached:
+        result, ts = cached
+        if time.time() - ts < TW_STOCK_CACHE_TTL:
+            return result
+
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_mis = pool.submit(_fetch_tw_mis, stock_id)
@@ -5047,6 +5064,7 @@ def get_tw_stock(stock_id: str) -> dict:
         }
         if ex_div:
             result["ex_dividend"] = ex_div["cash"]
+        TW_STOCK_CACHE[stock_id] = (result, time.time())  # v10.9.151 cache
         return result
 
     # 兩源全失敗 → 嘗試 STOCK_DAY
@@ -5090,13 +5108,15 @@ def get_tw_stock(stock_id: str) -> dict:
                 else:
                     status_label = f"最後交易日 {last_date_str}"
                     validation = f"⚠ 末援 STOCK_DAY（{last_date_str} 收盤，距今 {day_diff} 天）"
-                return {"name":name,"price":price,"chg":chg,"pct":pct,
+                result = {"name":name,"price":price,"chg":chg,"pct":pct,
                         "open":last[3].replace(",",""),"high":last[4].replace(",",""),
                         "low":last[5].replace(",",""),"vol":vol_str,
                         "market_type":"台股","status":status_label,
                         "source":"TWSE STOCK_DAY",
                         "validation":validation,
                         "meta": build_data_meta("TWSE 日線", is_realtime=False, is_fallback=True, delay_min=0)}
+                TW_STOCK_CACHE[stock_id] = (result, time.time())  # v10.9.151
+                return result
             else:
                 dlog("TW_STOCK", f"{stock_id} STOCK_DAY 最後日期 {last[0]} 距今 {day_diff} 天，跳過")
     except: pass
@@ -5137,7 +5157,7 @@ def get_tw_stock(stock_id: str) -> dict:
                 status_label = f"最後交易日 {last_str}"
                 validation = f"⚠ 末援 TPEx（{last_str} 收盤，距今 {back} 天）"
 
-            return {
+            result = {
                 "name": name, "price": price, "chg": chg, "pct": pct,
                 "open": last[5].replace(",", "") if len(last) > 5 else "N/A",
                 "high": last[6].replace(",", "") if len(last) > 6 else "N/A",
@@ -5148,6 +5168,8 @@ def get_tw_stock(stock_id: str) -> dict:
                 "meta": build_data_meta("TPEx 日線", is_realtime=False,
                                          is_fallback=True, delay_min=0),
             }
+            TW_STOCK_CACHE[stock_id] = (result, time.time())  # v10.9.151
+            return result
     except Exception as e:
         dlog("TW_STOCK", f"TPEx 末援例外：{type(e).__name__}: {e}")
 
@@ -5426,10 +5448,18 @@ def _load_finmind_closes_adj(stock_id: str) -> list:
 def get_tw_closes(stock_id: str) -> list:
     """個股近 1 年收盤序列（v10.9.59：FinMind 還原股價主來源 → Yahoo → TWSE 備援）。
     Layer 0 FinMind 還原股價：除權息日不會誤判暴跌（K 線、均線、RSI 都更準確）。
-    """
+    v10.9.151：加 10 分鐘 TTL 快取（連續推薦不重抓）"""
+    # v10.9.151：快取
+    cached = TW_CLOSES_CACHE.get(stock_id)
+    if cached:
+        closes, ts = cached
+        if time.time() - ts < TW_CLOSES_CACHE_TTL:
+            return closes
+
     # Layer 0：FinMind 還原股價（v10.9.59 新增主來源）
     closes = _load_finmind_closes_adj(stock_id)
     if len(closes) >= 20:
+        TW_CLOSES_CACHE[stock_id] = (closes, time.time())
         return closes
 
     headers={"User-Agent":"Mozilla/5.0"}
@@ -5438,9 +5468,16 @@ def get_tw_closes(stock_id: str) -> list:
         try:
             url=f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}{suffix}?interval=1d&range=1y"
             r=requests.get(url,headers=headers,timeout=10)
-            closes=r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-            closes=[c for c in closes if c is not None]
-            if len(closes)>=20: return closes
+            # v10.9.151：與 _fetch_tw_yahoo 同樣的 None 防護
+            j = r.json() or {}
+            results = (j.get("chart") or {}).get("result")
+            if not results: continue
+            result = results[0] or {}
+            quotes = (result.get("indicators",{}).get("quote") or [{}])[0]
+            closes = [c for c in (quotes.get("close") or []) if c is not None]
+            if len(closes) >= 20:
+                TW_CLOSES_CACHE[stock_id] = (closes, time.time())
+                return closes
         except: pass
     # Layer 2：TWSE STOCK_DAY 備援
     try:
@@ -5452,7 +5489,9 @@ def get_tw_closes(stock_id: str) -> list:
             for row in data["data"]:
                 try: closes.append(float(row[6].replace(",","")))
                 except: pass
-            if closes: return closes
+            if closes:
+                TW_CLOSES_CACHE[stock_id] = (closes, time.time())
+                return closes
     except: pass
     return []
 
