@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.151"
+VERSION              = "10.9.152"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4891,9 +4891,27 @@ def _fetch_tw_mis(stock_id: str) -> dict:
     return None
 
 
+def _tw_stale_limit_hr() -> int:
+    """v10.9.152：依台股市場時段給 stale 門檻
+    - 盤中 (週一~五 09:00-13:30 TW)：4 小時（必須即時）
+    - 盤後 (週一~五 13:30~隔日 09:00)：24 小時（接受當日收盤）
+    - 週末 / 假日：168 小時（接受最後交易日）
+    避免盤中誤把「昨日收盤」當即時，週末又能正常拿週五收盤。
+    """
+    now = now_taipei()
+    weekday = now.weekday()  # 0=Mon ... 6=Sun
+    if weekday >= 5:           # 週末
+        return 168
+    # 平日
+    minutes = now.hour * 60 + now.minute
+    if 9 * 60 <= minutes <= 13 * 60 + 30:   # 09:00-13:30 盤中
+        return 4
+    return 24                  # 盤前 / 盤後
+
+
 def _fetch_tw_yahoo(stock_id: str) -> dict:
     """v10.9.107: Yahoo Chart API。回傳 raw dict 或 None。
-    含 stale 偵測（regularMarketTime > 24hr 視為過期）。"""
+    v10.9.152: stale 門檻改動態（盤中 4hr / 盤後 24hr / 週末 168hr）"""
     headers = {"User-Agent": "Mozilla/5.0"}
     for suffix in [".TW", ".TWO"]:
         try:
@@ -4920,15 +4938,16 @@ def _fetch_tw_yahoo(stock_id: str) -> dict:
             closes = [c for c in quotes.get("close", []) if c is not None]
             price = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
             prev  = closes[-2] if len(closes) >= 2 else (meta.get("chartPreviousClose") or price)
-            # v10.9.150：Stale 偵測放寬 24hr → 168hr（7 天）
-            # 原本週末 / 連假後第一天 Yahoo 回週五收盤（~36hr）就被當過期丟掉
-            # 改為 7 天內都接受，標 is_realtime=False 即可
+            # v10.9.152：Stale 動態門檻（盤中 4hr / 盤後 24hr / 週末 168hr）
+            # 避免盤中接受「昨日收盤」當即時資料
             rmt = meta.get("regularMarketTime", 0)
             age_hr = 0
             if rmt:
                 age_hr = (datetime.now(timezone.utc).timestamp() - float(rmt)) / 3600
-                if age_hr > 168:  # 7 天才算真的死掉
-                    dlog("TW_STOCK", f"Yahoo {stock_id}{suffix} stale {age_hr:.1f}hr 前，跳過")
+                stale_limit = _tw_stale_limit_hr()
+                if age_hr > stale_limit:
+                    dlog("TW_STOCK",
+                         f"Yahoo {stock_id}{suffix} stale {age_hr:.1f}hr > {stale_limit}hr，跳過")
                     continue
             if not price or price <= 0:
                 continue
