@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.149"
+VERSION              = "10.9.150"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4920,11 +4920,14 @@ def _fetch_tw_yahoo(stock_id: str) -> dict:
             closes = [c for c in quotes.get("close", []) if c is not None]
             price = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
             prev  = closes[-2] if len(closes) >= 2 else (meta.get("chartPreviousClose") or price)
-            # Stale 偵測：regularMarketTime 超過 24 小時前 → 跳過
+            # v10.9.150：Stale 偵測放寬 24hr → 168hr（7 天）
+            # 原本週末 / 連假後第一天 Yahoo 回週五收盤（~36hr）就被當過期丟掉
+            # 改為 7 天內都接受，標 is_realtime=False 即可
             rmt = meta.get("regularMarketTime", 0)
+            age_hr = 0
             if rmt:
                 age_hr = (datetime.now(timezone.utc).timestamp() - float(rmt)) / 3600
-                if age_hr > 24:
+                if age_hr > 168:  # 7 天才算真的死掉
                     dlog("TW_STOCK", f"Yahoo {stock_id}{suffix} stale {age_hr:.1f}hr 前，跳過")
                     continue
             if not price or price <= 0:
@@ -9954,41 +9957,96 @@ US_WATCHLIST_UNIVERSE = [
 ]
 
 
+def _fetch_us_one_chart(symbol: str) -> dict:
+    """v10.9.150：單檔走 chart endpoint fallback（v7 quote 失敗時用）"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+        r = requests.get(url, headers=headers, timeout=6)
+        if r.status_code != 200:
+            return {}
+        j = r.json() or {}
+        chart = j.get("chart") or {}
+        results = chart.get("result")
+        if not results: return {}
+        result = results[0] or {}
+        meta = result.get("meta") or {}
+        quotes = (result.get("indicators", {}).get("quote") or [{}])[0]
+        closes = [c for c in (quotes.get("close") or []) if c is not None]
+        if not closes: return {}
+        price = meta.get("regularMarketPrice") or closes[-1]
+        prev  = closes[-2] if len(closes) >= 2 else (meta.get("chartPreviousClose") or price)
+        chg = price - prev
+        pct = chg / prev * 100 if prev else 0
+        return {
+            "symbol":  symbol,
+            "name":    meta.get("shortName") or meta.get("longName") or symbol,
+            "price":   float(price),
+            "chg":     float(chg),
+            "pct":     float(pct),
+            "vol":     0,
+            "day_high": None, "day_low": None,
+            "52w_high": meta.get("fiftyTwoWeekHigh"),
+            "52w_low":  meta.get("fiftyTwoWeekLow"),
+            "marketCap": None,
+            "ms":      "REGULAR",
+        }
+    except Exception as e:
+        dlog("US_REC", f"chart fallback {symbol} fail: {type(e).__name__}: {str(e)[:80]}")
+        return {}
+
+
 def _fetch_us_batch_quotes(symbols: list) -> dict:
-    """v10.9.129：用 Yahoo v7 quote 一次拉多檔。回傳 {symbol: data, ...}。"""
+    """v10.9.129：用 Yahoo v7 quote 一次拉多檔。
+    v10.9.150：v7 失敗時自動 fallback 到 chart endpoint per-symbol（並行）"""
     if not symbols: return {}
     headers = {"User-Agent": "Mozilla/5.0"}
+    out = {}
+    # Try 1: v7 batch
     try:
         url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={','.join(symbols)}"
         r = requests.get(url, headers=headers, timeout=8)
         if r.status_code != 200:
-            dlog("US_REC", f"v7 batch HTTP {r.status_code}")
-            return {}
-        results = r.json().get("quoteResponse", {}).get("result", [])
-        out = {}
-        for d in results:
-            sym = d.get("symbol", "")
-            rmp = d.get("regularMarketPrice")
-            if not sym or not rmp: continue
-            out[sym] = {
-                "symbol": sym,
-                "name": d.get("shortName") or d.get("longName") or sym,
-                "price": float(rmp),
-                "chg": float(d.get("regularMarketChange", 0) or 0),
-                "pct": float(d.get("regularMarketChangePercent", 0) or 0),
-                "vol": int(d.get("regularMarketVolume", 0) or 0),
-                "day_high": d.get("regularMarketDayHigh"),
-                "day_low":  d.get("regularMarketDayLow"),
-                "52w_high": d.get("fiftyTwoWeekHigh"),
-                "52w_low":  d.get("fiftyTwoWeekLow"),
-                "marketCap": d.get("marketCap"),
-                "ms": d.get("marketState", ""),
-            }
-        dlog("US_REC", f"batch quote: {len(symbols)} 請求 / {len(out)} 拿到")
-        return out
+            dlog("US_REC", f"v7 batch HTTP {r.status_code}, fallback to chart endpoint")
+        else:
+            results = r.json().get("quoteResponse", {}).get("result", [])
+            for d in results:
+                sym = d.get("symbol", "")
+                rmp = d.get("regularMarketPrice")
+                if not sym or not rmp: continue
+                out[sym] = {
+                    "symbol": sym,
+                    "name": d.get("shortName") or d.get("longName") or sym,
+                    "price": float(rmp),
+                    "chg": float(d.get("regularMarketChange", 0) or 0),
+                    "pct": float(d.get("regularMarketChangePercent", 0) or 0),
+                    "vol": int(d.get("regularMarketVolume", 0) or 0),
+                    "day_high": d.get("regularMarketDayHigh"),
+                    "day_low":  d.get("regularMarketDayLow"),
+                    "52w_high": d.get("fiftyTwoWeekHigh"),
+                    "52w_low":  d.get("fiftyTwoWeekLow"),
+                    "marketCap": d.get("marketCap"),
+                    "ms": d.get("marketState", ""),
+                }
     except Exception as e:
-        dlog("US_REC", f"batch fail: {type(e).__name__}: {e}")
-        return {}
+        dlog("US_REC", f"v7 batch fail: {type(e).__name__}: {str(e)[:120]}")
+
+    # Try 2: fallback chart endpoint for missing symbols (並行)
+    missing = [s for s in symbols if s not in out]
+    if missing:
+        dlog("US_REC", f"v7 拿到 {len(out)}/{len(symbols)}，fallback chart {len(missing)} 檔")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_us_one_chart, s): s for s in missing}
+            for fut in as_completed(futures):
+                try:
+                    d = fut.result()
+                    if d and d.get("price"):
+                        out[d["symbol"]] = d
+                except Exception:
+                    pass
+    dlog("US_REC", f"batch quote 最終：{len(symbols)} 請求 / {len(out)} 拿到")
+    return out
 
 
 def _score_us_candidate(q: dict) -> int:
