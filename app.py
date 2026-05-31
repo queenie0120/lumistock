@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.148"
+VERSION              = "10.9.149"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10786,48 +10786,71 @@ def _get_tw_swing_candidates() -> list:
 # 規格出處：project_recommendation_spec.md（補充規格）
 # 核心精神：寧可少推不要亂推；不為了湊數硬選；過熱不直接排除而是分級
 # ─────────────────────────────────────────
-# v10.9.146：連按防呆 — 追蹤每個 user 進行中分析數
-REC_MAX_CONCURRENT_PER_USER = 1     # 同一 user 同時最多 1 個分析跑（避免 worker 排隊）
-REC_PENDING_LOCK = threading.Lock()
-REC_PENDING_COUNT = {}              # {user_id: int}
+# v10.9.149：推薦分析 per-user FIFO 排隊
+# 行為：
+#   - 每個 user 一個 deque + 一個 worker thread（idle 自動消失）
+#   - 連按多個按鈕 → 依序跑、不會擋掉
+#   - 不同 user 的隊列互不影響（user A 5 個不會擋 user B 1 個）
+#   - 隊列上限 10（避免暴衝）；每個任務預估 45 秒
+import collections
+REC_QUEUE_MAX_PER_USER = 10      # 每 user 最多排 10 個
+REC_TASK_AVG_SEC = 45            # 預估每個任務耗時（給 UX 顯示）
+REC_QUEUE_LOCK = threading.Lock()
+REC_USER_QUEUES = {}             # {user_id: deque[(target_fn, args_tuple)]}
+REC_USER_WORKERS = {}            # {user_id: Thread}
 
-def _rec_pending_acquire(user_id: str) -> bool:
-    """嘗試取得分析 slot。成功 True / 已滿 False。"""
-    with REC_PENDING_LOCK:
-        n = REC_PENDING_COUNT.get(user_id, 0)
-        if n >= REC_MAX_CONCURRENT_PER_USER:
-            return False
-        REC_PENDING_COUNT[user_id] = n + 1
-        return True
-
-def _rec_pending_release(user_id: str):
-    with REC_PENDING_LOCK:
-        n = REC_PENDING_COUNT.get(user_id, 0)
-        if n <= 1:
-            REC_PENDING_COUNT.pop(user_id, None)
-        else:
-            REC_PENDING_COUNT[user_id] = n - 1
-
-def _rec_pending_count(user_id: str) -> int:
-    with REC_PENDING_LOCK:
-        return REC_PENDING_COUNT.get(user_id, 0)
-
-def launch_rec_thread(target, user_id: str, *args) -> tuple:
-    """v10.9.146：包裝 thread 啟動 — 自動 acquire / release pending slot
-    回傳 (started: bool, msg_if_blocked: str)"""
-    if not _rec_pending_acquire(user_id):
-        return False, (
-            f"⏳ 你已有 {_rec_pending_count(user_id)} 個分析正在跑\n"
-            f"系統只有 1 個 worker，連按會排隊。\n"
-            f"請等上一個完成（約 30-60 秒）後再按下一個。")
-    def wrapper():
+def _rec_queue_worker(user_id: str):
+    """單一 user 的 FIFO 處理 thread。隊列空了就退出。"""
+    while True:
+        with REC_QUEUE_LOCK:
+            q = REC_USER_QUEUES.get(user_id)
+            if not q:
+                # 空了，清掉自己
+                REC_USER_QUEUES.pop(user_id, None)
+                REC_USER_WORKERS.pop(user_id, None)
+                return
+            target, args = q.popleft()
+        # 鎖外執行任務（避免長時間持鎖）
         try:
             target(user_id, *args)
-        finally:
-            _rec_pending_release(user_id)
-    t = threading.Thread(target=wrapper, daemon=True)
-    t.start()
-    return True, ""
+        except Exception as e:
+            dlog("REC_QUEUE",
+                 f"{user_id[:8]} 任務失敗：{type(e).__name__}: {str(e)[:120]}")
+
+def launch_rec_thread(target, user_id: str, *args) -> tuple:
+    """v10.9.149：加入該 user 的 FIFO 隊列；隊列空時啟動 worker。
+    回傳 (queued: bool, position: int)
+      position == 1 → 立刻開始
+      position > 1  → 第 N 位排隊中
+      position == 0 → 隊列已滿（很少觸發，僅作上限保護）
+    """
+    with REC_QUEUE_LOCK:
+        if user_id not in REC_USER_QUEUES:
+            REC_USER_QUEUES[user_id] = collections.deque()
+        q = REC_USER_QUEUES[user_id]
+        # 上限保護
+        if len(q) >= REC_QUEUE_MAX_PER_USER:
+            return False, 0
+        q.append((target, args))
+        position = len(q)
+        # 若 worker 還沒在跑，啟動一個
+        worker = REC_USER_WORKERS.get(user_id)
+        if not worker or not worker.is_alive():
+            worker = threading.Thread(
+                target=_rec_queue_worker, args=(user_id,), daemon=True)
+            REC_USER_WORKERS[user_id] = worker
+            worker.start()
+    return True, position
+
+def format_queue_position_msg(position: int) -> str:
+    """依照排隊位置給用戶提示訊息"""
+    if position <= 1:
+        return ""  # 立刻開始，不用額外訊息
+    ahead = position - 1
+    est_sec = ahead * REC_TASK_AVG_SEC
+    return (f"📋 已加入分析隊列（第 {position} 位）\n"
+            f"前面還有 {ahead} 個分析，預估 {est_sec} 秒後開始\n"
+            f"系統會依序自動跑，不用再按。")
 
 
 MIN_SCORE_FOR_RECOMMENDATION = 60   # 品質門檻：低於此分數不推薦
@@ -12908,8 +12931,11 @@ def handle_message(event):
               "⭐ 台股觀察清單分析中...\n━━━━━━━━━━━━━━\n"
               "正在整合法人籌碼、技術面、新聞情緒\n約 15～30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
               [("🇺🇸 改看美股", "美股觀察")])
-        ok, blocked = launch_rec_thread(build_and_push_recommendation, user_id)
-        if not ok: push_message(user_id, blocked)
+        queued, pos = launch_rec_thread(build_and_push_recommendation, user_id)
+        if not queued:
+            push_message(user_id, "❌ 隊列已滿（10 個），請等部分完成再試")
+        elif pos > 1:
+            push_message(user_id, format_queue_position_msg(pos))
         return
 
     # v10.9.129：美股版觀察清單
@@ -12920,8 +12946,11 @@ def handle_message(event):
               "🇺🇸 美股觀察清單分析中...\n━━━━━━━━━━━━━━\n"
               "正在從 32 檔大型美股中挑出 Top 5\n整合動能、估值位置、AI 分析\n約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
               [("🇹🇼 改看台股", "台股觀察")])
-        ok, blocked = launch_rec_thread(build_and_push_us_recommendation, user_id)
-        if not ok: push_message(user_id, blocked)
+        queued, pos = launch_rec_thread(build_and_push_us_recommendation, user_id)
+        if not queued:
+            push_message(user_id, "❌ 隊列已滿（10 個），請等部分完成再試")
+        elif pos > 1:
+            push_message(user_id, format_queue_position_msg(pos))
         return
 
     # v10.9.130：AI 概念股 — 合併 AI 伺服器 + 生成式 AI + HBM + 矽光子 4 個主軸
@@ -12932,11 +12961,14 @@ def handle_message(event):
             "🤖 AI 概念觀察清單分析中...\n━━━━━━━━━━━━━━\n"
             "整合 AI 伺服器 / 生成式 AI / HBM / 矽光子\n約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
             [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察")])
-        ok, blocked = launch_rec_thread(
+        queued, pos = launch_rec_thread(
             build_and_push_themed_tw_recommendation, user_id,
             ["AI 伺服器", "生成式 AI / ChatGPT", "HBM 記憶體", "矽光子"],
             "🤖 AI 概念觀察清單")
-        if not ok: push_message(user_id, blocked)
+        if not queued:
+            push_message(user_id, "❌ 隊列已滿（10 個），請等部分完成再試")
+        elif pos > 1:
+            push_message(user_id, format_queue_position_msg(pos))
         return
 
     # v10.9.130：題材觀察清單統一處理
@@ -12963,10 +12995,13 @@ def handle_message(event):
                 f"題材：{' / '.join(theme_keys)}\n"
                 f"約 15-30 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
                 [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察")])
-            ok, blocked = launch_rec_thread(
+            queued, pos = launch_rec_thread(
                 build_and_push_themed_tw_recommendation, user_id,
                 theme_keys, display_name)
-            if not ok: push_message(user_id, blocked)
+            if not queued:
+                push_message(user_id, "❌ 隊列已滿（10 個），請等部分完成再試")
+            elif pos > 1:
+                push_message(user_id, format_queue_position_msg(pos))
             return
 
     # v10.9.133：4 分類獨立評分（對應 project_recommendation_spec.md）
@@ -12992,9 +13027,12 @@ def handle_message(event):
                 f"約 30-60 秒後將推送結果 📊\n\n⚠ 僅供參考，非投資建議",
                 [("🇹🇼 台股觀察", "台股觀察"), ("🇺🇸 美股觀察", "美股觀察"),
                  ("🤖 AI 概念", "AI概念觀察")])
-            ok, blocked = launch_rec_thread(
+            queued, pos = launch_rec_thread(
                 build_and_push_filtered_recommendation, user_id, ft)
-            if not ok: push_message(user_id, blocked)
+            if not queued:
+                push_message(user_id, "❌ 隊列已滿（10 個），請等部分完成再試")
+            elif pos > 1:
+                push_message(user_id, format_queue_position_msg(pos))
             return
 
     # ══ Owner 專屬指令 ══
