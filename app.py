@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.10.0"
+VERSION              = "10.9.154"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2173,101 +2173,6 @@ def get_all_user_ids() -> list:
     except Exception as e:
         dlog("BROADCAST", f"撈 user_ids 失敗：{e}")
     return list(uids)
-
-
-# ═══════════════════════════════════════════════════════════════
-# v10.10.0 Phase A：user_profile 模組（地基）
-# 為「我的投資助理 / 投資人格 / 教練週報」鋪路
-# 規格出處：project_lumistock_v2_vision.md Phase A
-# ═══════════════════════════════════════════════════════════════
-USER_PROFILE_FILE = "/tmp/lumistock_user_profiles.json"
-DEFAULT_USER_PROFILE = {
-    # 基礎統計（v10.10.0）
-    "total_buys": 0,                # 累計買進次數
-    "total_sells": 0,               # 累計賣出次數
-    "first_seen_ts": 0,             # 首次互動時間
-    "last_activity_ts": 0,          # 最近一次行為
-
-    # 預留給 Phase B（v10.10.x）
-    "persona": "",                  # "成長型/波段型/存股型/保守型/積極交易型/價值投資型"
-    "persona_updated_ts": 0,
-    "preferences": {                # 語言偏好（用對話累積判斷）
-        "length": "",               # "short" / "long"
-        "style": "",                # "casual" / "professional"
-        "level": "",                # "beginner" / "intermediate" / "advanced"
-    },
-    "behavior_events": [],          # 行為事件 ring buffer（追高/集中/過早停利等）
-}
-
-def _load_user_profiles() -> dict:
-    try:
-        if os.path.exists(USER_PROFILE_FILE):
-            with open(USER_PROFILE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        dlog("USER_PROFILE", f"讀取失敗：{e}")
-    return {}
-
-def _save_user_profiles(d: dict) -> None:
-    try:
-        with open(USER_PROFILE_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        dlog("USER_PROFILE", f"寫入失敗：{e}")
-
-USER_PROFILES = _load_user_profiles()
-
-def get_user_profile(uid: str) -> dict:
-    """取得 user profile（不存在自動建立 + 補齊缺漏 key）"""
-    p = USER_PROFILES.get(uid)
-    if not p:
-        p = dict(DEFAULT_USER_PROFILE)
-        p["first_seen_ts"] = time.time()
-        USER_PROFILES[uid] = p
-        _save_user_profiles(USER_PROFILES)
-    else:
-        # 升級時若新增 key，自動補預設值（不影響既有）
-        updated = False
-        for k, v in DEFAULT_USER_PROFILE.items():
-            if k not in p:
-                p[k] = v if not isinstance(v, (dict, list)) else (
-                    dict(v) if isinstance(v, dict) else list(v))
-                updated = True
-        if updated:
-            _save_user_profiles(USER_PROFILES)
-    return p
-
-def update_user_profile(uid: str, **fields) -> None:
-    """淺層更新 user profile"""
-    p = get_user_profile(uid)
-    p.update(fields)
-    p["last_activity_ts"] = time.time()
-    _save_user_profiles(USER_PROFILES)
-
-def track_user_action(uid: str, action: str) -> None:
-    """v10.10.0：記錄基礎行為計數
-    action ∈ {'buy', 'sell'}（未來會擴增）"""
-    p = get_user_profile(uid)
-    if action == "buy":
-        p["total_buys"] = p.get("total_buys", 0) + 1
-    elif action == "sell":
-        p["total_sells"] = p.get("total_sells", 0) + 1
-    p["last_activity_ts"] = time.time()
-    _save_user_profiles(USER_PROFILES)
-
-def add_behavior_event(uid: str, event_type: str, detail: str = "") -> None:
-    """v10.10.0：行為事件 ring buffer（Phase B 行為提醒用）
-    event_type 例：'chase_high' / 'over_concentrate' / 'early_stop' / 'avg_down_loser'
-    保留最近 50 筆。"""
-    p = get_user_profile(uid)
-    events = p.get("behavior_events", [])
-    events.append({
-        "type": event_type,
-        "detail": detail[:200],
-        "ts": time.time(),
-    })
-    p["behavior_events"] = events[-50:]
-    _save_user_profiles(USER_PROFILES)
 
 
 def run_portfolio_alerts(force: bool = False) -> dict:
@@ -4586,6 +4491,505 @@ def make_yield_analysis_flex(data: dict) -> dict:
         }
     }
 
+# ═══════════════════════════════════════════════════════════════
+# v10.9.154：外匯 / 資金 AI 專業分析（3 個）
+# 升級原本的「外匯市場分析 / 市場連動分析 / 全球資金流向」3 個 stub
+# pattern 參考 get_yield_analysis：拉 Yahoo 真實資料 + 規則式判讀 + Groq AI 摘要
+# ═══════════════════════════════════════════════════════════════
+def _fetch_yahoo_quote_simple(symbol: str) -> dict:
+    """簡易 Yahoo quote 抓 — 只回 {price, chg, pct}"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+        r = requests.get(url, headers=headers, timeout=6)
+        if r.status_code != 200: return {}
+        j = r.json() or {}
+        results = (j.get("chart") or {}).get("result")
+        if not results: return {}
+        result = results[0] or {}
+        meta = result.get("meta") or {}
+        quotes = (result.get("indicators",{}).get("quote") or [{}])[0]
+        closes = [c for c in (quotes.get("close") or []) if c is not None]
+        price = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
+        prev = closes[-2] if len(closes)>=2 else (meta.get("chartPreviousClose") or price)
+        chg = price - prev
+        pct = chg / prev * 100 if prev else 0
+        return {"price": float(price), "chg": float(chg), "pct": float(pct)}
+    except Exception as e:
+        dlog("FOREX_AI", f"{symbol} fetch fail: {type(e).__name__}: {str(e)[:80]}")
+        return {}
+
+
+# ─────────────────────────────────────────
+# 1. 外匯市場分析
+# ─────────────────────────────────────────
+def get_forex_market_analysis() -> dict:
+    """v10.9.154：拉主要匯率 + 規則式判讀 + 可選 AI 摘要"""
+    from concurrent.futures import ThreadPoolExecutor
+    targets = {
+        "DXY":     "DX-Y.NYB",
+        "USDTWD":  "TWD=X",
+        "USDJPY":  "JPY=X",
+        "EURUSD":  "EURUSD=X",
+        "GBPUSD":  "GBPUSD=X",
+        "USDCNH":  "CNH=X",
+        "USDKRW":  "KRW=X",
+        "AUDUSD":  "AUDUSD=X",
+    }
+    quotes = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {k: pool.submit(_fetch_yahoo_quote_simple, sym) for k, sym in targets.items()}
+        for k, fut in futs.items():
+            try: quotes[k] = fut.result(timeout=8)
+            except Exception: quotes[k] = {}
+
+    if not any(quotes.values()):
+        return {}
+
+    # 規則式判讀
+    interp = []
+    dxy = quotes.get("DXY", {})
+    if dxy.get("price"):
+        d = dxy["price"]
+        if d >= 106: interp.append(f"💵 美元指數 {d:.2f} 偏強（≥106）→ 美元 risk-off / 新興市場資金壓力")
+        elif d >= 103: interp.append(f"💵 美元指數 {d:.2f} 中性偏強")
+        elif d >= 100: interp.append(f"💵 美元指數 {d:.2f} 中性")
+        else: interp.append(f"💵 美元指數 {d:.2f} 偏弱 → 新興市場 / 商品 / 黃金較有利")
+        if dxy.get("pct", 0) > 0.5:
+            interp.append("📈 美元短線走強 → 出口股 / 半導體承壓減輕；但對新興市場負面")
+        elif dxy.get("pct", 0) < -0.5:
+            interp.append("📉 美元短線走弱 → 新興市場 / 商品 / 黃金資金流入")
+
+    # 台幣
+    twd = quotes.get("USDTWD", {})
+    if twd.get("pct") is not None:
+        if twd["pct"] > 0.3:
+            interp.append(f"🇹🇼 USD/TWD 升 {twd['pct']:+.2f}% → 台幣貶值，外資可能調節台股")
+        elif twd["pct"] < -0.3:
+            interp.append(f"🇹🇼 USD/TWD 跌 {twd['pct']:+.2f}% → 台幣升值，外資匯入正面")
+
+    # 日圓避險
+    jpy = quotes.get("USDJPY", {})
+    if jpy.get("pct") is not None:
+        if jpy["pct"] < -0.5:
+            interp.append("🟢 日圓走強（USD/JPY 跌）→ 避險資金流入，市場 risk-off")
+        elif jpy["pct"] > 0.5:
+            interp.append("🔴 日圓走弱（USD/JPY 升）→ 風險偏好上升，套息交易活躍")
+
+    # 人民幣
+    cnh = quotes.get("USDCNH", {})
+    if cnh.get("pct") is not None:
+        if cnh["pct"] > 0.3:
+            interp.append("🇨🇳 人民幣走弱 → 中國資金外流壓力 / 亞洲新興承壓")
+        elif cnh["pct"] < -0.3:
+            interp.append("🇨🇳 人民幣走強 → 亞洲市場資金回流訊號")
+
+    # AI 摘要（可選）
+    ai_summary = ""
+    if is_ai_enabled() and interp:
+        data_block = "\n".join([
+            f"- {k}: {q.get('price', '--'):.4f} ({q.get('pct', 0):+.2f}%)"
+            for k, q in quotes.items() if q.get('price')
+        ])
+        prompt = (
+            "你是台股外匯分析師。根據以下匯率資料給專業判讀：\n"
+            "1. 美元目前強弱位置（1 句）\n"
+            "2. 對台股 / 出口股 / 半導體影響（1-2 句）\n"
+            "3. 一個短線觀察重點（1 句）\n"
+            "禁用詞：保證、必漲、必跌、明牌；改用偏多/偏空/觀察。"
+        )
+        ai_summary = groq_chat(
+            messages=[{"role":"system","content":prompt},
+                      {"role":"user","content":data_block}],
+            max_tokens=350, temperature=0.3, timeout=10) or ""
+
+    return {
+        "quotes": quotes,
+        "interpretations": interp,
+        "ai_summary": ai_summary.strip(),
+    }
+
+
+def make_forex_market_analysis_flex(data: dict) -> dict:
+    if not data or not data.get("quotes"): return None
+    quotes = data["quotes"]
+    interp = data.get("interpretations", [])
+    ai = data.get("ai_summary", "")
+    now_str = now_taipei().strftime("%m/%d %H:%M")
+
+    # 主要報價區
+    def quote_row(key, label):
+        q = quotes.get(key, {})
+        if not q.get("price"): return None
+        price = q["price"]
+        pct = q.get("pct", 0)
+        color = "#D97A5C" if pct >= 0 else "#7AABBE"
+        arrow = "▲" if pct >= 0 else "▼"
+        return {"type":"box","layout":"horizontal","contents":[
+            {"type":"text","text":label,"size":"xs","color":"#5B4040","flex":3},
+            {"type":"text","text":f"{price:.4f}","size":"xs","color":"#5B4040","flex":2,"align":"end"},
+            {"type":"text","text":f"{arrow} {abs(pct):.2f}%","size":"xs","color":color,"flex":2,"align":"end"},
+        ]}
+    rows = [r for r in [
+        quote_row("DXY", "💵 美元指數 DXY"),
+        quote_row("USDTWD", "🇹🇼 USD/TWD"),
+        quote_row("USDJPY", "🇯🇵 USD/JPY"),
+        quote_row("EURUSD", "🇪🇺 EUR/USD"),
+        quote_row("GBPUSD", "🇬🇧 GBP/USD"),
+        quote_row("USDCNH", "🇨🇳 USD/CNH"),
+        quote_row("USDKRW", "🇰🇷 USD/KRW"),
+        quote_row("AUDUSD", "🇦🇺 AUD/USD"),
+    ] if r]
+
+    interp_contents = []
+    for s in interp[:6]:
+        interp_contents.append({"type":"text","text":s,"size":"xxs","color":"#5B4040","wrap":True,"margin":"xs"})
+
+    body_contents = [
+        {"type":"text","text":"📊 主要匯率","size":"sm","color":"#A05A48","weight":"bold"},
+        {"type":"box","layout":"vertical","spacing":"xs","contents":rows},
+        {"type":"separator","color":"#F0D5C0"},
+        {"type":"text","text":"🧠 規則式判讀","size":"sm","color":"#A05A48","weight":"bold"},
+    ] + interp_contents
+    if ai:
+        body_contents += [
+            {"type":"separator","color":"#F0D5C0"},
+            {"type":"text","text":"🤖 AI 專業摘要","size":"sm","color":"#A05A48","weight":"bold"},
+            {"type":"text","text":ai,"size":"xs","color":"#5B4040","wrap":True},
+        ]
+    body_contents += [
+        {"type":"separator","color":"#F0D5C0"},
+        {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#B89BC4"},
+    ]
+
+    return {
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#B89BC4","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"📊 外匯市場分析","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":f"美元強弱 + 主要貨幣對 ‧ {now_str}","size":"xxs","color":"#FFFFFF"},
+            ]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0",
+            "paddingAll":"12px","spacing":"sm","contents":body_contents}
+    }
+
+
+# ─────────────────────────────────────────
+# 2. 市場連動分析
+# ─────────────────────────────────────────
+def get_market_correlation_analysis() -> dict:
+    """v10.9.154：分析美元 ↔ 台股 / 美股 / 黃金 / 半導體連動"""
+    from concurrent.futures import ThreadPoolExecutor
+    targets = {
+        "DXY":     "DX-Y.NYB",
+        "USDTWD":  "TWD=X",
+        "TWII":    "^TWII",          # 加權指數
+        "SP500":   "^GSPC",          # S&P 500
+        "NASDAQ":  "^IXIC",          # Nasdaq
+        "GOLD":    "GC=F",           # 黃金期貨
+        "SOX":     "^SOX",           # 費城半導體指數
+    }
+    quotes = {}
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        futs = {k: pool.submit(_fetch_yahoo_quote_simple, sym) for k, sym in targets.items()}
+        for k, fut in futs.items():
+            try: quotes[k] = fut.result(timeout=8)
+            except Exception: quotes[k] = {}
+
+    if not any(quotes.values()):
+        return {}
+
+    interp = []
+    dxy_pct = quotes.get("DXY", {}).get("pct", 0)
+    twd_pct = quotes.get("USDTWD", {}).get("pct", 0)
+    tw_pct  = quotes.get("TWII", {}).get("pct", 0)
+    sp_pct  = quotes.get("SP500", {}).get("pct", 0)
+    gold_pct = quotes.get("GOLD", {}).get("pct", 0)
+    sox_pct  = quotes.get("SOX", {}).get("pct", 0)
+
+    # USD/TWD ↔ 台股
+    if abs(twd_pct) > 0.2 and abs(tw_pct) > 0.3:
+        if (twd_pct > 0) == (tw_pct < 0):
+            interp.append(f"✅ USD/TWD {twd_pct:+.2f}% / 台股 {tw_pct:+.2f}% → 符合「台幣升=台股漲」傳統關聯")
+        else:
+            interp.append(f"⚠️ USD/TWD {twd_pct:+.2f}% / 台股 {tw_pct:+.2f}% → 偏離傳統關聯，要關注外資動向")
+
+    # DXY ↔ 美股
+    if abs(dxy_pct) > 0.2 and abs(sp_pct) > 0.3:
+        if (dxy_pct > 0) == (sp_pct < 0):
+            interp.append(f"✅ DXY {dxy_pct:+.2f}% / S&P {sp_pct:+.2f}% → 美元強 = 美股弱（傳統反向）")
+        else:
+            interp.append(f"⚠️ DXY {dxy_pct:+.2f}% / S&P {sp_pct:+.2f}% → 同向走勢，避險情緒主導")
+
+    # DXY ↔ 黃金（標準反向）
+    if abs(dxy_pct) > 0.2 and abs(gold_pct) > 0.3:
+        if (dxy_pct > 0) == (gold_pct < 0):
+            interp.append(f"✅ DXY {dxy_pct:+.2f}% / 黃金 {gold_pct:+.2f}% → 美元黃金反向（健康關聯）")
+        else:
+            interp.append(f"⚠️ DXY {dxy_pct:+.2f}% / 黃金 {gold_pct:+.2f}% → 同向異常 = 系統性風險訊號")
+
+    # 美元 ↔ 半導體（出口導向）
+    if abs(dxy_pct) > 0.3 and abs(sox_pct) > 0.5:
+        if dxy_pct > 0 and sox_pct < 0:
+            interp.append(f"📉 美元強 + SOX 弱 → 半導體出口股短線承壓")
+        elif dxy_pct < 0 and sox_pct > 0:
+            interp.append(f"📈 美元弱 + SOX 強 → 半導體出口股偏多")
+
+    if not interp:
+        interp.append("📊 各市場短線變動小，連動關係不顯著，維持觀察")
+
+    ai_summary = ""
+    if is_ai_enabled():
+        data_block = "\n".join([
+            f"- {k}: {q.get('price', 0):.2f} ({q.get('pct', 0):+.2f}%)"
+            for k, q in quotes.items() if q.get('price')
+        ])
+        prompt = (
+            "你是台股市場連動分析師。根據以下匯率/指數資料，分析「美元、台股、美股、黃金、半導體」之間的連動：\n"
+            "1. 哪一組連動最值得關注（1-2 句）\n"
+            "2. 對台灣半導體 / 出口股的影響（1-2 句）\n"
+            "3. 一個今日觀察重點（1 句）\n"
+            "禁用詞：保證、必漲、必跌、明牌。"
+        )
+        ai_summary = groq_chat(
+            messages=[{"role":"system","content":prompt},
+                      {"role":"user","content":data_block}],
+            max_tokens=350, temperature=0.3, timeout=10) or ""
+
+    return {
+        "quotes": quotes,
+        "interpretations": interp,
+        "ai_summary": ai_summary.strip(),
+    }
+
+
+def make_market_correlation_analysis_flex(data: dict) -> dict:
+    if not data or not data.get("quotes"): return None
+    quotes = data["quotes"]
+    interp = data.get("interpretations", [])
+    ai = data.get("ai_summary", "")
+    now_str = now_taipei().strftime("%m/%d %H:%M")
+
+    def quote_row(key, label):
+        q = quotes.get(key, {})
+        if not q.get("price"): return None
+        price = q["price"]; pct = q.get("pct", 0)
+        color = "#D97A5C" if pct >= 0 else "#7AABBE"
+        arrow = "▲" if pct >= 0 else "▼"
+        return {"type":"box","layout":"horizontal","contents":[
+            {"type":"text","text":label,"size":"xs","color":"#5B4040","flex":3},
+            {"type":"text","text":f"{price:,.2f}","size":"xs","color":"#5B4040","flex":2,"align":"end"},
+            {"type":"text","text":f"{arrow} {abs(pct):.2f}%","size":"xs","color":color,"flex":2,"align":"end"},
+        ]}
+
+    rows = [r for r in [
+        quote_row("DXY", "💵 DXY 美元指數"),
+        quote_row("USDTWD", "🇹🇼 USD/TWD"),
+        quote_row("TWII", "📊 台股加權"),
+        quote_row("SP500", "🇺🇸 S&P 500"),
+        quote_row("NASDAQ", "🇺🇸 Nasdaq"),
+        quote_row("GOLD", "🥇 黃金期貨"),
+        quote_row("SOX", "💎 SOX 半導體"),
+    ] if r]
+
+    interp_contents = []
+    for s in interp[:6]:
+        interp_contents.append({"type":"text","text":s,"size":"xxs","color":"#5B4040","wrap":True,"margin":"xs"})
+
+    body_contents = [
+        {"type":"text","text":"📊 跨市場報價","size":"sm","color":"#A05A48","weight":"bold"},
+        {"type":"box","layout":"vertical","spacing":"xs","contents":rows},
+        {"type":"separator","color":"#F0D5C0"},
+        {"type":"text","text":"🔗 連動關係判讀","size":"sm","color":"#A05A48","weight":"bold"},
+    ] + interp_contents
+    if ai:
+        body_contents += [
+            {"type":"separator","color":"#F0D5C0"},
+            {"type":"text","text":"🤖 AI 連動分析","size":"sm","color":"#A05A48","weight":"bold"},
+            {"type":"text","text":ai,"size":"xs","color":"#5B4040","wrap":True},
+        ]
+    body_contents += [
+        {"type":"separator","color":"#F0D5C0"},
+        {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#B89BC4"},
+    ]
+
+    return {
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#B89BC4","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"🔗 市場連動分析","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":f"美元 ↔ 台美股 ↔ 黃金 ↔ 半導體 ‧ {now_str}","size":"xxs","color":"#FFFFFF"},
+            ]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0",
+            "paddingAll":"12px","spacing":"sm","contents":body_contents}
+    }
+
+
+# ─────────────────────────────────────────
+# 3. 全球資金流向（Risk-on / Risk-off）
+# ─────────────────────────────────────────
+def get_global_capital_flow_analysis() -> dict:
+    """v10.9.154：跨資產資金流向判讀
+    股、債、黃金、美元、VIX 各代表不同資金面向"""
+    from concurrent.futures import ThreadPoolExecutor
+    targets = {
+        "SP500":   "^GSPC",
+        "NASDAQ":  "^IXIC",
+        "DJI":     "^DJI",
+        "VIX":     "^VIX",     # 恐慌指數
+        "TNX":     "^TNX",     # 10Y 美債
+        "DXY":     "DX-Y.NYB",
+        "GOLD":    "GC=F",
+        "BTC":     "BTC-USD",  # 加密貨幣風險偏好
+        "TWII":    "^TWII",
+    }
+    quotes = {}
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        futs = {k: pool.submit(_fetch_yahoo_quote_simple, sym) for k, sym in targets.items()}
+        for k, fut in futs.items():
+            try: quotes[k] = fut.result(timeout=8)
+            except Exception: quotes[k] = {}
+
+    if not any(quotes.values()):
+        return {}
+
+    interp = []
+    # VIX 風險情緒
+    vix = quotes.get("VIX", {}).get("price", 0)
+    vix_pct = quotes.get("VIX", {}).get("pct", 0)
+    if vix:
+        if vix < 15:
+            interp.append(f"🟢 VIX {vix:.1f} 低（< 15）→ Risk-on 樂觀，避險需求低")
+        elif vix < 20:
+            interp.append(f"🟡 VIX {vix:.1f} 中性（15-20）→ 市場平靜")
+        elif vix < 30:
+            interp.append(f"🟠 VIX {vix:.1f} 偏高（20-30）→ 警戒升高，留意回檔")
+        else:
+            interp.append(f"🔴 VIX {vix:.1f} 恐慌（> 30）→ Risk-off 強烈，避險為主")
+
+    # 股 vs 黃金（風險偏好對比）
+    sp_pct = quotes.get("SP500", {}).get("pct", 0)
+    gold_pct = quotes.get("GOLD", {}).get("pct", 0)
+    if sp_pct > 0.3 and gold_pct < -0.2:
+        interp.append(f"📈 美股 {sp_pct:+.2f}% 漲 / 黃金 {gold_pct:+.2f}% 跌 → Risk-on（資金進股、出避險）")
+    elif sp_pct < -0.3 and gold_pct > 0.2:
+        interp.append(f"📉 美股 {sp_pct:+.2f}% 跌 / 黃金 {gold_pct:+.2f}% 漲 → Risk-off（資金避險）")
+    elif sp_pct > 0 and gold_pct > 0:
+        interp.append(f"⚠️ 美股 / 黃金 同向上漲 → 通膨預期 / 流動性寬鬆訊號")
+
+    # 美債利率與股市
+    tnx_pct = quotes.get("TNX", {}).get("pct", 0)
+    if abs(tnx_pct) > 1 and abs(sp_pct) > 0.3:
+        if tnx_pct > 0 and sp_pct < 0:
+            interp.append(f"📉 10Y 殖利率漲 {tnx_pct:+.2f}% + 美股跌 → 利率壓力導致成長股承壓")
+        elif tnx_pct < 0 and sp_pct > 0:
+            interp.append(f"📈 10Y 殖利率跌 {tnx_pct:+.2f}% + 美股漲 → 利率舒緩，成長股受惠")
+
+    # 加密貨幣風險偏好
+    btc_pct = quotes.get("BTC", {}).get("pct", 0)
+    if abs(btc_pct) > 2:
+        if btc_pct > 0:
+            interp.append(f"🟢 BTC {btc_pct:+.2f}% → 高風險偏好回升")
+        else:
+            interp.append(f"🔴 BTC {btc_pct:+.2f}% → 風險資金撤退")
+
+    # 台股影響
+    tw_pct = quotes.get("TWII", {}).get("pct", 0)
+    if tw_pct and abs(tw_pct) > 0.3:
+        interp.append(f"🇹🇼 台股 {tw_pct:+.2f}% → 跟隨全球風險偏好" if (tw_pct > 0) == (sp_pct > 0)
+                      else f"🇹🇼 台股 {tw_pct:+.2f}% → 與全球偏離，留意內資 / 籌碼面")
+
+    if not interp:
+        interp.append("📊 各資產類別變動小，全球資金流向不明顯")
+
+    ai_summary = ""
+    if is_ai_enabled():
+        data_block = "\n".join([
+            f"- {k}: {q.get('price', 0):.2f} ({q.get('pct', 0):+.2f}%)"
+            for k, q in quotes.items() if q.get('price')
+        ])
+        prompt = (
+            "你是全球資金流向分析師。根據以下股 / 債 / 商品 / 匯率 / 恐慌指數 / 加密貨幣資料：\n"
+            "1. 目前 Risk-on 還是 Risk-off（1 句）\n"
+            "2. 資金主要流向哪類資產（1-2 句）\n"
+            "3. 對台股的潛在影響（1 句）\n"
+            "禁用詞：保證、必漲、必跌、明牌。"
+        )
+        ai_summary = groq_chat(
+            messages=[{"role":"system","content":prompt},
+                      {"role":"user","content":data_block}],
+            max_tokens=350, temperature=0.3, timeout=10) or ""
+
+    return {
+        "quotes": quotes,
+        "interpretations": interp,
+        "ai_summary": ai_summary.strip(),
+    }
+
+
+def make_global_capital_flow_analysis_flex(data: dict) -> dict:
+    if not data or not data.get("quotes"): return None
+    quotes = data["quotes"]
+    interp = data.get("interpretations", [])
+    ai = data.get("ai_summary", "")
+    now_str = now_taipei().strftime("%m/%d %H:%M")
+
+    def quote_row(key, label, fmt="{:,.2f}"):
+        q = quotes.get(key, {})
+        if not q.get("price"): return None
+        price = q["price"]; pct = q.get("pct", 0)
+        color = "#D97A5C" if pct >= 0 else "#7AABBE"
+        arrow = "▲" if pct >= 0 else "▼"
+        return {"type":"box","layout":"horizontal","contents":[
+            {"type":"text","text":label,"size":"xs","color":"#5B4040","flex":3},
+            {"type":"text","text":fmt.format(price),"size":"xs","color":"#5B4040","flex":2,"align":"end"},
+            {"type":"text","text":f"{arrow} {abs(pct):.2f}%","size":"xs","color":color,"flex":2,"align":"end"},
+        ]}
+
+    rows = [r for r in [
+        quote_row("VIX", "😱 VIX 恐慌"),
+        quote_row("SP500", "🇺🇸 S&P 500"),
+        quote_row("NASDAQ", "🇺🇸 Nasdaq"),
+        quote_row("TWII", "🇹🇼 台股加權"),
+        quote_row("TNX", "📉 10Y 美債"),
+        quote_row("DXY", "💵 DXY"),
+        quote_row("GOLD", "🥇 黃金"),
+        quote_row("BTC", "₿ Bitcoin"),
+    ] if r]
+
+    interp_contents = []
+    for s in interp[:7]:
+        interp_contents.append({"type":"text","text":s,"size":"xxs","color":"#5B4040","wrap":True,"margin":"xs"})
+
+    body_contents = [
+        {"type":"text","text":"📊 跨資產報價","size":"sm","color":"#A05A48","weight":"bold"},
+        {"type":"box","layout":"vertical","spacing":"xs","contents":rows},
+        {"type":"separator","color":"#F0D5C0"},
+        {"type":"text","text":"💸 資金流向判讀","size":"sm","color":"#A05A48","weight":"bold"},
+    ] + interp_contents
+    if ai:
+        body_contents += [
+            {"type":"separator","color":"#F0D5C0"},
+            {"type":"text","text":"🤖 AI 資金流分析","size":"sm","color":"#A05A48","weight":"bold"},
+            {"type":"text","text":ai,"size":"xs","color":"#5B4040","wrap":True},
+        ]
+    body_contents += [
+        {"type":"separator","color":"#F0D5C0"},
+        {"type":"text","text":"⚠️ 僅供參考，非投資建議","size":"xxs","color":"#B89BC4"},
+    ]
+
+    return {
+        "type":"bubble","size":"mega",
+        "header":{"type":"box","layout":"vertical","backgroundColor":"#B89BC4","paddingAll":"14px",
+            "contents":[
+                {"type":"text","text":"💸 全球資金流向","size":"lg","color":"#FFFFFF","weight":"bold"},
+                {"type":"text","text":f"Risk-on / Risk-off · 跨資產 ‧ {now_str}","size":"xxs","color":"#FFFFFF"},
+            ]},
+        "body":{"type":"box","layout":"vertical","backgroundColor":"#FDF6F0",
+            "paddingAll":"12px","spacing":"sm","contents":body_contents}
+    }
+
+
 def _fetch_quote_chart(symbol: str) -> dict:
     """v10.9.110: Yahoo Chart API for index/commodity/forex（含 stale 防禦）。"""
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -6333,9 +6737,6 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
            f"　成本　　{cost_total:>10,.0f}（均價 {cost_avg:,.2f}）\n"
            f"　{sign}　{realized_pnl:+,.0f} 元（{pct:+.2f}%）\n"
            f"　剩餘庫存 {remaining:,} 股")
-    # v10.10.0：追蹤行為（Phase A 地基）
-    try: track_user_action(user_id, "sell")
-    except: pass
     return {"ok": True, "msg": msg, "realized_pnl": realized_pnl,
             "remaining_shares": remaining, "name": name,
             "fee": fee, "tax": tax, "gross": gross, "net": net_proceeds}
@@ -6419,9 +6820,6 @@ def process_buy(user_id: str, stock_id: str, buy_shares: int, buy_price: float) 
            f"━━━━━━━━━━━━━━\n"
            f"{change_str}\n"
            f"（折數 {disc_str}）")
-    # v10.10.0：追蹤行為（Phase A 地基）
-    try: track_user_action(user_id, "buy")
-    except: pass
     return {"ok": True, "msg": msg, "is_new": is_new, **msg_payload}
 
 
@@ -13074,25 +13472,65 @@ def handle_message(event):
             reply_text(event.reply_token, f"⚠️ {name} 資料取得失敗")
         return
 
-    # ══ 外匯市場分析 ══
-    if text=="外匯市場分析":
+    # ══ v10.9.154：外匯 / 資金 AI 專業分析（升級原 stub）══
+    if text == "外匯市場分析":
+        dlog("HANDLER", "→ 外匯市場分析")
+        # reply 即時提示，背景跑分析（資料 + AI 約 10-15 秒）
         reply_text_with_qr(event.reply_token,
-            "💹 外匯市場分析\n━━━━━━━━━━━━━━\n請選擇分析主題：",
-            [("Fed利率影響","查Fed利率"),("BOJ日本央行","查BOJ"),
-             ("ECB歐洲央行","查ECB"),("避險資金流向","查避險資金"),
-             ("全球資金流向","全球資金流向")])
+            "📊 外匯市場分析\n━━━━━━━━━━━━━━\n"
+            "正在整合 8 大主要匯率 + AI 判讀\n約 10-15 秒後推送結果",
+            [("🔗 市場連動", "市場連動分析"), ("💸 資金流向", "全球資金流向")])
+        def _run():
+            data = get_forex_market_analysis()
+            if not data or not data.get("quotes"):
+                push_message(user_id, "⚠️ 匯率資料取得失敗，請稍後再試")
+                return
+            flex = make_forex_market_analysis_flex(data)
+            if flex:
+                push_flex(user_id, flex, "📊 外匯市場分析")
+            else:
+                push_message(user_id, "⚠️ 卡片生成失敗")
+        threading.Thread(target=_run, daemon=True).start()
         return
 
-    if text=="市場連動分析":
+    if text == "市場連動分析":
+        dlog("HANDLER", "→ 市場連動分析")
         reply_text_with_qr(event.reply_token,
-            "🔗 市場連動分析\n━━━━━━━━━━━━━━\n請選擇分析主題：",
-            [("匯率對台股","查匯率台股"),("匯率對美股","查匯率美股"),
-             ("匯率對黃金","查匯率黃金"),("匯率對半導體","查匯率半導體")])
+            "🔗 市場連動分析\n━━━━━━━━━━━━━━\n"
+            "美元 ↔ 台美股 ↔ 黃金 ↔ 半導體\n約 10-15 秒後推送結果",
+            [("📊 外匯", "外匯市場分析"), ("💸 資金流向", "全球資金流向")])
+        def _run():
+            data = get_market_correlation_analysis()
+            if not data or not data.get("quotes"):
+                push_message(user_id, "⚠️ 跨市場資料取得失敗，請稍後再試")
+                return
+            flex = make_market_correlation_analysis_flex(data)
+            if flex:
+                push_flex(user_id, flex, "🔗 市場連動分析")
+            else:
+                push_message(user_id, "⚠️ 卡片生成失敗")
+        threading.Thread(target=_run, daemon=True).start()
         return
 
-    if text=="全球資金流向":
-        news = get_news("全球資金流向 外資 匯率", count=4, trusted_only=True)
-        reply_text(event.reply_token, format_news_text(news,"全球資金流向"))
+    if text == "全球資金流向":
+        dlog("HANDLER", "→ 全球資金流向")
+        reply_text_with_qr(event.reply_token,
+            "💸 全球資金流向\n━━━━━━━━━━━━━━\n"
+            "整合 股 / 債 / 黃金 / VIX / 加密貨幣\nRisk-on vs Risk-off 判讀\n約 10-15 秒後推送結果",
+            [("📊 外匯", "外匯市場分析"), ("🔗 連動", "市場連動分析")])
+        def _run():
+            data = get_global_capital_flow_analysis()
+            if not data or not data.get("quotes"):
+                # 失敗 fallback 改回原本的新聞
+                news = get_news("全球資金流向 外資 匯率", count=4, trusted_only=True)
+                push_message(user_id, format_news_text(news, "全球資金流向"))
+                return
+            flex = make_global_capital_flow_analysis_flex(data)
+            if flex:
+                push_flex(user_id, flex, "💸 全球資金流向")
+            else:
+                push_message(user_id, "⚠️ 卡片生成失敗")
+        threading.Thread(target=_run, daemon=True).start()
         return
 
     # ══ 新聞查詢 ══
@@ -13704,39 +14142,6 @@ def handle_message(event):
         return
 
     # v10.9.140：「我的提醒」列出所有自訂設定
-    # v10.10.0：debug 看自己的 profile（任何 user 可用，未來 Phase B 會做成正式 UI）
-    if text in ["我的檔案", "我的 profile", "我的profile"]:
-        p = get_user_profile(user_id)
-        first_dt = (datetime.fromtimestamp(p.get("first_seen_ts", 0))
-                    .strftime("%Y-%m-%d %H:%M")
-                    if p.get("first_seen_ts") else "未知")
-        last_dt = (datetime.fromtimestamp(p.get("last_activity_ts", 0))
-                   .strftime("%Y-%m-%d %H:%M")
-                   if p.get("last_activity_ts") else "未知")
-        lines = [
-            "🧠 我的檔案（Phase A 預覽）",
-            "━━━━━━━━━━━━━━",
-            "📊 基礎統計",
-            f"　累計買進：{p.get('total_buys', 0)} 次",
-            f"　累計賣出：{p.get('total_sells', 0)} 次",
-            f"　首次互動：{first_dt}",
-            f"　最近行為：{last_dt}",
-            "",
-            "🌱 投資人格：" + (p.get("persona") or "尚未分析（Phase B 將推出）"),
-            "",
-            "🎯 語言偏好",
-            f"　長度：{p.get('preferences', {}).get('length') or '尚未判斷'}",
-            f"　風格：{p.get('preferences', {}).get('style') or '尚未判斷'}",
-            f"　程度：{p.get('preferences', {}).get('level') or '尚未判斷'}",
-            "",
-            f"⚠️ 行為事件：{len(p.get('behavior_events', []))} 筆",
-            "",
-            "📌 這個檔案會默默累積資料",
-            "未來會用來生成「我的投資助理」報告",
-        ]
-        reply_text(event.reply_token, "\n".join(lines))
-        return
-
     if text in ["我的提醒", "我的提醒設定", "提醒設定"]:
         ua_all = list_user_alerts(user_id)
         if not ua_all:
