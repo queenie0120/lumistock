@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.152"
+VERSION              = "10.10.0"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2173,6 +2173,101 @@ def get_all_user_ids() -> list:
     except Exception as e:
         dlog("BROADCAST", f"撈 user_ids 失敗：{e}")
     return list(uids)
+
+
+# ═══════════════════════════════════════════════════════════════
+# v10.10.0 Phase A：user_profile 模組（地基）
+# 為「我的投資助理 / 投資人格 / 教練週報」鋪路
+# 規格出處：project_lumistock_v2_vision.md Phase A
+# ═══════════════════════════════════════════════════════════════
+USER_PROFILE_FILE = "/tmp/lumistock_user_profiles.json"
+DEFAULT_USER_PROFILE = {
+    # 基礎統計（v10.10.0）
+    "total_buys": 0,                # 累計買進次數
+    "total_sells": 0,               # 累計賣出次數
+    "first_seen_ts": 0,             # 首次互動時間
+    "last_activity_ts": 0,          # 最近一次行為
+
+    # 預留給 Phase B（v10.10.x）
+    "persona": "",                  # "成長型/波段型/存股型/保守型/積極交易型/價值投資型"
+    "persona_updated_ts": 0,
+    "preferences": {                # 語言偏好（用對話累積判斷）
+        "length": "",               # "short" / "long"
+        "style": "",                # "casual" / "professional"
+        "level": "",                # "beginner" / "intermediate" / "advanced"
+    },
+    "behavior_events": [],          # 行為事件 ring buffer（追高/集中/過早停利等）
+}
+
+def _load_user_profiles() -> dict:
+    try:
+        if os.path.exists(USER_PROFILE_FILE):
+            with open(USER_PROFILE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        dlog("USER_PROFILE", f"讀取失敗：{e}")
+    return {}
+
+def _save_user_profiles(d: dict) -> None:
+    try:
+        with open(USER_PROFILE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dlog("USER_PROFILE", f"寫入失敗：{e}")
+
+USER_PROFILES = _load_user_profiles()
+
+def get_user_profile(uid: str) -> dict:
+    """取得 user profile（不存在自動建立 + 補齊缺漏 key）"""
+    p = USER_PROFILES.get(uid)
+    if not p:
+        p = dict(DEFAULT_USER_PROFILE)
+        p["first_seen_ts"] = time.time()
+        USER_PROFILES[uid] = p
+        _save_user_profiles(USER_PROFILES)
+    else:
+        # 升級時若新增 key，自動補預設值（不影響既有）
+        updated = False
+        for k, v in DEFAULT_USER_PROFILE.items():
+            if k not in p:
+                p[k] = v if not isinstance(v, (dict, list)) else (
+                    dict(v) if isinstance(v, dict) else list(v))
+                updated = True
+        if updated:
+            _save_user_profiles(USER_PROFILES)
+    return p
+
+def update_user_profile(uid: str, **fields) -> None:
+    """淺層更新 user profile"""
+    p = get_user_profile(uid)
+    p.update(fields)
+    p["last_activity_ts"] = time.time()
+    _save_user_profiles(USER_PROFILES)
+
+def track_user_action(uid: str, action: str) -> None:
+    """v10.10.0：記錄基礎行為計數
+    action ∈ {'buy', 'sell'}（未來會擴增）"""
+    p = get_user_profile(uid)
+    if action == "buy":
+        p["total_buys"] = p.get("total_buys", 0) + 1
+    elif action == "sell":
+        p["total_sells"] = p.get("total_sells", 0) + 1
+    p["last_activity_ts"] = time.time()
+    _save_user_profiles(USER_PROFILES)
+
+def add_behavior_event(uid: str, event_type: str, detail: str = "") -> None:
+    """v10.10.0：行為事件 ring buffer（Phase B 行為提醒用）
+    event_type 例：'chase_high' / 'over_concentrate' / 'early_stop' / 'avg_down_loser'
+    保留最近 50 筆。"""
+    p = get_user_profile(uid)
+    events = p.get("behavior_events", [])
+    events.append({
+        "type": event_type,
+        "detail": detail[:200],
+        "ts": time.time(),
+    })
+    p["behavior_events"] = events[-50:]
+    _save_user_profiles(USER_PROFILES)
 
 
 def run_portfolio_alerts(force: bool = False) -> dict:
@@ -6238,6 +6333,9 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
            f"　成本　　{cost_total:>10,.0f}（均價 {cost_avg:,.2f}）\n"
            f"　{sign}　{realized_pnl:+,.0f} 元（{pct:+.2f}%）\n"
            f"　剩餘庫存 {remaining:,} 股")
+    # v10.10.0：追蹤行為（Phase A 地基）
+    try: track_user_action(user_id, "sell")
+    except: pass
     return {"ok": True, "msg": msg, "realized_pnl": realized_pnl,
             "remaining_shares": remaining, "name": name,
             "fee": fee, "tax": tax, "gross": gross, "net": net_proceeds}
@@ -6321,6 +6419,9 @@ def process_buy(user_id: str, stock_id: str, buy_shares: int, buy_price: float) 
            f"━━━━━━━━━━━━━━\n"
            f"{change_str}\n"
            f"（折數 {disc_str}）")
+    # v10.10.0：追蹤行為（Phase A 地基）
+    try: track_user_action(user_id, "buy")
+    except: pass
     return {"ok": True, "msg": msg, "is_new": is_new, **msg_payload}
 
 
@@ -13603,6 +13704,39 @@ def handle_message(event):
         return
 
     # v10.9.140：「我的提醒」列出所有自訂設定
+    # v10.10.0：debug 看自己的 profile（任何 user 可用，未來 Phase B 會做成正式 UI）
+    if text in ["我的檔案", "我的 profile", "我的profile"]:
+        p = get_user_profile(user_id)
+        first_dt = (datetime.fromtimestamp(p.get("first_seen_ts", 0))
+                    .strftime("%Y-%m-%d %H:%M")
+                    if p.get("first_seen_ts") else "未知")
+        last_dt = (datetime.fromtimestamp(p.get("last_activity_ts", 0))
+                   .strftime("%Y-%m-%d %H:%M")
+                   if p.get("last_activity_ts") else "未知")
+        lines = [
+            "🧠 我的檔案（Phase A 預覽）",
+            "━━━━━━━━━━━━━━",
+            "📊 基礎統計",
+            f"　累計買進：{p.get('total_buys', 0)} 次",
+            f"　累計賣出：{p.get('total_sells', 0)} 次",
+            f"　首次互動：{first_dt}",
+            f"　最近行為：{last_dt}",
+            "",
+            "🌱 投資人格：" + (p.get("persona") or "尚未分析（Phase B 將推出）"),
+            "",
+            "🎯 語言偏好",
+            f"　長度：{p.get('preferences', {}).get('length') or '尚未判斷'}",
+            f"　風格：{p.get('preferences', {}).get('style') or '尚未判斷'}",
+            f"　程度：{p.get('preferences', {}).get('level') or '尚未判斷'}",
+            "",
+            f"⚠️ 行為事件：{len(p.get('behavior_events', []))} 筆",
+            "",
+            "📌 這個檔案會默默累積資料",
+            "未來會用來生成「我的投資助理」報告",
+        ]
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+
     if text in ["我的提醒", "我的提醒設定", "提醒設定"]:
         ua_all = list_user_alerts(user_id)
         if not ua_all:
