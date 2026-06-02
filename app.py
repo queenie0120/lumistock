@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.154"
+VERSION              = "10.9.155"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4232,15 +4232,110 @@ MARKET_SYMBOLS = {
 }
 
 
+# v10.9.155：銀樓飾金快取（價格動得慢，5 分鐘即可）
+SILVER_SHOP_GOLD_CACHE = {"data": None, "ts": 0}
+SILVER_SHOP_GOLD_TTL = 300  # 5 分鐘
+
+def _fetch_silver_shop_gold() -> dict:
+    """v10.9.155：抓銀樓飾金牌價（gck99.com.tw 金嘉吉珠寶銀樓）
+    這才是「大家買賣黃金的價格」— 不是台銀黃金存摺
+    回傳含黃金 + 白金 賣/買 報價 (per 錢、per 兩、per 公克)
+    1 錢 ≈ 3.75 公克，1 兩 = 10 錢
+    """
+    # 5 分鐘快取
+    if SILVER_SHOP_GOLD_CACHE["data"] and \
+       (time.time() - SILVER_SHOP_GOLD_CACHE["ts"]) < SILVER_SHOP_GOLD_TTL:
+        return SILVER_SHOP_GOLD_CACHE["data"]
+
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+    import re as _re
+    try:
+        url = "https://www.gck99.com.tw/gold.php"
+        r = requests.get(url, headers=headers, timeout=10, verify=False)
+        if r.status_code != 200:
+            dlog("GOLD", f"銀樓 HTTP {r.status_code}")
+            return {}
+        html = r.text
+        # 找每筆「YYYY-MM-DD 星期X」row，每筆 8 個數字：
+        # 黃金賣 / 漲跌 / 黃金買 / 漲跌 / 白金賣 / 漲跌 / 白金買 / 漲跌
+        rows = _re.findall(
+            r'(\d{4}-\d{2}-\d{2})\s*星期[一二三四五六日]([\s\S]{50,1500}?)'
+            r'(?=\d{4}-\d{2}-\d{2}|</table>|</tbody>)',
+            html
+        )
+        for date, block in rows:
+            nums = _re.findall(r'>\s*([\d,]{3,7})\s*<', block)
+            if len(nums) < 8: continue
+            try:
+                gold_sell = int(nums[0].replace(",", ""))
+                gold_buy  = int(nums[2].replace(",", ""))
+                plat_sell = int(nums[4].replace(",", ""))
+                plat_buy  = int(nums[6].replace(",", ""))
+                # 合理性檢查（per 錢；黃金約 15000-30000）
+                if not (5000 <= gold_sell <= 40000): continue
+                if not (gold_buy < gold_sell):       continue
+                data = {
+                    "gold_sell_per_qian": gold_sell,        # 賣出/錢
+                    "gold_buy_per_qian":  gold_buy,         # 回收/錢
+                    "gold_sell_per_tael": gold_sell * 10,   # 賣出/兩
+                    "gold_buy_per_tael":  gold_buy * 10,
+                    "gold_sell_per_gram": gold_sell / 3.75, # 賣出/公克
+                    "gold_buy_per_gram":  gold_buy / 3.75,
+                    "platinum_sell_per_qian": plat_sell,
+                    "platinum_buy_per_qian":  plat_buy,
+                    "platinum_sell_per_tael": plat_sell * 10,
+                    "platinum_buy_per_tael":  plat_buy * 10,
+                    "platinum_sell_per_gram": plat_sell / 3.75,
+                    "platinum_buy_per_gram":  plat_buy / 3.75,
+                    "date": date,
+                    "source": "金嘉吉珠寶銀樓",
+                    "source_url": url,
+                }
+                SILVER_SHOP_GOLD_CACHE["data"] = data
+                SILVER_SHOP_GOLD_CACHE["ts"] = time.time()
+                dlog("GOLD", f"✅ 銀樓飾金 {date}：賣 {gold_sell}/錢、買 {gold_buy}/錢")
+                return data
+            except Exception as e:
+                dlog("GOLD", f"銀樓 row 解析失敗：{e}")
+                continue
+        dlog("GOLD", "銀樓 HTML 找不到有效 row")
+    except Exception as e:
+        dlog("GOLD", f"銀樓飾金抓取失敗：{type(e).__name__}: {e}")
+    return {}
+
+
 def get_taiwan_gold_price() -> dict:
-    """抓台灣黃金價格（每兩 = 37.5 公克）
-    v10.9.32 修正：用正確的台銀網址 + 多重備援
-    1. 台銀金鑽條塊（直接每兩價）→ 最準
-    2. 黃金存摺（每公克 × 37.5）
-    3. XAU/USD × 美元台幣匯率（估算）
+    """抓台灣黃金價格
+    v10.9.155 更新策略順序（依照「大家買賣黃金」的真實場景）：
+    1. 銀樓飾金（gck99）→ 「大家買賣黃金的價格」← 主推
+    2. 台銀金鑽條塊（投資級條塊）→ 投資人實體買賣
+    3. 台銀黃金存摺（每公克）→ 帳戶交易，明確標註「非實體買賣」
+    4. XAU/USD × 美元台幣匯率（估算）→ 國際金價參考
+    回傳 dict 含 source_type ∈ {'jewelry','bullion','passbook','estimate'} 給 UI 區別
     """
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
     import re as _re
+
+    # ── 策略 0（v10.9.155 新主推）：銀樓飾金 ──
+    # 「大家買賣黃金的價格」就是這個 — 不是台銀存摺、不是條塊
+    shop = _fetch_silver_shop_gold()
+    if shop and shop.get("gold_sell_per_tael"):
+        return {
+            "price": shop["gold_sell_per_tael"],      # per 兩（賣出 / 一般人買的價）
+            "gram_price": shop["gold_sell_per_gram"], # per 公克
+            "buy_price": shop["gold_buy_per_tael"],   # 回收價
+            "buy_gram_price": shop["gold_buy_per_gram"],
+            "platinum_sell_per_tael": shop["platinum_sell_per_tael"],
+            "platinum_buy_per_tael":  shop["platinum_buy_per_tael"],
+            "platinum_sell_per_gram": shop["platinum_sell_per_gram"],
+            "platinum_buy_per_gram":  shop["platinum_buy_per_gram"],
+            "source": shop["source"],
+            "source_type": "jewelry",   # ← 銀樓飾金（一般人買賣）
+            "source_url": shop.get("source_url"),
+            "currency": "TWD",
+            "quote_time": shop.get("date", ""),
+            "est": False,
+        }
 
     # 嘗試 1：台銀牌價頁面（正確網址：/gold/quote/recent）
     try:
@@ -4270,6 +4365,7 @@ def get_taiwan_gold_price() -> dict:
                             "price": price_per_tael,
                             "gram_price": gram_price,
                             "source": "台銀金鑽條塊牌價",
+                            "source_type": "bullion",   # v10.9.155：投資級條塊
                             "currency": "TWD",
                             "quote_time": quote_time,
                             "est": False
@@ -4294,6 +4390,7 @@ def get_taiwan_gold_price() -> dict:
                             "price": price_per_tael,
                             "gram_price": gram_price,
                             "source": "台銀黃金存摺牌價",
+                            "source_type": "passbook",  # v10.9.155：黃金存摺（非實體買賣）
                             "currency": "TWD",
                             "quote_time": quote_time,
                             "est": False
@@ -4323,6 +4420,7 @@ def get_taiwan_gold_price() -> dict:
                 "price": twd_per_tael,
                 "gram_price": twd_per_gram,
                 "source": f"國際金價 ${usd_per_oz:.0f}/盎司 × USD/TWD {usdtwd['price']:.2f}",
+                "source_type": "estimate",   # v10.9.155：估算（最末端 fallback）
                 "currency": "TWD",
                 "est": True
             }
@@ -5270,36 +5368,95 @@ def make_taiwan_gold_flex(data: dict) -> dict:
     if not data: return None
     price = data.get("price", 0)
     gram_price = data.get("gram_price", 0)
+    buy_price = data.get("buy_price")
+    buy_gram = data.get("buy_gram_price")
     source = data.get("source", "")
+    source_type = data.get("source_type", "")
     quote_time = data.get("quote_time", "")
     est = data.get("est", False)
 
-    # 來源說明
-    src_label = f"💡 {source}"
-    if est:
-        src_label += "（估算）"
+    # v10.9.155：來源類型標籤
+    if source_type == "jewelry":
+        title = "🥇 台灣金價（銀樓飾金）"
+        type_tag = "💍 銀樓飾金牌價 — 一般人買賣的真實價格"
+        header_color = "#E8B870"   # 較亮的金色
+    elif source_type == "bullion":
+        title = "🥇 台灣金價（投資條塊）"
+        type_tag = "🏦 台銀金鑽條塊 — 投資級實體買賣"
+        header_color = "#E8C99B"
+    elif source_type == "passbook":
+        title = "🥇 台灣金價（黃金存摺）"
+        type_tag = "⚠ 台銀黃金存摺 — 帳戶交易，非實體買賣"
+        header_color = "#D9C5A8"
+    elif source_type == "estimate":
+        title = "🥇 台灣金價（國際估算）"
+        type_tag = "📊 國際金價 × 匯率估算"
+        header_color = "#D9C5A8"
+    else:
+        title = "🥇 台灣金價"
+        type_tag = source
+        header_color = "#E8C99B"
+
+    contents = [
+        {"type":"box","layout":"horizontal","contents":[
+            {"type":"text","text":"每兩（37.5 克）","size":"xxs","color":"#A07560","flex":3},
+            {"type":"text","text":"賣出 / 一般人買價","size":"xxs","color":"#9B6B5A","flex":4,"align":"end"},
+        ]},
+        {"type":"text","text":f"NT$ {price:,.0f}","size":"xxl","weight":"bold","color":"#E89B82"},
+        {"type":"text","text":f"每公克 NT$ {gram_price:,.2f}","size":"sm","color":"#A07560"},
+    ]
+    # 回收價（only 銀樓飾金有）
+    if buy_price and source_type == "jewelry":
+        contents += [
+            {"type":"separator","color":"#F0D5C0"},
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":"回收價（賣回去）","size":"xxs","color":"#A07560","flex":3},
+                {"type":"text","text":f"NT$ {buy_price:,.0f} / 兩","size":"xxs","color":"#7AABBE","flex":4,"align":"end","weight":"bold"},
+            ]},
+            {"type":"text","text":f"每公克 NT$ {buy_gram:,.2f}",
+             "size":"xxs","color":"#7AABBE"},
+        ]
+
+    # 白金（only 銀樓飾金有）
+    plat_sell = data.get("platinum_sell_per_tael")
+    plat_buy = data.get("platinum_buy_per_tael")
+    if plat_sell and source_type == "jewelry":
+        contents += [
+            {"type":"separator","color":"#F0D5C0","margin":"sm"},
+            {"type":"text","text":"⚪ 白金（鉑金）","size":"sm","color":"#A05A48","weight":"bold"},
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":"賣出 / 兩","size":"xxs","color":"#A07560","flex":3},
+                {"type":"text","text":f"NT$ {plat_sell:,.0f}","size":"xxs","color":"#5B4040","flex":4,"align":"end","weight":"bold"},
+            ]},
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":"回收 / 兩","size":"xxs","color":"#A07560","flex":3},
+                {"type":"text","text":f"NT$ {plat_buy:,.0f}","size":"xxs","color":"#7AABBE","flex":4,"align":"end"},
+            ]},
+        ]
+
+    # 來源 + 時間
+    contents += [
+        {"type":"separator","color":"#F0D5C0","margin":"sm"},
+        {"type":"text","text":type_tag,"size":"xxs","color":"#5B4040","wrap":True},
+    ]
     if quote_time:
-        src_label += f"\n📅 掛牌：{quote_time}"
+        contents.append({"type":"text","text":f"📅 掛牌：{quote_time}",
+                         "size":"xxs","color":"#A07560"})
+    contents.append({"type":"text","text":f"⏰ 查詢：{now_taipei().strftime('%m/%d %H:%M')}",
+                     "size":"xxs","color":"#B8B8B8"})
+    if est:
+        contents.append({"type":"text","text":"⚠️ 國際估算，僅供參考","size":"xxs",
+                         "color":"#D97A5C","wrap":True})
 
     return {
-        "type":"bubble","size":"kilo",
+        "type":"bubble","size":"mega",
         "header":{
-            "type":"box","layout":"vertical","backgroundColor":"#E8C99B","paddingAll":"10px",
-            "contents":[{"type":"text","text":"🥇 台灣金價","size":"sm","color":"#FFFFFF","weight":"bold"}]
+            "type":"box","layout":"vertical","backgroundColor":header_color,"paddingAll":"10px",
+            "contents":[{"type":"text","text":title,"size":"sm","color":"#FFFFFF","weight":"bold"}]
         },
         "body":{
             "type":"box","layout":"vertical","paddingAll":"12px","spacing":"sm",
-            "contents":[
-                {"type":"text","text":"每兩（37.5 克）","size":"xxs","color":"#A07560"},
-                {"type":"text","text":f"NT$ {price:,.0f}","size":"xxl","weight":"bold","color":"#E89B82"},
-                {"type":"separator","color":"#F0D5C0"},
-                {"type":"text","text":"每公克","size":"xxs","color":"#A07560"},
-                {"type":"text","text":f"NT$ {gram_price:,.2f}","size":"md","color":"#E89B82","weight":"bold"},
-                {"type":"separator","color":"#F0D5C0"},
-                {"type":"text","text":src_label,"size":"xxs","color":"#A07560","wrap":True},
-                {"type":"text","text":f"⏰ 查詢：{now_taipei().strftime('%m/%d %H:%M')}",
-                 "size":"xxs","color":"#B8B8B8"}
-            ]
+            "contents": contents
         }
     }
 
