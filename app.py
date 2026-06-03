@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.161"
+VERSION              = "10.9.162"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6057,10 +6057,61 @@ def get_sparkline(closes: list) -> str:
     bars="▁▂▃▄▅▆▇█"
     return "".join(bars[int((c-mn)/(mx-mn)*7)] for c in data)
 
+# v10.9.162：KD（Stochastic 9 日）— 只用 close 近似
+def _kd_from_closes(closes: list, n: int = 9):
+    """近似版 KD：用 close 當 high/low（手上只有收盤序列時的常見近似）
+    回傳 (K, D)；資料不足回 (50, 50)。"""
+    if not closes or len(closes) < n + 3:
+        return (50.0, 50.0)
+    K, D = 50.0, 50.0
+    # 取後段算，避免前期 init 影響
+    start = max(n - 1, len(closes) - 60)
+    for i in range(start, len(closes)):
+        window = closes[max(0, i - n + 1):i + 1]
+        lo, hi = min(window), max(window)
+        rsv = ((closes[i] - lo) / (hi - lo) * 100) if hi > lo else 50.0
+        K = K * 2 / 3 + rsv / 3        # 標準台股 KD 平滑公式
+        D = D * 2 / 3 + K / 3
+    return (K, D)
+
+
+# v10.9.162：MACD（EMA12 / EMA26 / Signal 9）
+def _macd_from_closes(closes: list):
+    """回傳 (DIF, MACD, Hist)；資料不足回 (0, 0, 0)。
+    DIF = EMA12 - EMA26
+    MACD（Signal）= EMA9 of DIF
+    Hist = DIF - MACD
+    """
+    if not closes or len(closes) < 35:
+        return (0.0, 0.0, 0.0)
+    def ema(seq, span):
+        k = 2 / (span + 1)
+        e = seq[0]
+        for v in seq[1:]:
+            e = v * k + e * (1 - k)
+        return e
+    # 累積 EMA 序列以算 DIF 歷史
+    def ema_series(seq, span):
+        k = 2 / (span + 1)
+        out = [seq[0]]
+        for v in seq[1:]:
+            out.append(v * k + out[-1] * (1 - k))
+        return out
+    ema12_seq = ema_series(closes, 12)
+    ema26_seq = ema_series(closes, 26)
+    dif_seq = [a - b for a, b in zip(ema12_seq, ema26_seq)]
+    macd = ema(dif_seq[-30:], 9)   # Signal 線
+    dif = dif_seq[-1]
+    hist = dif - macd
+    return (dif, macd, hist)
+
+
 def get_kline_analysis(closes: list) -> dict:
     if not closes or len(closes)<2:
         return {"spark":"▄▄▄▄▄▄▄▄▄▄","trend":"--","rsi":0,"rsi_label":"--",
-                "ma5":None,"ma20":None,"ma60":None,"ma120":None,"ma240":None}
+                "ma5":None,"ma20":None,"ma60":None,"ma120":None,"ma240":None,
+                "k":50,"d":50,"kd_label":"--",
+                "macd_dif":0,"macd":0,"macd_hist":0,"macd_label":"--"}
     def ma(n): return sum(closes[-n:])/n if len(closes)>=n else None
     ma5=ma(5); ma20=ma(20); ma60=ma(60); ma120=ma(120); ma240=ma(240)
     if ma5 and ma20 and ma60:
@@ -6080,9 +6131,26 @@ def get_kline_analysis(closes: list) -> dict:
     elif rsi<20: rl="極度超賣"
     elif rsi<30: rl="短線偏冷"
     else:        rl="中性區間"
+    # v10.9.162：補 KD + MACD
+    k, d = _kd_from_closes(closes)
+    if   k > 80 and d > 80:        kd_label = "高檔鈍化（過熱）"
+    elif k < 20 and d < 20:        kd_label = "低檔鈍化（超賣）"
+    elif k > d and k > 50:         kd_label = "黃金交叉偏多"
+    elif k < d and k < 50:         kd_label = "死亡交叉偏空"
+    elif k > d:                    kd_label = "K > D 偏多"
+    else:                          kd_label = "K < D 偏空"
+    macd_dif, macd_s, macd_h = _macd_from_closes(closes)
+    if   macd_dif > 0 and macd_h > 0: macd_label = "DIF > 0 且柱狀放大（強勢）"
+    elif macd_dif > 0 and macd_h < 0: macd_label = "DIF 仍正但動能轉弱"
+    elif macd_dif < 0 and macd_h < 0: macd_label = "DIF < 0 且柱狀擴大（弱勢）"
+    elif macd_dif < 0 and macd_h > 0: macd_label = "DIF 仍負但動能回穩"
+    else:                              macd_label = "中性"
     return {"spark":get_sparkline(closes),"trend":trend,
             "ma5":ma5,"ma20":ma20,"ma60":ma60,"ma120":ma120,"ma240":ma240,
-            "rsi":rsi,"rsi_label":rl}
+            "rsi":rsi,"rsi_label":rl,
+            "k":k,"d":d,"kd_label":kd_label,
+            "macd_dif":macd_dif,"macd":macd_s,"macd_hist":macd_h,
+            "macd_label":macd_label}
 
 def _load_finmind_closes_adj(stock_id: str) -> list:
     """v10.9.59：用 FinMind TaiwanStockPriceAdj 抓還原股價收盤序列（近 1 年）。
@@ -8215,6 +8283,11 @@ def _build_stock_context(sid: str, user_cost: float = 0.0) -> str:
         ma = lambda v: f"{v:.1f}" if v else "N/A"
         lines.append(f"　技術：趨勢 {k.get('trend','--')}　RSI {k.get('rsi',0):.0f}（{k.get('rsi_label','')}）")
         lines.append(f"　均線 MA5 {ma(k.get('ma5'))} / MA20 {ma(k.get('ma20'))} / MA60 {ma(k.get('ma60'))} / MA120 {ma(k.get('ma120'))} / MA240 {ma(k.get('ma240'))}")
+        # v10.9.162：KD + MACD（規格寫了但之前漏實裝）
+        if k.get("k") is not None:
+            lines.append(f"　KD：K {k['k']:.1f} / D {k.get('d',0):.1f}（{k.get('kd_label','--')}）")
+        if k.get("macd") is not None:
+            lines.append(f"　MACD：DIF {k.get('macd_dif',0):.2f} / MACD {k.get('macd',0):.2f} / 柱 {k.get('macd_hist',0):+.2f}（{k.get('macd_label','--')}）")
     except: pass
     # 籌碼（用 advice 內含的近期 / 或法人，簡化用 advice 的支撐目標）
     try:
