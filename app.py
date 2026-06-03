@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.158"
+VERSION              = "10.9.159"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -8080,11 +8080,18 @@ def _classify_question_intent(text: str) -> tuple:
     if any(k in t for k in function_kws):
         return ("function", "function")
 
-    # 2. 完整分析 / 研究報告
+    # 2. 完整分析 / 研究報告 / 持股決策 → deep_analysis 模式
     full_kws = ["完整分析", "投資報告", "完整看", "完整研究", "深度分析", "詳細分析",
-                "值得投資嗎", "幫我分析", "給我報告"]
+                "值得投資嗎", "幫我分析", "給我報告", "完整報告", "完整評估"]
     if any(k in t for k in full_kws):
-        return ("full_analysis", "report")
+        return ("full_analysis", "deep_analysis")
+
+    # v10.9.159：個人成本相關 / 持股決策 → 也走 deep_analysis
+    cost_kws = ["我買在", "我成本", "我進場", "我持有", "我手上"]
+    decision_kws = ["要怎麼處理", "怎麼辦", "繼續抱", "續抱嗎", "值得抱嗎",
+                    "要不要賣", "要不要加碼", "要不要減碼", "該怎麼辦"]
+    if any(k in t for k in cost_kws) or any(k in t for k in decision_kws):
+        return ("full_analysis", "deep_analysis")
 
     # 3. 關聯性問題（★ 最重要的特殊處理）
     relation_kws = ["有關係", "有關嗎", "有關連", "是不是", "概念股", "供應鏈",
@@ -8408,6 +8415,44 @@ def ai_qa_answer(user_id: str, question: str) -> str:
         "report":       "→ 模式：研究報告版。可以使用完整 8 段（基本/技術/籌碼/新聞/風險/支撐壓力/操作/AI 信心）。",
         "quick":        "→ 模式：快速結論版。先 1 句結論 → 3 個理由 → 風險。簡潔有力。",
         "function":     "→ 模式：功能客服版。用步驟列表回答 Lumistock 操作問題，不要變成投資分析。",
+        # v10.9.159：深度分析模式 — 12 段顧問報告
+        "deep_analysis": """→ 模式：深度分析顧問報告（12 段，必照架構）
+規格出處：project_ai_deep_analysis_framework.md
+
+【必含 12 段】
+1️⃣ 個股與持股背景（代號名稱 + 用戶成本 + 目前狀態 + 分析目的）
+2️⃣ ★ 總結結論（先講重點！續抱/停利/減碼 + 具體價位）
+3️⃣ 基本面分析（獲利 + 月營收動向 + 評價判斷，要解釋意義不只貼數字）
+4️⃣ 技術面分析（位置 + 3 壓力 + 3 支撐 + 結論「站穩 X 轉強、跌破 Y 減碼」）
+5️⃣ 消息面分析（重大消息分「短線 vs 中長線」+ 產業題材）
+6️⃣ 籌碼面分析（法人動向 + 融資借券 + 結論）
+7️⃣ 依持股成本分析（新進場 vs 持有人視角分離）
+8️⃣ 操作策略 3 種（A 穩健 / B 積極 / C 保守，各含做法+適合誰）
+9️⃣ 四大面向總表（表格化：面向 | 判斷 | 重點）
+🔟 價位判斷表（表格化：股價位置 | 判斷 | 操作）
+1️⃣1️⃣ 最終建議（3-5 句具體做法）
+1️⃣2️⃣ 一句話總結
+
+【表格輸出格式】（LINE 純文字，用 │ 對齊）
+面向    │ 判斷         │ 重點
+─────────────────────────────────────
+基本面  │ 偏多但需觀察 │ EPS 強，月營收要追蹤
+技術面  │ 高檔震盪    │ 1,000 防守，1,100 站穩才轉強
+
+【3 策略必並列】
+策略 A：穩健型（先賣 1/3~1/2 鎖獲利，剩下續抱）
+策略 B：積極型（全部續抱 + 移動停利線 X 元）
+策略 C：保守型（先賣一半，剩下用 Y 元防守）
+
+【絕對禁止】
+- 「投資決策取決於多重因素」「請評估」「請審慎判斷」
+- 給單一價位但不給「站穩/跌破」對應動作
+- 不給 3 策略
+- 不給表格化總結
+
+【資料不足處理】
+某項資料區沒提供 → 該段標「該欄資料不足，這部分不下定論」，
+其他段照常分析，不可整體 fallback。""",
     }
     mode_hint = mode_instructions.get(response_mode, mode_instructions["professional"])
 
@@ -8435,13 +8480,23 @@ def ai_qa_answer(user_id: str, question: str) -> str:
             messages.append({"role": role, "content": content[:800]})
     messages.append({"role": "user", "content": user_msg})
 
-    answer = groq_chat(messages, max_tokens=1800, temperature=0.3, timeout=30)
+    # v10.9.159：deep_analysis 模式需要更長 output（12 段顧問報告）
+    if response_mode == "deep_analysis":
+        max_tokens, timeout = 3500, 45
+    else:
+        max_tokens, timeout = 1800, 30
+    answer = groq_chat(messages, max_tokens=max_tokens, temperature=0.3, timeout=timeout)
     if not answer:
         return ("🤖 AI 暫時無法回答（可能是 API 忙碌或額度限制）\n"
                 "請稍後再試，或換個方式提問")
     # 保險：確保有免責聲明
     if "不構成投資建議" not in answer and qtype in ("stock", "market", "compare_knowledge"):
         answer += "\n\n⚠ 僅供參考，不構成投資建議"
+    # v10.9.159：LINE TextMessage 5000 字上限。deep_analysis 可能逼近上限 → 截在 4800
+    if len(answer) > 4800:
+        cut_at = answer.rfind("\n", 0, 4750)
+        if cut_at < 0: cut_at = 4750
+        answer = answer[:cut_at] + "\n\n…（內容過長已截斷，可問「續說剩下的」）"
     # v10.9.120：寫入歷史（user + assistant 各一筆）
     _ai_qa_add_history(user_id, "user", q)
     _ai_qa_add_history(user_id, "assistant", answer)
