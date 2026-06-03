@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.155"
+VERSION              = "10.9.156"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6841,7 +6841,14 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
                 target_key = k
                 break
     if not target_key:
-        return {"ok": False, "msg": f"❌ 持股清單裡找不到 {norm}\n請先確認你有持有這檔，或用「新增 代號 股數 均價」建立"}
+        # v10.9.156：不再直接 fail，回傳 not_held flag 讓 handler 提供 Quick Reply
+        return {"ok": False, "not_held": True,
+                "stock_id": norm,
+                "shares": sell_shares,
+                "price": sell_price,
+                "msg": (f"❌ 持股清單找不到 {norm}\n"
+                        f"可能：(1) 尚未新增到持股 (2) 已全數賣出\n"
+                        f"你可以選下方按鈕補建持股、或直接記錄這筆賣出")}
 
     data = portfolio[target_key]
     held_shares = int(data.get("shares", 0))
@@ -6897,6 +6904,73 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
     return {"ok": True, "msg": msg, "realized_pnl": realized_pnl,
             "remaining_shares": remaining, "name": name,
             "fee": fee, "tax": tax, "gross": gross, "net": net_proceeds}
+
+
+# ═══════════════════════════════════════════════════════════════
+# v10.9.156：交易輸入大幅簡化
+#   - 多行批次（一個訊息含多筆）
+#   - 簡化 prefix「賣 / 買」即可（不用「賣出 / 買進」）
+#   - 無 prefix 自動判斷（有持股→賣、無→新增）
+# ═══════════════════════════════════════════════════════════════
+TRADE_LINE_RE = re.compile(
+    r"^(?:(買進|賣出|買|賣|加碼|新增|sell|buy)\s+)?"
+    r"([0-9]{4,6}[A-Za-z]?)\s+"
+    r"(\d+)\s+"
+    r"([\d]+(?:\.\d+)?)\s*$",
+    re.IGNORECASE,
+)
+
+def _parse_one_trade_line(line: str):
+    """v10.9.156：解析單行交易，回傳 (action, sid, shares, price) 或 None
+    action ∈ {'buy', 'sell', 'auto'}"""
+    line = line.replace("　", " ").replace("\t", " ").strip()
+    m = TRADE_LINE_RE.match(line)
+    if not m:
+        return None
+    action_raw, sid, shares, price = m.groups()
+    if action_raw in ("買", "買進", "新增", "加碼", "buy", "Buy", "BUY"):
+        action = "buy"
+    elif action_raw in ("賣", "賣出", "sell", "Sell", "SELL"):
+        action = "sell"
+    else:
+        action = "auto"
+    return action, sid.upper(), int(shares), float(price)
+
+
+def parse_trade_lines(text: str) -> list:
+    """v10.9.156：解析整個訊息（可能含多行），回傳 list of dict"""
+    out = []
+    for raw in (text or "").splitlines():
+        parsed = _parse_one_trade_line(raw)
+        if not parsed: continue
+        action, sid, shares, price = parsed
+        out.append({
+            "action": action,
+            "stock_id": sid,
+            "shares": shares,
+            "price": price,
+            "raw": raw.strip(),
+        })
+    return out
+
+
+def _resolve_auto_action(user_id: str, sid: str) -> str:
+    """auto action 解析：若該股已有持股 → 'sell'；否則 → 'buy'"""
+    try:
+        portfolio = load_portfolio()
+        norm = sid.replace(".TW", "")
+        candidates = [_pf_key(user_id, norm), _pf_key(user_id, sid),
+                      norm, sid, sid + ".TW"]
+        for k in candidates:
+            if k in portfolio and portfolio[k].get("user_id") == user_id:
+                return "sell"
+    except Exception:
+        pass
+    return "buy"
+
+
+# v10.9.156：暫存「找不到持股」的賣出指令，等用戶 Quick Reply 決定
+PENDING_NOT_HELD_SELL = {}   # {user_id: {"sid":..., "shares":..., "price":..., "ts":...}}
 
 
 def process_buy(user_id: str, stock_id: str, buy_shares: int, buy_price: float) -> dict:
@@ -14055,18 +14129,21 @@ def handle_message(event):
         return
     if text=="賣出說明":
         reply_text(event.reply_token,
-            "💸 登記賣出 — 兩種方式\n━━━━━━━━━━━━━━\n"
-            "1️⃣ 手動輸入\n"
-            "　格式：賣出 代碼 股數 賣價\n"
-            "　例如：賣出 6742 1000 59.5\n\n"
-            "2️⃣ 截圖辨識 ✨\n"
+            "💸 登記賣出 — 三種方式（v10.9.156 大幅簡化）\n━━━━━━━━━━━━━━\n"
+            "1️⃣ 一筆手動輸入（極簡）\n"
+            "　賣 6742 1000 59.5\n"
+            "　（也可用「賣出」「sell」開頭，省略也行）\n\n"
+            "2️⃣ 多筆一次輸入（NEW！）\n"
+            "　一個訊息打多行，例如：\n"
+            "　　賣 6742 1000 59.5\n"
+            "　　賣 2367 5000 66\n"
+            "　　買 2330 1000 1000\n"
+            "　系統會依序處理，最後給彙整報告\n\n"
+            "3️⃣ 截圖辨識 ✨\n"
             "　傳券商「成交回報（賣）」截圖\n"
-            "　AI 自動辨識 → 預估已實現損益\n"
-            "　→ 卡片上點 [✅ 確認賣出] 即可（v10.9.89 起免打字）\n\n"
-            "系統會自動：\n"
-            "　• 從庫存扣股數（成本均價不變）\n"
-            "　• 計算已實現損益（含手續費 + 證交稅）\n"
-            "　• 寫入 Google Sheets「賣出紀錄」")
+            "　AI 自動辨識 → 卡片上點 [✅ 確認賣出] 即可\n\n"
+            "📌 找不到持股不會直接 fail，會問你「改成新增」或「取消」\n"
+            "📌 系統會自動：扣股數、算手續費+證交稅、寫 Sheets")
         return
     if text=="加碼說明":
         # v10.9.86：加碼已併入「新增」智能模式，這裡保留為說明轉址
@@ -14215,6 +14292,116 @@ def handle_message(event):
                 "　• 新部位：等同新增")
         return
     # v10.9.81：手動「賣出 代號 股數 賣價」
+    # ════════════════════════════════════════════════════════════
+    # v10.9.156：交易輸入大幅簡化（批次 + 不 fail + Quick Reply）
+    # 支援：
+    #   - 「賣 / 賣出 / 買 / 買進 / 新增 / 加碼」prefix（或無 prefix 自動判斷）
+    #   - 多行批次：一個訊息含多筆，每行一筆
+    #   - 找不到持股：Quick Reply 改成新增 / 取消
+    # ════════════════════════════════════════════════════════════
+    # 找不到持股 → Quick Reply 後續處理
+    if text in ["記為新增", "把這筆當新增", "改成新增"] and user_id in PENDING_NOT_HELD_SELL:
+        pending = PENDING_NOT_HELD_SELL.pop(user_id)
+        if (time.time() - pending.get("ts", 0)) > 600:
+            reply_text(event.reply_token, "⏱ 已超過 10 分鐘逾時，請重新輸入")
+            return
+        r = process_buy(user_id, pending["sid"], pending["shares"], pending["price"])
+        reply_text(event.reply_token, f"（已改記為新增）\n{r.get('msg', '完成')}")
+        return
+    if text in ["取消這筆", "取消交易"] and user_id in PENDING_NOT_HELD_SELL:
+        PENDING_NOT_HELD_SELL.pop(user_id, None)
+        reply_text(event.reply_token, "✅ 已取消")
+        return
+
+    # 嘗試解析整個訊息為交易（可多行）
+    trades = parse_trade_lines(text)
+    # 條件：(1) 至少一筆 (2) 且能明確認定是交易輸入
+    #   - 多行 → 一定是
+    #   - 單行且有 prefix → 一定是
+    #   - 單行無 prefix → 只在「3 個 token 且第 1 個是純數字代號」時觸發
+    is_trade_input = False
+    if trades:
+        if len(trades) >= 2:
+            is_trade_input = True
+        elif trades[0]["action"] != "auto":
+            is_trade_input = True
+        else:
+            # 單行無 prefix：避免誤觸發其他指令，只接受純數字股票代號開頭
+            first_token = (text.strip().split() or [""])[0]
+            if first_token.isdigit() and len(first_token) >= 4:
+                is_trade_input = True
+
+    if is_trade_input:
+        results = []      # [(trade, result_msg_or_dict)]
+        not_held_pending = None
+        for t in trades:
+            action = t["action"]
+            if action == "auto":
+                action = _resolve_auto_action(user_id, t["stock_id"])
+            try:
+                if action == "buy":
+                    r = process_buy(user_id, t["stock_id"], t["shares"], t["price"])
+                else:
+                    r = process_sell(user_id, t["stock_id"], t["shares"], t["price"])
+            except Exception as e:
+                r = {"ok": False, "msg": f"❌ {t['stock_id']} 處理失敗：{type(e).__name__}: {e}"}
+            results.append((t, action, r))
+            # 第一筆 not_held 暫存（單筆時可走 Quick Reply）
+            if (not not_held_pending) and (not r.get("ok")) and r.get("not_held"):
+                not_held_pending = {
+                    "sid":    r.get("stock_id"),
+                    "shares": r.get("shares"),
+                    "price":  r.get("price"),
+                    "ts":     time.time(),
+                }
+
+        # 組訊息
+        if len(results) == 1:
+            t, action, r = results[0]
+            msg = r.get("msg", "完成")
+            if r.get("ok"):
+                reply_text(event.reply_token, msg)
+            elif r.get("not_held") and not_held_pending:
+                PENDING_NOT_HELD_SELL[user_id] = not_held_pending
+                reply_text_with_qr(event.reply_token, msg,
+                    [("📝 改成新增", "改成新增"),
+                     ("🚫 取消", "取消交易")])
+            else:
+                reply_text(event.reply_token, msg)
+            return
+
+        # 批次回覆 — 統一報告
+        lines = [f"📊 批次交易結果（{len(results)} 筆）", "━━━━━━━━━━━━━━"]
+        ok_n = 0
+        for (t, action, r) in results:
+            action_zh = "🟢 賣" if action == "sell" else "🔴 買"
+            if r.get("ok"):
+                ok_n += 1
+                lines.append(f"✅ {action_zh} {t['stock_id']} "
+                             f"{t['shares']:,} @ {t['price']:.2f}")
+                # 抓 realized_pnl 或 new_avg
+                if "realized_pnl" in r:
+                    lines.append(f"　已實現損益 {r['realized_pnl']:+,.0f}")
+            else:
+                tag = "查無持股" if r.get("not_held") else "失敗"
+                lines.append(f"❌ {action_zh} {t['stock_id']} "
+                             f"{t['shares']:,} @ {t['price']:.2f}（{tag}）")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append(f"成功 {ok_n} / {len(results)}")
+        if not_held_pending and len(results) <= 3:
+            # 批次只記第一個 not_held 給 Quick Reply
+            PENDING_NOT_HELD_SELL[user_id] = not_held_pending
+            lines.append(f"\n📌 {not_held_pending['sid']} 未持有")
+            reply_text_with_qr(event.reply_token, "\n".join(lines),
+                [("📝 改成新增", "改成新增"),
+                 ("🚫 取消", "取消交易")])
+        else:
+            reply_text(event.reply_token, "\n".join(lines))
+        return
+    # ════════════════════════════════════════════════════════════
+    # 以下為舊版單行「賣出 XXX」格式 — 保留 backward compatibility
+    # 但實際上幾乎都會被上面新版 parse_trade_lines 攔截到
+    # ════════════════════════════════════════════════════════════
     if text.startswith("賣出 "):
         parts = text.split()
         if len(parts) == 4:
