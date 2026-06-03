@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.160"
+VERSION              = "10.9.161"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10563,9 +10563,16 @@ REC_CATEGORY_SUBTITLE = {
 
 
 def make_rec_card(rank:int, s:dict)->dict:
-    """v10.9.135：觀察清單卡片 — AI 深度分析版 + 7 狀態徽章 + 5 段拆分。"""
-    is_up=s["pct"]>=0; color="#D97A5C" if is_up else "#7AABBE"
-    arrow="▲" if is_up else "▼"; pct_str=f"{arrow} {abs(s['pct']):.2f}%"
+    """v10.9.135：觀察清單卡片 — AI 深度分析版 + 7 狀態徽章 + 5 段拆分。
+    v10.9.161：補回漲跌絕對值（之前只剩百分比）"""
+    pct = s.get("pct", 0) or 0
+    price = s.get("price", 0) or 0
+    is_up = pct >= 0
+    color = "#D97A5C" if is_up else "#7AABBE"
+    arrow = "▲" if is_up else "▼"
+    # v10.9.161：算出絕對漲跌（從 price + pct 反推，因為 rec dict 未存 chg）
+    chg_abs = abs(price * pct / (100 + pct)) if (100 + pct) != 0 else 0
+    pct_str = f"{arrow} {chg_abs:.2f}　{abs(pct):.2f}%"
     filled=s["score"]//10; bar="█"*filled+"░"*(10-filled)
     ai = s.get("ai") or {}
     # AI 分析 fallback：若 AI 未回，用 signals 拼湊
