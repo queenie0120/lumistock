@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.157"
+VERSION              = "10.9.158"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -6912,29 +6912,73 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
 #   - 簡化 prefix「賣 / 買」即可（不用「賣出 / 買進」）
 #   - 無 prefix 自動判斷（有持股→賣、無→新增）
 # ═══════════════════════════════════════════════════════════════
+# v10.9.158：聰明 parser — 容忍動作貼代號、各種分隔符、股/張單位、元字尾
+# 接受格式（單行）：
+#   賣 6742 1000 59.5   ← 最標準
+#   賣6742 1000 59.5    ← 動作貼代號
+#   6742 1000 59.5      ← 無動作自動判斷
+#   賣 6742, 1000, 59.5 ← 逗號 / 全形分隔
+#   賣 6742 1張 59.5    ← 1張=1000股
+#   賣 6742 1000股 59.5
+#   賣 6742 1000 59.5元
+#   售出 6742 1000 59.5  ← 同義詞
 TRADE_LINE_RE = re.compile(
-    r"^(?:(買進|賣出|買|賣|加碼|新增|sell|buy)\s+)?"
-    r"([0-9]{4,6}[A-Za-z]?)\s+"
-    r"(\d+)\s+"
-    r"([\d]+(?:\.\d+)?)\s*$",
-    re.IGNORECASE,
+    r"""^\s*
+    (?P<action>賣出|買進|售出|加碼|新增|賣|買|sell|buy)?    # 動作（可省、可貼代號）
+    \s*[，,、\s]*\s*
+    (?P<sid>\d{4,6}[A-Za-z]?)                              # 代號 4-6 位
+    \s*[，,、@\s]*\s*
+    (?P<shares>\d+(?:\.\d+)?)                              # 股數（允許小數，後續判斷張）
+    \s*(?P<unit>股|張)?                                    # 單位（張=1000股）
+    \s*[，,、@\s]*\s*
+    (?P<price>\d+(?:\.\d+)?)                               # 價格
+    \s*(?:元|塊|TWD|NTD)?                                  # 價格單位（吃掉）
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
+
+_ACTION_BUY = {"買", "買進", "新增", "加碼", "buy"}
+_ACTION_SELL = {"賣", "賣出", "售出", "sell"}
+
 
 def _parse_one_trade_line(line: str):
     """v10.9.156：解析單行交易，回傳 (action, sid, shares, price) 或 None
+    v10.9.158：parser 變聰明 — 容忍格式
     action ∈ {'buy', 'sell', 'auto'}"""
+    if not line: return None
+    # 全形字轉半形（。, 、 ， 都已在 regex 處理）
     line = line.replace("　", " ").replace("\t", " ").strip()
     m = TRADE_LINE_RE.match(line)
     if not m:
         return None
-    action_raw, sid, shares, price = m.groups()
-    if action_raw in ("買", "買進", "新增", "加碼", "buy", "Buy", "BUY"):
+    action_raw = (m.group("action") or "").lower()
+    sid = m.group("sid").upper()
+    shares_raw = m.group("shares")
+    unit = m.group("unit") or ""
+    price_raw = m.group("price")
+
+    if action_raw in _ACTION_BUY:
         action = "buy"
-    elif action_raw in ("賣", "賣出", "sell", "Sell", "SELL"):
+    elif action_raw in _ACTION_SELL:
         action = "sell"
     else:
         action = "auto"
-    return action, sid.upper(), int(shares), float(price)
+
+    # v10.9.158：「1張」「2.5張」→ 換算成股
+    try:
+        shares_num = float(shares_raw)
+    except: return None
+    if unit == "張":
+        shares = int(shares_num * 1000)
+    else:
+        shares = int(shares_num)
+
+    try: price = float(price_raw)
+    except: return None
+    if shares <= 0 or price <= 0:
+        return None
+    return action, sid, shares, price
 
 
 def parse_trade_lines(text: str) -> list:
