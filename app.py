@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.156"
+VERSION              = "10.9.157"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -7538,6 +7538,37 @@ AI_QA_SYSTEM_PROMPT = """你是 Lumistock 慧股拾光的 AI 投資助理，由 
 - 提醒「配息≠獲利」「總報酬比殖利率重要」
 - 禁止說「哪個比較好」，要說「哪個比較適合什麼樣的人」
 - 可以「核心 + 衛星」搭配
+
+━━━━━━━━━━━━━━━━━━
+【🚨 v10.9.157 強制專業規則 — 違反 = 失敗】
+━━━━━━━━━━━━━━━━━━
+
+❌ 絕對禁止這些「GPT 式廢話」（會被使用者罵）：
+- 「投資決策取決於多重因素」
+- 「請評估自身風險承受度」
+- 「需要謹慎考慮 / 謹慎評估」
+- 「建議您審慎決定 / 自行判斷」
+- 「無法給出明確建議」
+- 「投資需謹慎」（這句已隱含在免責，不要再講）
+- 任何「請自己想」「我無法替你判斷」式的迴避
+
+✅ 必做：
+1. **必須引用資料區的具體數字** — 股價、RSI、均線、EPS、毛利率、法人買賣超、月營收 YoY。看到什麼用什麼。
+2. **必須給具體判斷** — 偏多 / 偏空 / 等回測 / 暫不建議追高 / 站穩 X 元再評估。
+3. **必須給具體價位**（如資料區提供）：支撐約 X / 壓力約 Y / 停損可設 Z / 目標 W。
+4. **使用者問「我買在 X」「我成本 X」時** —
+   - 算出目前損益（資料區會直接提供）
+   - 引用支撐 / 壓力位
+   - 給「續抱 / 減碼 / 出場 / 等回測加碼」的具體建議
+   - 例：「目前 + 2%，未跌破 5 日線且法人續買，可續抱；若跌破 X 元先減半」
+5. **資料區真的沒提到的事實** → 直接說「資料不足，這部分不下定論」，不要編、不要含糊。
+6. **回答長度與題型對應** — 不要每次都長篇大論：
+   - 「可以追嗎」「能不能買」→ 結論 + 3 個理由 + 風險（3-5 段以內）
+   - 「我買在 X」→ 結論（續抱/減碼）+ 2-3 個理由 + 觸發條件
+
+🎯 你的身份是「**20 年台股投資顧問**」，不是「**怕被告所以打太極的客服**」。
+   有資料就分析、沒資料就承認、有風險就指出。
+   專業 ≠ 模糊；模糊 = 不專業。
 """
 
 
@@ -7591,6 +7622,54 @@ def _ai_qa_resolve_pronoun(user_id: str, question: str) -> list:
             dlog("AI_QA", f"代名詞解析：{user_id[-6:]} 「{question[:20]}」→ 沿用上次 {stocks}")
             return stocks
     return []
+
+
+# v10.9.157：implicit subject keywords — 問題沒提股票但顯然在問特定股票
+_IMPLICIT_STOCK_KWS = [
+    "我買在", "我成本", "我進場", "我持有", "我手上",
+    "繼續抱", "繼續持有", "要不要賣", "要不要加碼", "要不要減碼",
+    "可不可以追", "可以追嗎", "可以買嗎", "現在能不能", "現在能買",
+    "目前能買", "適合進場", "適合進", "要小心嗎", "風險高嗎",
+    "停損", "停利", "怎麼處理", "怎麼操作",
+]
+
+def _is_implicit_stock_question(q: str) -> bool:
+    """v10.9.157：問題本身沒提股票，但句意明顯是在問特定股票"""
+    return any(k in q for k in _IMPLICIT_STOCK_KWS)
+
+
+def _ai_qa_resolve_implicit_subject(user_id: str) -> list:
+    """v10.9.157：從歷史挖最近一次提到的股票（不要求代名詞）
+    給「我買在667.5 要不要繼續抱」這種沒提股票但顯然在問前面討論過的標的"""
+    h = _ai_qa_get_history(user_id)
+    for entry in reversed(h):
+        if entry.get("role") != "user": continue
+        prev_q = entry.get("content", "")
+        stocks = _detect_stocks_in_question(prev_q)
+        if stocks:
+            dlog("AI_QA", f"隱含主詞解析：{user_id[-6:]} → 沿用上次 {stocks}")
+            return stocks
+    return []
+
+
+# v10.9.157：解析使用者個人成本（「我買在 667.5」「我成本是 100」「進場價 50」）
+def _parse_user_cost(q: str) -> float:
+    patterns = [
+        r"我?\s*買在\s*([\d.]+)",
+        r"我?\s*成本\s*(?:是|為|價|大約)?\s*([\d.]+)",
+        r"進場\s*(?:價|在|價位)?\s*([\d.]+)",
+        r"持有成本\s*([\d.]+)",
+        r"買進\s*([\d.]+)",
+    ]
+    for p in patterns:
+        m = re.search(p, q)
+        if m:
+            try:
+                v = float(m.group(1))
+                if 0 < v < 100000:   # 合理性
+                    return v
+            except: pass
+    return 0.0
 
 
 # v10.9.128 Phase 6：題材 → 台股對應表（讓 AI 看到「黃仁勳提到矽光子」就知道哪幾檔台股受惠）
@@ -8046,13 +8125,21 @@ def _detect_stocks_in_question(text: str) -> list:
     return found[:3]
 
 
-def _build_stock_context(sid: str) -> str:
-    """組單檔股票的資料區文字（供 AI grounding）。"""
+def _build_stock_context(sid: str, user_cost: float = 0.0) -> str:
+    """組單檔股票的資料區文字（供 AI grounding）。
+    v10.9.157：加 user_cost，把「使用者個人買進成本」放進 context"""
     tw = get_tw_stock(sid)
     if not tw:
         return f"[{sid}] 查無即時報價資料"
     name = tw.get("name", sid)
     lines = [f"◆ {sid} {name}"]
+    # v10.9.157：個人成本 + 當前損益
+    if user_cost > 0 and tw.get("price"):
+        cur = tw["price"]
+        pnl_pct = (cur - user_cost) / user_cost * 100
+        sign = "📈 獲利" if pnl_pct >= 0 else "📉 虧損"
+        lines.append(f"　【⭐ 使用者個人成本 {user_cost:.2f}】"
+                     f"目前 {cur:.2f}，{sign} {abs(pnl_pct):.2f}%")
     # v10.9.121：產業類別（基本面 grounding）
     ind = INDUSTRY_CACHE.get(sid, "")
     if ind:
@@ -8212,11 +8299,19 @@ def ai_qa_answer(user_id: str, question: str) -> str:
         # v10.9.120：若沒抓到 ticker 但有代名詞 → 沿用歷史最近提到的股票
         if not stocks:
             stocks = _ai_qa_resolve_pronoun(user_id, q)
+        # v10.9.157：問題沒提股票也沒代名詞，但句意是在問特定股票（如「我買在 X 要不要繼續抱」）
+        # → 沿用歷史最近一檔
+        if not stocks and _is_implicit_stock_question(q):
+            stocks = _ai_qa_resolve_implicit_subject(user_id)
+        # v10.9.157：解析使用者個人成本（「我買在 667.5」）
+        user_cost = _parse_user_cost(q)
         if stocks:
             qtype = "stock"
             context_parts.append("【即時資料區（僅能引用以下數據，未列出的不可編造）】")
             for sid in stocks:
-                context_parts.append(_build_stock_context(sid))
+                # 個人成本只對第一檔（通常使用者只會講一個成本）
+                cost_for_this = user_cost if sid == stocks[0] else 0
+                context_parts.append(_build_stock_context(sid, user_cost=cost_for_this))
             # 持股問答：附上「該使用者自己」的持倉（v10.9.73：複合 key 隔離）
             try:
                 portfolio = load_portfolio()
