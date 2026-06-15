@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.166"
+VERSION              = "10.9.167"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4105,6 +4105,7 @@ def make_portfolio_menu_flex() -> dict:
     return make_menu_flex(
         "📋 持股管理", "新增・賣出・損益・設定", "#5B8B6B",
         [("📋 我的持股","持股"),
+         ("🤖 持股個股分析","持股分析"),           # v10.9.167：新功能
          ("💗 立即持股警報","立即持股警報"),
          ("➕ 新增持股","新增持股說明"),
          ("💸 賣出登記","賣出說明"),
@@ -12469,6 +12470,368 @@ def _determine_recommendation_status(score: int, overheating: str,
     return "positive"                          # 偏多觀察
 
 
+# ═══════════════════════════════════════════════════════════════
+# v10.9.167：持股個股分析（按持股逐張卡 + 個人成本 P&L + 7 狀態 + AI 建議）
+# 入口：使用者輸入「分析持股」/「持股分析」/「我的持股分析」
+# ═══════════════════════════════════════════════════════════════
+
+def _holding_quick_verdict(score: int, pnl_pct: float, kline: dict,
+                            overheat: str) -> tuple:
+    """v10.9.167：依 score + P&L + 過熱程度 給「短評」+ 簡單行動建議
+    回傳 (verdict_emoji, verdict_text, action_hint)
+    用規則式（不打 AI 省 token），但 AI 行動建議會在後面 batch 跑
+    """
+    if score < 40:
+        return ("🔴", "結構轉弱", "考慮減碼或停損；不建議加碼")
+    if overheat == "dangerous_hot":
+        return ("🟠", "高檔過熱", "已有獲利可分批停利；不追高")
+    if overheat == "healthy_hot" and pnl_pct > 15:
+        return ("🟡", "強勢但偏熱", "用移動停利線守住獲利")
+    if score >= 70 and pnl_pct >= 0:
+        return ("🟢", "結構健康", "可續抱；跌破關鍵均線再評估")
+    if score >= 60 and pnl_pct < -5:
+        return ("🟡", "結構尚可、套牢", "未跌破支撐可續抱攤回；跌破要嚴設停損")
+    if score < 60 and pnl_pct < -10:
+        return ("🔴", "結構轉弱 + 套牢", "建議減碼降風險；不要繼續加碼攤平")
+    return ("🟡", "中性觀察", "守好停損；不主動加碼")
+
+
+def _analyze_one_holding(user_id: str, sid: str, holding: dict) -> dict:
+    """v10.9.167：單檔持股分析（給並行 worker 用），失敗回 None
+    回傳卡片所需的 dict"""
+    try:
+        tw = get_tw_stock(sid)
+        if not tw: return None
+        price = tw.get("price") or 0
+        if not price: return None
+        shares = int(holding.get("shares", 0) or 0)
+        cost = float(holding.get("buy_price", 0) or 0)
+        pnl_per_share = price - cost
+        pnl_pct = (pnl_per_share / cost * 100) if cost else 0
+        market_value = price * shares
+        cost_value = cost * shares
+        unrealized = pnl_per_share * shares
+
+        # 技術 (KD/MACD v10.9.162 已有)
+        closes = get_tw_closes(sid) or []
+        kline = get_kline_analysis(closes) if closes else {}
+
+        # 借推薦 swing scoring 給綜合分數（不挑類別、用 swing 做泛用）
+        try:
+            ns = {"score": 0}
+            chip = _load_finmind_chip_recent(sid, days=5) or {}
+            s = score_swing_stock(tw, closes, ns.get("score", 0))
+            excludes = exclude_swing_stock(closes, s)
+            total = s.get("total", 0)
+        except Exception:
+            total = 50
+            excludes = []
+
+        # 過熱判斷（沿用 v10.9.135 邏輯）
+        try:
+            overheat = _assess_overheating(tw, closes, s if 'total' in s else {})
+        except Exception:
+            overheat = "normal"
+
+        emoji, verdict, action = _holding_quick_verdict(total, pnl_pct, kline, overheat)
+        return {
+            "sid": sid,
+            "name": tw.get("name", sid),
+            "price": price,
+            "pct": tw.get("pct", 0),
+            "shares": shares,
+            "cost": cost,
+            "pnl_per_share": pnl_per_share,
+            "pnl_pct": pnl_pct,
+            "market_value": market_value,
+            "cost_value": cost_value,
+            "unrealized": unrealized,
+            "kline": kline,
+            "score": int(total),
+            "overheat": overheat,
+            "verdict_emoji": emoji,
+            "verdict_text": verdict,
+            "action_hint": action,
+            "excludes": excludes,
+        }
+    except Exception as e:
+        dlog("HOLDING_AI", f"{sid} 分析失敗：{type(e).__name__}: {str(e)[:80]}")
+        return None
+
+
+def make_holding_analysis_card(rank: int, h: dict) -> dict:
+    """v10.9.167：單檔持股分析 Flex 卡片"""
+    is_up = h["pct"] >= 0
+    color = "#D97A5C" if is_up else "#7AABBE"
+    arrow = "▲" if is_up else "▼"
+    is_profit = h["pnl_per_share"] >= 0
+    pnl_color = "#D97A5C" if is_profit else "#7AABBE"
+    sign = "+" if is_profit else ""
+
+    kline = h.get("kline") or {}
+    trend = kline.get("trend", "--")
+    rsi = kline.get("rsi", 0)
+    rsi_label = kline.get("rsi_label", "--")
+    kd_label = kline.get("kd_label", "")
+    macd_label = kline.get("macd_label", "")
+
+    # 從現價反推絕對漲跌（推薦卡同 pattern）
+    pct = h["pct"]; price = h["price"]
+    chg_abs = abs(price * pct / (100 + pct)) if (100 + pct) != 0 else 0
+
+    return {
+        "type": "bubble", "size": "mega",
+        "header": {"type": "box", "layout": "horizontal",
+                   "backgroundColor": "#5B8B6B", "paddingAll": "12px",
+                   "contents": [
+            {"type": "box", "layout": "vertical", "flex": 0,
+             "contents": [{"type": "text", "text": f"#{rank}", "size": "xl",
+                          "color": "#FFFFFF", "weight": "bold"}]},
+            {"type": "box", "layout": "vertical", "flex": 1, "paddingStart": "10px",
+             "contents": [
+                {"type": "text", "text": f"{h['sid']} {h['name']}",
+                 "size": "md", "color": "#FFFFFF", "weight": "bold", "wrap": True},
+                {"type": "text", "text": f"{h['shares']:,} 股 ‧ 成本 {h['cost']:,.2f}",
+                 "size": "xs", "color": "#E0EDD8"},
+            ]}
+        ]},
+        "body": {"type": "box", "layout": "vertical",
+                 "backgroundColor": "#FDF6F0", "paddingAll": "12px", "spacing": "sm",
+                 "contents": [
+            # 現價 + 絕對漲跌 + %
+            {"type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": f"{h['price']:.2f}",
+                 "size": "xxl", "weight": "bold", "color": color, "flex": 1},
+                {"type": "text", "text": f"{arrow} {chg_abs:.2f}　{abs(pct):.2f}%",
+                 "size": "sm", "color": color, "align": "end", "flex": 1, "gravity": "bottom"},
+            ]},
+            {"type": "separator", "color": "#E8C4B4"},
+            # 損益區塊
+            {"type": "text", "text": "💰 我的損益", "size": "xxs",
+             "color": "#A05A48", "weight": "bold"},
+            {"type": "box", "layout": "vertical", "spacing": "xs", "contents": [
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "市值", "size": "xxs",
+                     "color": "#9B6B5A", "flex": 2},
+                    {"type": "text", "text": f"{h['market_value']:,.0f}",
+                     "size": "xs", "color": "#5B4040", "flex": 3, "align": "end"},
+                ]},
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "成本", "size": "xxs",
+                     "color": "#9B6B5A", "flex": 2},
+                    {"type": "text", "text": f"{h['cost_value']:,.0f}",
+                     "size": "xs", "color": "#5B4040", "flex": 3, "align": "end"},
+                ]},
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "未實現損益", "size": "xxs",
+                     "color": "#9B6B5A", "weight": "bold", "flex": 2},
+                    {"type": "text",
+                     "text": f"{sign}{h['unrealized']:,.0f}　({sign}{h['pnl_pct']:.2f}%)",
+                     "size": "xs", "color": pnl_color, "weight": "bold",
+                     "flex": 3, "align": "end"},
+                ]},
+            ]},
+            {"type": "separator", "color": "#E8C4B4"},
+            # 短評（規則）
+            {"type": "box", "layout": "vertical", "backgroundColor": "#FAE6DE",
+             "cornerRadius": "6px", "paddingAll": "8px", "spacing": "xs",
+             "contents": [
+                {"type": "text", "text": f"{h['verdict_emoji']} {h['verdict_text']}",
+                 "size": "sm", "color": "#5B4040", "weight": "bold"},
+                {"type": "text", "text": h["action_hint"],
+                 "size": "xs", "color": "#5B4040", "wrap": True},
+            ]},
+            {"type": "separator", "color": "#E8C4B4"},
+            # 技術面（KD/MACD v10.9.163 補的）
+            {"type": "text", "text": "📊 技術面",
+             "size": "xxs", "color": "#A05A48", "weight": "bold"},
+            {"type": "box", "layout": "vertical", "spacing": "xs", "contents": [
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "趨勢", "size": "xxs",
+                     "color": "#9B6B5A", "flex": 1},
+                    {"type": "text", "text": trend, "size": "xxs",
+                     "color": "#5B4040", "flex": 3},
+                ]},
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "RSI", "size": "xxs",
+                     "color": "#9B6B5A", "flex": 1},
+                    {"type": "text", "text": f"{rsi:.0f}　{rsi_label}",
+                     "size": "xxs", "color": "#5B4040", "flex": 3},
+                ]},
+                *([{"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "KD", "size": "xxs",
+                     "color": "#9B6B5A", "flex": 1},
+                    {"type": "text", "text": kd_label, "size": "xxs",
+                     "color": "#5B4040", "flex": 3},
+                ]}] if kd_label and kd_label != "--" else []),
+                *([{"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "MACD", "size": "xxs",
+                     "color": "#9B6B5A", "flex": 1},
+                    {"type": "text", "text": macd_label, "size": "xxs",
+                     "color": "#5B4040", "flex": 3},
+                ]}] if macd_label and macd_label != "--" else []),
+            ]},
+            {"type": "separator", "color": "#E8C4B4"},
+            # 風控警訊（如有）
+            *([{"type": "text", "text": "⚠ 系統風控警訊",
+                "size": "xxs", "color": "#A05A48", "weight": "bold"},
+               {"type": "text", "text": "・" + "\n・".join(h["excludes"][:2]),
+                "size": "xxs", "color": "#A05A48", "wrap": True}]
+              if h.get("excludes") else []),
+            # 評分
+            {"type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": f"AI 評分 {h['score']}/100",
+                 "size": "xxs", "color": "#E89B82", "weight": "bold", "flex": 1},
+                {"type": "text", "text": "⚠ 僅供參考，非投資建議",
+                 "size": "xxs", "color": "#B89BC4", "align": "end", "flex": 1},
+            ]},
+        ]}
+    }
+
+
+def make_holdings_analysis_overview(holdings_data: list) -> dict:
+    """v10.9.167：持股分析封面 — 統整資訊"""
+    total_market = sum(h["market_value"] for h in holdings_data)
+    total_cost = sum(h["cost_value"] for h in holdings_data)
+    total_unrealized = sum(h["unrealized"] for h in holdings_data)
+    pnl_pct = (total_unrealized / total_cost * 100) if total_cost else 0
+    is_profit = total_unrealized >= 0
+    pnl_color = "#D97A5C" if is_profit else "#7AABBE"
+    sign = "+" if is_profit else ""
+    now_str = now_taipei().strftime("%Y-%m-%d %H:%M")
+
+    # 統計各 verdict
+    verdict_count = {}
+    for h in holdings_data:
+        v = h["verdict_text"]
+        verdict_count[v] = verdict_count.get(v, 0) + 1
+
+    return {
+        "type": "bubble", "size": "mega",
+        "header": {"type": "box", "layout": "vertical",
+                   "backgroundColor": "#5B8B6B", "paddingAll": "14px",
+                   "contents": [
+            {"type": "text", "text": "📋 我的持股分析",
+             "size": "xl", "color": "#FFFFFF", "weight": "bold"},
+            {"type": "text", "text": f"🇹🇼 台股 ‧ {now_str}",
+             "size": "xxs", "color": "#E0EDD8"},
+        ]},
+        "body": {"type": "box", "layout": "vertical",
+                 "backgroundColor": "#FDF6F0", "paddingAll": "14px", "spacing": "md",
+                 "contents": [
+            # 整體摘要
+            {"type": "text", "text": "💰 整體損益", "size": "sm",
+             "color": "#A05A48", "weight": "bold"},
+            {"type": "box", "layout": "vertical", "spacing": "xs", "contents": [
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "持股檔數", "size": "xs",
+                     "color": "#9B6B5A", "flex": 2},
+                    {"type": "text", "text": f"{len(holdings_data)} 檔",
+                     "size": "xs", "color": "#5B4040", "flex": 3, "align": "end"},
+                ]},
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "總市值", "size": "xs",
+                     "color": "#9B6B5A", "flex": 2},
+                    {"type": "text", "text": f"NT$ {total_market:,.0f}",
+                     "size": "xs", "color": "#5B4040", "flex": 3, "align": "end"},
+                ]},
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "總成本", "size": "xs",
+                     "color": "#9B6B5A", "flex": 2},
+                    {"type": "text", "text": f"NT$ {total_cost:,.0f}",
+                     "size": "xs", "color": "#5B4040", "flex": 3, "align": "end"},
+                ]},
+                {"type": "box", "layout": "horizontal", "contents": [
+                    {"type": "text", "text": "未實現損益", "size": "xs",
+                     "color": "#9B6B5A", "weight": "bold", "flex": 2},
+                    {"type": "text",
+                     "text": f"{sign}{total_unrealized:,.0f}　({sign}{pnl_pct:.2f}%)",
+                     "size": "sm", "color": pnl_color, "weight": "bold",
+                     "flex": 3, "align": "end"},
+                ]},
+            ]},
+            {"type": "separator", "color": "#C9D8C0"},
+            # 評估分佈
+            {"type": "text", "text": "📊 持股結構評估", "size": "sm",
+             "color": "#A05A48", "weight": "bold"},
+            {"type": "box", "layout": "vertical", "spacing": "xs", "contents": [
+                {"type": "text", "text": f"・{k}：{v} 檔", "size": "xxs",
+                 "color": "#5B4040"}
+                for k, v in sorted(verdict_count.items(), key=lambda x: -x[1])
+            ]},
+            {"type": "separator", "color": "#C9D8C0"},
+            # 提醒
+            {"type": "box", "layout": "vertical", "backgroundColor": "#FAE6DE",
+             "cornerRadius": "6px", "paddingAll": "8px", "contents": [
+                {"type": "text",
+                 "text": "📌 個股建議基於個人成本 + 技術面 + 風控警訊綜合判讀。",
+                 "size": "xxs", "color": "#A05A48", "wrap": True},
+                {"type": "text",
+                 "text": "⚠️ 僅供參考，不構成投資建議",
+                 "size": "xxs", "color": "#B89BC4", "wrap": True, "margin": "xs"},
+            ]},
+        ]}
+    }
+
+
+def build_and_push_holdings_analysis(user_id: str):
+    """v10.9.167：持股個股分析主流程"""
+    try:
+        # 1. 撈 user 的台股持股
+        portfolio = load_portfolio()
+        my_holdings = []
+        for key, data in portfolio.items():
+            if data.get("user_id") != user_id: continue
+            symbol = _pf_symbol(key)
+            sid = symbol.replace(".TW", "")
+            if not sid.isdigit() and not (len(sid) >= 4 and sid[:4].isdigit()):
+                continue  # 暫不支援美股
+            shares = int(data.get("shares", 0) or 0)
+            if shares <= 0: continue
+            my_holdings.append((sid, data))
+        if not my_holdings:
+            push_message(user_id,
+                "📋 我的持股分析\n━━━━━━━━━━━━━━\n"
+                "目前沒有台股持股紀錄。\n"
+                "輸入「新增 代碼 股數 均價」建立持股後再試。")
+            return
+
+        # 2. 並行分析每檔
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        holdings_data = []
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_analyze_one_holding, user_id, sid, data): sid
+                       for sid, data in my_holdings}
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                    if r: holdings_data.append(r)
+                except Exception as e:
+                    dlog("HOLDING_AI", f"worker error: {type(e).__name__}: {str(e)[:80]}")
+        dlog("HOLDING_AI",
+             f"持股分析完成：{len(holdings_data)}/{len(my_holdings)} 檔 "
+             f"耗時 {time.time()-t0:.1f}s")
+
+        if not holdings_data:
+            push_message(user_id,
+                "⚠️ 持股資料暫時無法取得，請稍後再試")
+            return
+
+        # 3. 排序 + 截斷至 10（LINE carousel 上限 12；含 overview = 11）
+        holdings_data.sort(key=lambda x: x["market_value"], reverse=True)
+        top = holdings_data[:10]
+
+        # 4. Flex carousel
+        overview = make_holdings_analysis_overview(top)
+        cards = [make_holding_analysis_card(i+1, h) for i, h in enumerate(top)]
+        flex = {"type": "carousel", "contents": [overview] + cards}
+        push_flex(user_id, flex, "📋 我的持股分析")
+    except Exception as e:
+        dlog("HOLDING_AI", f"主流程失敗：{type(e).__name__}: {str(e)[:120]}")
+        push_message(user_id, "⚠️ 持股分析發生問題，請稍後再試")
+
+
 def build_and_push_filtered_recommendation(user_id: str, filter_type: str):
     """v10.9.135：依分類跑獨立評分流程 + 品質門檻 + 過熱分級。
     filter_type ∈ {'trend', 'growth', 'stable', 'swing'}"""
@@ -15403,6 +15766,18 @@ def handle_message(event):
         return
 
     # ══ 持股管理指令 ══
+    # v10.9.167：持股個股分析（基於個人成本 + 7 狀態 + AI 建議）
+    if text in ["分析持股", "持股分析", "我的持股分析", "持股個股分析"]:
+        dlog("HANDLER", "→ 持股個股分析")
+        reply_text_with_qr(event.reply_token,
+            "📋 我的持股分析\n━━━━━━━━━━━━━━\n"
+            "正在分析每檔持股 — 即時報價 + 技術面 + 個人損益 + AI 建議\n"
+            "約 20-40 秒推送結果",
+            [("📋 持股列表", "持股"), ("📊 損益分析", "損益分析")])
+        threading.Thread(target=build_and_push_holdings_analysis,
+                         args=(user_id,), daemon=True).start()
+        return
+
     if text=="持股":
         # v10.9.62：Flex carousel
         # v10.9.93：/tmp 空時即時 restore（不等 _bg_init）
