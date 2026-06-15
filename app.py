@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.163"
+VERSION              = "10.9.164"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9928,11 +9928,70 @@ def get_yahoo_finance_rss(category: str, count: int = 10) -> list:
         return []
 
 
-def make_news_carousel(title: str, color: str, items: list) -> dict:
+def make_news_carousel(title: str, color: str, items: list,
+                        market_type: str = "") -> dict:
     """v10.9.75：通用新聞 carousel（台股/美股/國際大盤新聞用）。
     每張卡：標題、來源、時間、看完整按鈕（直接連結）。
-    """
+    v10.9.164：可加封面 bubble（強調「不是新聞搬運工」）+ 每張卡免責
+    market_type ∈ {'tw', 'us', 'intl', 'geo'}（給封面副標用）"""
     bubbles = []
+
+    # v10.9.164：封面 bubble（only when market_type given）
+    if market_type and items:
+        # 統計來源多樣性
+        sources = sorted({n.get("source", "") for n in items if n.get("source")})
+        n_src = len(sources)
+        market_flag = {
+            "tw":   "🇹🇼 台股新聞",
+            "us":   "🇺🇸 美股新聞",
+            "intl": "🌐 國際財經",
+            "geo":  "🌏 地緣政治",
+        }.get(market_type, title)
+        now_str = now_taipei().strftime("%Y-%m-%d %H:%M")
+        cover = {
+            "type": "bubble", "size": "kilo",
+            "header": {"type": "box", "layout": "vertical",
+                       "backgroundColor": color, "paddingAll": "12px",
+                       "contents": [
+                           {"type": "text", "text": "✨ 慧股拾光", "size": "xxs",
+                            "color": "#F0E5DD"},
+                           {"type": "text", "text": market_flag, "size": "lg",
+                            "color": "#FFFFFF", "weight": "bold"},
+                           {"type": "text", "text": now_str, "size": "xxs",
+                            "color": "#F0E5DD"},
+                       ]},
+            "body": {"type": "box", "layout": "vertical",
+                     "backgroundColor": "#FDF6F0", "paddingAll": "12px",
+                     "spacing": "sm", "contents": [
+                # 規格強調「不是新聞搬運工」
+                {"type": "text", "text": "📡 AI 篩選 / 多源去重 / 重要度排序",
+                 "size": "xs", "color": "#A05A48", "weight": "bold"},
+                {"type": "text", "text": f"本次共 {len(items[:10])} 則 / 來自 {n_src} 個媒體",
+                 "size": "xxs", "color": "#5B4040", "wrap": True},
+                {"type": "separator", "color": "#E8C4B4"},
+                # 來源列表
+                {"type": "text", "text": "📰 來源", "size": "xxs",
+                 "color": "#9B6B5A", "weight": "bold"},
+                {"type": "text",
+                 "text": "、".join(sources[:6]) + ("..." if n_src > 6 else ""),
+                 "size": "xxs", "color": "#5B4040", "wrap": True},
+                {"type": "separator", "color": "#E8C4B4"},
+                # 紅線提示：不是搬運工
+                {"type": "box", "layout": "vertical",
+                 "backgroundColor": "#FAE6DE", "cornerRadius": "6px",
+                 "paddingAll": "8px", "contents": [
+                    {"type": "text",
+                     "text": "Lumistock 不是新聞搬運工 — 已過篩內容農場、合併重複事件、依重要度排序。",
+                     "size": "xxs", "color": "#A05A48", "wrap": True},
+                 ]},
+                # 底部免責
+                {"type": "text",
+                 "text": "⚠️ 新聞僅供參考、不構成投資建議",
+                 "size": "xxs", "color": "#B89BC4", "wrap": True},
+            ]}
+        }
+        bubbles.append(cover)
+
     for i, n in enumerate(items[:10], start=1):
         t = n.get("title", "")
         u = n.get("url", "")
@@ -9959,10 +10018,13 @@ def make_news_carousel(title: str, color: str, items: list) -> dict:
                           "color": "#5B4040", "weight": "bold", "wrap": True},
                      ]},
             "footer": {"type": "box", "layout": "vertical", "paddingAll": "8px",
-                       "contents": [
+                       "spacing": "xs", "contents": [
                            {"type": "button", "style": "primary", "color": color,
                             "height": "sm",
-                            "action": {"type": "uri", "label": "📖 看完整", "uri": u}}
+                            "action": {"type": "uri", "label": "📖 看完整", "uri": u}},
+                           # v10.9.164：每張卡加免責
+                           {"type": "text", "text": "⚠️ 僅供參考，非投資建議",
+                            "size": "xxs", "color": "#B89BC4", "align": "center"},
                        ]},
         }
         bubbles.append(bubble)
@@ -14115,16 +14177,17 @@ def handle_message(event):
         # v10.9.76：多來源（Yahoo 直接連結 + Google 多媒體）
         items = get_category_news("tw", count=10)
         if items:
-            flex = make_news_carousel("🇹🇼 台股新聞", "#E89B82", items)
+            flex = make_news_carousel("🇹🇼 台股新聞", "#E89B82", items, market_type="tw")
             if flex: reply_flex(event.reply_token, flex, "台股新聞"); return
         news=get_news("台股 股市 財經 今日",4,trusted_only=True)
         reply_text(event.reply_token, format_news_text(news,"🇹🇼 台股新聞"))
         return
     if text=="美股新聞":
         # v10.9.76：聚焦美股（道瓊/Nasdaq/標普/費半/Fed），多媒體
+        # v10.9.164：套封面 + 警告
         items = get_category_news("us", count=10)
         if items:
-            flex = make_news_carousel("🇺🇸 美股新聞", "#5B8DB8", items)
+            flex = make_news_carousel("🇺🇸 美股新聞", "#5B8DB8", items, market_type="us")
             if flex: reply_flex(event.reply_token, flex, "美股新聞"); return
         news=get_news("美股 華爾街 財經",4,trusted_only=True)
         reply_text(event.reply_token, format_news_text(news,"🇺🇸 美股新聞"))
@@ -14133,7 +14196,7 @@ def handle_message(event):
         # v10.9.76：聚焦非美全球（歐日陸/總經/商品），與美股區隔
         items = get_category_news("intl", count=10)
         if items:
-            flex = make_news_carousel("🌐 國際財經", "#B89BC4", items)
+            flex = make_news_carousel("🌐 國際財經", "#B89BC4", items, market_type="intl")
             if flex: reply_flex(event.reply_token, flex, "國際新聞"); return
         news=get_news("國際財經 全球市場 Fed",4,trusted_only=True)
         reply_text(event.reply_token, format_news_text(news,"🌐 國際財經新聞"))
@@ -14142,7 +14205,7 @@ def handle_message(event):
         # v10.9.76：多來源（台海/美中/美伊中東/俄烏），Flex carousel
         items = get_category_news("geo", count=10)
         if items:
-            flex = make_news_carousel("🌏 地緣政治", "#A0809B", items)
+            flex = make_news_carousel("🌏 地緣政治", "#A0809B", items, market_type="geo")
             if flex: reply_flex(event.reply_token, flex, "地緣政治"); return
         news=get_news("地緣政治 美中 台海 俄烏 中東",4,trusted_only=False)
         reply_text(event.reply_token, format_news_text(news,"🌏 地緣政治"))
