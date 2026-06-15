@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.164"
+VERSION              = "10.9.165"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9854,32 +9854,98 @@ def _merge_dedup_news(*lists, count: int = 12) -> list:
     return out
 
 
+# v10.9.165：分類新聞的「真實」過篩管道（之前封面寫了但沒做的）
+# 規格 project_us_news_spec.md / project_lumistock_vision.md
+def _filter_and_dedup_category_news(items: list, count: int = 10,
+                                     min_weight: int = None,
+                                     similarity_threshold: float = 0.65) -> list:
+    """v10.9.165：對分類新聞做：
+    1. 標題重複去重（normalize_title）
+    2. 內容農場過濾（weight < min_weight 砍）
+    3. 相似事件合併（標題相似度 >= threshold 視為同事件，保留 weight 高的）
+    4. 依 weight 由高到低排序
+    5. 截斷到 count
+    """
+    if not items: return []
+    if min_weight is None:
+        min_weight = US_NEWS_MIN_WEIGHT   # 30
+
+    # 1. 標題正規化去重（同標題不同網址）+ 計算 weight
+    normed_seen = set()
+    enriched = []
+    for it in items:
+        title = it.get("title", "")
+        url = it.get("url", "")
+        if not title or not url:
+            continue
+        norm = normalize_title(title)
+        if norm in normed_seen:
+            continue
+        normed_seen.add(norm)
+        src_name = it.get("source", "") or _us_news_source_name(url)
+        w = _us_news_compute_weight(url, src_name)
+        it2 = dict(it)
+        it2["weight"] = w
+        it2["source"] = src_name
+        enriched.append(it2)
+
+    before_farm = len(enriched)
+    # 2. 內容農場過濾
+    enriched = [x for x in enriched if x["weight"] >= min_weight]
+    farmed_out = before_farm - len(enriched)
+
+    # 3. 相似事件合併：兩兩比較相似度，相似時保留 weight 高的
+    enriched.sort(key=lambda x: x["weight"], reverse=True)
+    merged = []
+    for it in enriched:
+        is_dup = False
+        for kept in merged:
+            try:
+                sim = _us_news_title_similar(it["title"], kept["title"])
+            except Exception:
+                sim = 0.0
+            if sim >= similarity_threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            merged.append(it)
+
+    merged_out = len(enriched) - len(merged)
+    dlog("NEWS_FILTER",
+         f"輸入 {len(items)} → 同題去重 {len(enriched) + farmed_out} → "
+         f"農場過濾 -{farmed_out} → 相似合併 -{merged_out} → 留 {len(merged)}")
+
+    # 4. 已依 weight 排序，截斷
+    return merged[:count]
+
+
 def get_category_news(category: str, count: int = 10) -> list:
     """v10.9.76：分類大盤新聞，多來源。
+    v10.9.165：真的套上「過篩內容農場 + 合併重複事件 + 重要度排序」
+              （封面已宣告，現在補上實作）
     category: tw / us / intl / geo
     """
+    raw_count = count * 3   # 多抓 3 倍備過篩
     if category == "tw":
-        # 台股：Yahoo（直接連結）優先 + Google 補多來源
-        y = get_yahoo_finance_rss("tw-market", count=count)
-        g = get_google_news_multi("台股 加權指數 台積電 上市櫃", count=count)
-        return _merge_dedup_news(y, g, count=count)
-    if category == "us":
-        # 美股：聚焦美國市場
-        return get_google_news_multi(
-            "美股 道瓊 那斯達克 標普500 費城半導體 Fed 聯準會", count=count)
-    if category == "intl":
-        # 國際：聚焦非美國的全球（歐日陸 + 總經 + 商品）
-        return get_google_news_multi(
-            "國際財經 歐洲股市 日本股市 全球經濟 油價 黃金 IMF", count=count)
-    if category == "geo":
-        # v10.9.77：用「話題層級關鍵字」而非寫死國家/事件
-        # Google News 會自動抓「今天最熱的衝突/制裁/外交」，不用人工維護地點清單
-        # 多 query 聚合：覆蓋衝突、制裁、外交、軍事、政變、戰爭等通用面向
-        q1 = get_google_news_multi("地緣政治 OR 國際衝突 OR 戰爭", count=count)
-        q2 = get_google_news_multi("制裁 OR 軍事行動 OR 外交危機 OR 邊境緊張", count=count)
-        q3 = get_google_news_multi("國安 OR 聯合國決議 OR 政變 OR 國際情勢", count=count)
-        return _merge_dedup_news(q1, q2, q3, count=count)
-    return []
+        y = get_yahoo_finance_rss("tw-market", count=raw_count)
+        g = get_google_news_multi("台股 加權指數 台積電 上市櫃", count=raw_count)
+        merged = (y or []) + (g or [])
+    elif category == "us":
+        merged = get_google_news_multi(
+            "美股 道瓊 那斯達克 標普500 費城半導體 Fed 聯準會", count=raw_count)
+    elif category == "intl":
+        merged = get_google_news_multi(
+            "國際財經 歐洲股市 日本股市 全球經濟 油價 黃金 IMF", count=raw_count)
+    elif category == "geo":
+        q1 = get_google_news_multi("地緣政治 OR 國際衝突 OR 戰爭", count=raw_count)
+        q2 = get_google_news_multi("制裁 OR 軍事行動 OR 外交危機 OR 邊境緊張", count=raw_count)
+        q3 = get_google_news_multi("國安 OR 聯合國決議 OR 政變 OR 國際情勢", count=raw_count)
+        merged = (q1 or []) + (q2 or []) + (q3 or [])
+    else:
+        return []
+
+    # v10.9.165：真正過篩
+    return _filter_and_dedup_category_news(merged, count=count)
 
 
 def get_yahoo_finance_rss(category: str, count: int = 10) -> list:
