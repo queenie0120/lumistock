@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.162"
+VERSION              = "10.9.163"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -11511,22 +11511,36 @@ def exclude_stable_stock(tw: dict, closes: list, financials: dict,
 def score_swing_stock(tw: dict, closes: list, news_sentiment: int) -> dict:
     price = tw.get("price", 0)
 
-    # 技術面 0-45（KD 黃金交叉 / MA 突破 / 接近支撐）
+    # 技術面 0-45（v10.9.163：補 KD / MACD 信號，原註解承諾的兌現）
     tech = 0
     ma5 = _ma(closes, 5); ma20 = _ma(closes, 20)
     rsi = _rsi(closes)
     pct_5d = _chg_pct(closes, 5)
     pct_20d = _chg_pct(closes, 20)
-    if ma5 and price > ma5: tech += 10
-    if ma20 and price > ma20: tech += 10
+    if ma5 and price > ma5: tech += 8        # 原 10 → 8（騰 2 給 KD/MACD）
+    if ma20 and price > ma20: tech += 8       # 原 10 → 8
     # 接近支撐回測（近 20 日低點 +5% 範圍）
     if len(closes) >= 20:
         low_20 = min(closes[-20:])
         if low_20 < price <= low_20 * 1.05:
-            tech += 10
+            tech += 8                          # 原 10 → 8
     # RSI 40-65 黃金區（轉強）
-    if 40 <= rsi <= 65: tech += 8
-    elif rsi > 65 and pct_5d < 5: tech += 5
+    if 40 <= rsi <= 65: tech += 6              # 原 8 → 6
+    elif rsi > 65 and pct_5d < 5: tech += 4   # 原 5 → 4
+    # v10.9.163：KD 信號（規格承諾的，現在 v10.9.162 算得出來）
+    try:
+        k, d = _kd_from_closes(closes)
+        if k > d and k < 80:           tech += 8   # 黃金交叉、非高檔鈍化
+        elif k > d:                     tech += 4   # 黃金交叉但已偏熱
+        elif k < 20 and d < 20:        tech += 5   # 低檔可能反彈
+    except: pass
+    # v10.9.163：MACD 信號
+    try:
+        dif, macd_v, hist = _macd_from_closes(closes)
+        if dif > 0 and hist > 0:       tech += 7   # 強勢
+        elif dif > 0:                   tech += 4
+        elif dif < 0 and hist > 0:     tech += 3   # 弱勢轉好
+    except: pass
 
     # 量價結構 0-25（用 5 日 vs 20 日均量替代 — 但 closes 沒量資訊）
     # 用 5 日漲幅 + 20 日漲幅判斷量價配合
@@ -11544,10 +11558,18 @@ def score_swing_stock(tw: dict, closes: list, news_sentiment: int) -> dict:
     if pct_20d > 30: risk -= 5
     risk = max(0, risk)
 
+    # v10.9.163：把 KD/MACD 值也存進 breakdown 方便檢視
+    kd_k = kd_d = None; mdif = mmacd = mhist = None
+    try:
+        kd_k, kd_d = _kd_from_closes(closes)
+        mdif, mmacd, mhist = _macd_from_closes(closes)
+    except: pass
     return {
         "total": tech + volprice + news + risk,
         "tech": tech, "volprice": volprice, "news": news, "risk": risk,
         "rsi": rsi, "pct_5d": pct_5d, "pct_20d": pct_20d,
+        "k": kd_k, "d": kd_d,
+        "macd_dif": mdif, "macd": mmacd, "macd_hist": mhist,
     }
 
 def exclude_swing_stock(closes: list, score_breakdown: dict) -> list:
@@ -13010,6 +13032,13 @@ def make_stock_flex(symbol,name,market_type,status,source,
     ma120=kline.get("ma120"); ma240=kline.get("ma240")
     rsi=kline.get("rsi",0); rl=kline.get("rsi_label","--")
     rc="#E89B82" if rsi>70 else ("#5B8DB8" if rsi<30 else "#8B6B5A")
+    # v10.9.163：KD + MACD（從 kline 取，v10.9.162 開始有）
+    kd_k=kline.get("k"); kd_d=kline.get("d"); kd_label=kline.get("kd_label","--")
+    macd_dif=kline.get("macd_dif"); macd_v=kline.get("macd"); macd_hist=kline.get("macd_hist")
+    macd_label=kline.get("macd_label","--")
+    # KD 顏色：偏多紅、偏空藍、過熱/超賣標
+    kd_color = "#E89B82" if (kd_k or 0) > (kd_d or 0) else "#7AABBE"
+    macd_color = "#E89B82" if (macd_hist or 0) > 0 else "#7AABBE"
     dn=f"{symbol} {name}" if name and name!=symbol else symbol
     nc=[]
     # v10.9.35：支援兩種格式 — 舊 (t, u) tuple、新 dict（含 sentiment+summary）
@@ -13094,6 +13123,23 @@ def make_stock_flex(symbol,name,market_type,status,source,
                     {"type":"text","text":f"{rsi:.0f}","size":"xs","color":rc,"weight":"bold","flex":1},
                     {"type":"text","text":rl,"size":"xs","color":rc,"flex":3}
                 ]},
+                # v10.9.163：KD（v10.9.162 開始算）
+                *([{"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"KD","size":"xs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"{kd_k:.0f}/{kd_d:.0f}",
+                     "size":"xs","color":kd_color,"weight":"bold","flex":1},
+                    {"type":"text","text":kd_label,"size":"xs","color":kd_color,"flex":3}
+                ]}] if (kd_k is not None and kd_d is not None) else []),
+                # v10.9.163：MACD
+                *([{"type":"box","layout":"horizontal","contents":[
+                    {"type":"text","text":"MACD","size":"xs","color":"#9B6B5A","flex":1},
+                    {"type":"text","text":f"{macd_dif:+.2f}/{macd_v:+.2f}",
+                     "size":"xs","color":macd_color,"weight":"bold","flex":2},
+                    {"type":"text","text":f"柱{macd_hist:+.2f}",
+                     "size":"xs","color":macd_color,"flex":2}
+                ]},
+                {"type":"text","text":f"　　{macd_label}","size":"xxs","color":"#8B6B5A"}]
+                  if (macd_dif is not None and macd_v is not None) else []),
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"text","text":"📰 相關新聞","size":"sm","weight":"bold","color":"#A05A48"},
             ]+nc+[
