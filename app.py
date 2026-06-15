@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.167"
+VERSION              = "10.9.168"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -12641,6 +12641,23 @@ def make_holding_analysis_card(rank: int, h: dict) -> dict:
                 {"type": "text", "text": h["action_hint"],
                  "size": "xs", "color": "#5B4040", "wrap": True},
             ]},
+            # v10.9.168：AI 深度短評（批次跑）— 失敗時整段省略
+            *([{"type": "separator", "color": "#E8C4B4"},
+               {"type": "text", "text": "🤖 AI 顧問建議",
+                "size": "xxs", "color": "#A05A48", "weight": "bold"},
+               *([{"type": "text",
+                   "text": f"💡 {h.get('ai',{}).get('key_action', '')}",
+                   "size": "xs", "color": "#5B4040", "weight": "bold", "wrap": True}]
+                 if h.get("ai", {}).get("key_action") else []),
+               *([{"type": "text",
+                   "text": h.get("ai", {}).get("advice", ""),
+                   "size": "xxs", "color": "#5B4040", "wrap": True}]
+                 if h.get("ai", {}).get("advice") else []),
+               *([{"type": "text",
+                   "text": f"⚠ {h.get('ai',{}).get('risk', '')}",
+                   "size": "xxs", "color": "#A05A48", "wrap": True, "margin": "xs"}]
+                 if h.get("ai", {}).get("risk") else []),
+              ] if h.get("ai") and h["ai"].get("advice") else []),
             {"type": "separator", "color": "#E8C4B4"},
             # 技術面（KD/MACD v10.9.163 補的）
             {"type": "text", "text": "📊 技術面",
@@ -12774,8 +12791,81 @@ def make_holdings_analysis_overview(holdings_data: list) -> dict:
     }
 
 
+def ai_analyze_holdings_batch(holdings_data: list, timeout: int = 25) -> dict:
+    """v10.9.168：批次 AI 為每檔持股給 1-2 句具體建議
+    嚴格 grounding：只能用提供的數字判讀；禁通則廢話
+    回傳 {sid: {advice, key_action, risk}} dict"""
+    if not holdings_data or not is_ai_enabled():
+        return {}
+    lines = ["【持股資料 — 每檔含個人成本 + 損益 + 技術 + 評分】"]
+    for i, h in enumerate(holdings_data, 1):
+        kline = h.get("kline") or {}
+        lines.append(f"{i}. {h['sid']} {h['name']}")
+        lines.append(f"   現價 {h['price']:.2f}（{h['pct']:+.2f}%）")
+        lines.append(f"   個人成本 {h['cost']:.2f}　損益 {h['pnl_pct']:+.2f}%（{h['unrealized']:+,.0f}元）")
+        lines.append(f"   趨勢 {kline.get('trend','--')}　RSI {kline.get('rsi',0):.0f}（{kline.get('rsi_label','--')}）")
+        if kline.get("kd_label"):
+            lines.append(f"   KD {kline['kd_label']}")
+        if kline.get("macd_label"):
+            lines.append(f"   MACD {kline['macd_label']}")
+        lines.append(f"   AI 評分 {h['score']}/100　短評：{h['verdict_text']}　過熱：{h['overheat']}")
+        if h.get("excludes"):
+            lines.append(f"   風控警訊：{'；'.join(h['excludes'][:2])}")
+    data_block = "\n".join(lines)
+
+    system_prompt = """你是 20 年台股投資顧問，正在幫使用者個別檢視每檔持股。
+
+【絕對精神】
+- 能講具體就講具體；不行就說不行（規格 project_ai_assistant_spec / pre_commit_checklist）
+- 禁用：「請評估」「需審慎判斷」「多重因素」這類廢話
+- 必引用使用者個人成本算當前損益做建議（不是新進場者視角）
+
+【每檔輸出 3 個欄位】
+- advice：1-2 句「具體判斷 + 具體價位」（例：「+15% 已有安全墊，跌破 5MA 先減半」）
+- key_action：4-8 個字濃縮（例：「續抱守 5MA」「分批停利」「減碼止血」）
+- risk：1 句「短線最該擔心的點」（例：「跌破支撐恐快速殺到 X」）
+
+【用詞合規】
+禁用：建議買進/賣出、保證、明牌、必賺、一定漲跌
+改用：偏多/偏空/守住/可考慮分批/接近壓力等
+
+【輸出格式：純 JSON array，沒 markdown 包裝】
+[
+  {"sid":"2330","advice":"...","key_action":"...","risk":"..."},
+  ...
+]
+順序與輸入相同，每欄位簡潔但具體。"""
+    user_msg = data_block + "\n\n請依規則輸出 JSON array。"
+    ans = groq_chat(
+        messages=[{"role":"system","content":system_prompt},
+                  {"role":"user","content":user_msg}],
+        max_tokens=2000, temperature=0.3, timeout=timeout)
+    if not ans:
+        return {}
+    try:
+        cleaned = re.sub(r"^```(?:json)?\s*", "", ans.strip())
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        arr = json.loads(cleaned)
+        if not isinstance(arr, list):
+            return {}
+        out = {}
+        for item in arr:
+            if isinstance(item, dict) and item.get("sid"):
+                out[str(item["sid"])] = {
+                    "advice": (item.get("advice") or "")[:200],
+                    "key_action": (item.get("key_action") or "")[:30],
+                    "risk": (item.get("risk") or "")[:150],
+                }
+        dlog("HOLDING_AI", f"AI 批次：{len(out)}/{len(holdings_data)} 檔成功")
+        return out
+    except Exception as e:
+        dlog("HOLDING_AI", f"AI 解析失敗：{type(e).__name__}: {str(e)[:100]}")
+        return {}
+
+
 def build_and_push_holdings_analysis(user_id: str):
-    """v10.9.167：持股個股分析主流程"""
+    """v10.9.167：持股個股分析主流程
+    v10.9.168：加 AI 深度短評（批次 Groq）"""
     try:
         # 1. 撈 user 的台股持股
         portfolio = load_portfolio()
@@ -12822,7 +12912,12 @@ def build_and_push_holdings_analysis(user_id: str):
         holdings_data.sort(key=lambda x: x["market_value"], reverse=True)
         top = holdings_data[:10]
 
-        # 4. Flex carousel
+        # 4. v10.9.168：AI 深度短評（批次）
+        ai_map = ai_analyze_holdings_batch(top)
+        for h in top:
+            h["ai"] = ai_map.get(h["sid"], {})
+
+        # 5. Flex carousel
         overview = make_holdings_analysis_overview(top)
         cards = [make_holding_analysis_card(i+1, h) for i, h in enumerate(top)]
         flex = {"type": "carousel", "contents": [overview] + cards}
