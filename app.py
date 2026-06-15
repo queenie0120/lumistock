@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.165"
+VERSION              = "10.9.166"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9894,21 +9894,29 @@ def _filter_and_dedup_category_news(items: list, count: int = 10,
     enriched = [x for x in enriched if x["weight"] >= min_weight]
     farmed_out = before_farm - len(enriched)
 
-    # 3. 相似事件合併：兩兩比較相似度，相似時保留 weight 高的
+    # 3. v10.9.166：相似事件「合併」而不是「丟棄」
+    #    規格五~七章：「5 篇講同件事 → 合併為 1 張事件卡，顯示『來源：Reuters、CNBC、Yahoo』」
     enriched.sort(key=lambda x: x["weight"], reverse=True)
     merged = []
     for it in enriched:
-        is_dup = False
+        merged_into = None
         for kept in merged:
             try:
                 sim = _us_news_title_similar(it["title"], kept["title"])
             except Exception:
                 sim = 0.0
             if sim >= similarity_threshold:
-                is_dup = True
+                merged_into = kept
                 break
-        if not is_dup:
+        if merged_into is None:
+            # 新事件
+            it["other_sources"] = []          # 同事件其他來源（不含主來源）
             merged.append(it)
+        else:
+            # 加進主事件的 other_sources（去重 + 不重複自己）
+            if it["source"] != merged_into["source"] and \
+               it["source"] not in merged_into["other_sources"]:
+                merged_into["other_sources"].append(it["source"])
 
     merged_out = len(enriched) - len(merged)
     dlog("NEWS_FILTER",
@@ -9917,6 +9925,62 @@ def _filter_and_dedup_category_news(items: list, count: int = 10,
 
     # 4. 已依 weight 排序，截斷
     return merged[:count]
+
+
+# v10.9.166：AI 重要度判讀（規格第九章「高/中/低」）
+_NEWS_IMPORTANCE_PROMPT = """你是美股新聞重要度判讀員。
+規格定義（嚴格遵守，不可自創）：
+
+【高 high】財報明顯優/劣於預期、財測上下修、Fed 利率決議、CPI/PPI/非農重大變化、
+重大併購、重大產品發表、出口管制、關稅政策、大型訴訟、CEO/CFO 異動、
+分析師大幅調目標價、重大產業需求變化
+
+【中 mid】產業趨勢延伸分析、法人觀點調整、一般產品進度、市場情緒變化、ETF 資金流變動
+
+【低 low】泛泛市場評論、無新資訊重複報導、單純社群討論、標題黨、影響不明顯
+
+對下面每則新聞，輸出純 JSON array（無 markdown 包裝）：
+[
+  {"i": 1, "imp": "high/mid/low", "why": "1 句原因"},
+  {"i": 2, "imp": "...", "why": "..."},
+  ...
+]
+順序需與輸入相同。why 1 句即可。
+"""
+
+def ai_classify_news_importance(items: list, timeout: int = 15) -> list:
+    """v10.9.166：批次 Groq 判讀新聞重要度
+    回傳 items（每筆加上 importance / importance_reason）
+    AI 失敗時保持原列表，不影響顯示。"""
+    if not items or not is_ai_enabled():
+        return items
+    try:
+        data_block = "\n".join([
+            f"{i+1}. [{it.get('source','')}] {it.get('title','')[:120]}"
+            for i, it in enumerate(items)
+        ])
+        ans = groq_chat(
+            messages=[{"role": "system", "content": _NEWS_IMPORTANCE_PROMPT},
+                      {"role": "user", "content": data_block}],
+            max_tokens=1200, temperature=0.2, timeout=timeout)
+        if not ans: return items
+        cleaned = re.sub(r"^```(?:json)?\s*", "", ans.strip())
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        arr = json.loads(cleaned)
+        if not isinstance(arr, list): return items
+        # 對齊 index
+        by_i = {int(x.get("i", 0)): x for x in arr if isinstance(x, dict)}
+        for i, it in enumerate(items, start=1):
+            x = by_i.get(i)
+            if x:
+                imp = (x.get("imp") or "").lower()
+                if imp in ("high", "mid", "low"):
+                    it["importance"] = imp
+                    it["importance_reason"] = x.get("why", "")[:80]
+        dlog("NEWS_FILTER", f"AI 重要度：{len(by_i)}/{len(items)} 判讀完成")
+    except Exception as e:
+        dlog("NEWS_FILTER", f"AI 重要度判讀失敗：{type(e).__name__}: {str(e)[:80]}")
+    return items
 
 
 def get_category_news(category: str, count: int = 10) -> list:
@@ -9945,7 +10009,16 @@ def get_category_news(category: str, count: int = 10) -> list:
         return []
 
     # v10.9.165：真正過篩
-    return _filter_and_dedup_category_news(merged, count=count)
+    filtered = _filter_and_dedup_category_news(merged, count=count)
+    # v10.9.166：AI 重要度判讀 + 重要度優先排序
+    filtered = ai_classify_news_importance(filtered)
+    # 重要度排序：high > mid > low > 未判讀（仍依 weight 高到低為次序）
+    imp_rank = {"high": 0, "mid": 1, "low": 2}
+    filtered.sort(key=lambda x: (
+        imp_rank.get(x.get("importance"), 3),
+        -x.get("weight", 0),
+    ))
+    return filtered
 
 
 def get_yahoo_finance_rss(category: str, count: int = 10) -> list:
@@ -10029,8 +10102,8 @@ def make_news_carousel(title: str, color: str, items: list,
             "body": {"type": "box", "layout": "vertical",
                      "backgroundColor": "#FDF6F0", "paddingAll": "12px",
                      "spacing": "sm", "contents": [
-                # 規格強調「不是新聞搬運工」
-                {"type": "text", "text": "📡 AI 篩選 / 多源去重 / 重要度排序",
+                # v10.9.166：規格實際做到的事
+                {"type": "text", "text": "📡 過篩農場 / 同事件合併 / AI 重要度",
                  "size": "xs", "color": "#A05A48", "weight": "bold"},
                 {"type": "text", "text": f"本次共 {len(items[:10])} 則 / 來自 {n_src} 個媒體",
                  "size": "xxs", "color": "#5B4040", "wrap": True},
@@ -10042,13 +10115,16 @@ def make_news_carousel(title: str, color: str, items: list,
                  "text": "、".join(sources[:6]) + ("..." if n_src > 6 else ""),
                  "size": "xxs", "color": "#5B4040", "wrap": True},
                 {"type": "separator", "color": "#E8C4B4"},
-                # 紅線提示：不是搬運工
+                # 紅線提示
                 {"type": "box", "layout": "vertical",
                  "backgroundColor": "#FAE6DE", "cornerRadius": "6px",
                  "paddingAll": "8px", "contents": [
                     {"type": "text",
-                     "text": "Lumistock 不是新聞搬運工 — 已過篩內容農場、合併重複事件、依重要度排序。",
+                     "text": "Lumistock 不是新聞搬運工 — 已過篩內容農場、合併同事件多家報導、AI 標重要度高/中/低。",
                      "size": "xxs", "color": "#A05A48", "wrap": True},
+                    {"type": "text",
+                     "text": "（情緒判讀 / 6 類分類 / 台股連動 在後續版本推出）",
+                     "size": "xxs", "color": "#7AABBE", "wrap": True, "margin": "xs"},
                  ]},
                 # 底部免責
                 {"type": "text",
@@ -10058,11 +10134,51 @@ def make_news_carousel(title: str, color: str, items: list,
         }
         bubbles.append(cover)
 
+    # v10.9.166：重要度顯示對應
+    imp_label = {"high": "🔴 高", "mid": "🟡 中", "low": "🟢 低"}
+
     for i, n in enumerate(items[:10], start=1):
         t = n.get("title", "")
         u = n.get("url", "")
         src = n.get("source", "")
         date = n.get("date", "")
+        importance = n.get("importance", "")
+        imp_reason = n.get("importance_reason", "")
+        other_srcs = n.get("other_sources") or []
+        # 事件卡：來源 + 其他來源（若有）
+        src_text = f"📰 {src}"
+        if other_srcs:
+            src_text += f"　+ {('、'.join(other_srcs[:3]))}"
+            if len(other_srcs) > 3:
+                src_text += "..."
+        # 卡片 body 區塊
+        body_contents = [
+            {"type": "text", "text": t, "size": "sm",
+             "color": "#5B4040", "weight": "bold", "wrap": True},
+        ]
+        # v10.9.166：重要度 badge
+        if importance and importance in imp_label:
+            body_contents.append({
+                "type": "box", "layout": "horizontal",
+                "margin": "sm", "contents": [
+                    {"type": "text", "text": "重要度", "size": "xxs",
+                     "color": "#9B6B5A", "flex": 0},
+                    {"type": "text", "text": "  " + imp_label[importance],
+                     "size": "xxs", "color": "#5B4040", "weight": "bold", "flex": 0},
+                ]
+            })
+            if imp_reason:
+                body_contents.append({
+                    "type": "text", "text": imp_reason,
+                    "size": "xxs", "color": "#8B6B5A", "wrap": True, "margin": "xs",
+                })
+        # v10.9.166：其他佐證來源（事件卡精神）
+        if other_srcs:
+            body_contents.append({
+                "type": "text", "margin": "sm",
+                "text": f"📡 同事件其他來源：{'、'.join(other_srcs[:5])}",
+                "size": "xxs", "color": "#7AABBE", "wrap": True,
+            })
         bubble = {
             "type": "bubble", "size": "kilo",
             "header": {"type": "box", "layout": "vertical",
@@ -10074,21 +10190,17 @@ def make_news_carousel(title: str, color: str, items: list,
                                {"type": "text", "text": title, "size": "xs",
                                 "color": "#FFFFFF", "weight": "bold", "flex": 1, "margin": "sm"},
                            ]},
-                           {"type": "text", "text": f"📰 {src}　{date}",
+                           {"type": "text", "text": f"{src_text}　{date}",
                             "size": "xxs", "color": "#FDF6F0", "margin": "xs", "wrap": True},
                        ]},
             "body": {"type": "box", "layout": "vertical",
                      "backgroundColor": "#FDF6F0", "paddingAll": "12px",
-                     "contents": [
-                         {"type": "text", "text": t, "size": "sm",
-                          "color": "#5B4040", "weight": "bold", "wrap": True},
-                     ]},
+                     "contents": body_contents},
             "footer": {"type": "box", "layout": "vertical", "paddingAll": "8px",
                        "spacing": "xs", "contents": [
                            {"type": "button", "style": "primary", "color": color,
                             "height": "sm",
                             "action": {"type": "uri", "label": "📖 看完整", "uri": u}},
-                           # v10.9.164：每張卡加免責
                            {"type": "text", "text": "⚠️ 僅供參考，非投資建議",
                             "size": "xxs", "color": "#B89BC4", "align": "center"},
                        ]},
