@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.175"
+VERSION              = "10.9.176"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -8911,36 +8911,83 @@ def clean_title(t:str)->str:
 
 # v10.9.112 Phase 1：美股新聞來源權重表（依規格書「二、來源權重排序」）
 US_NEWS_SOURCE_WEIGHTS = {
-    # 最高權重（規格 1-7）
-    "reuters.com": 100, "bloomberg.com": 100, "wsj.com": 100, "cnbc.com": 100,
-    # 中高權重（規格 8-12）
-    "apnews.com": 90, "ap.org": 90,
+    # 🇺🇸 US 一手主來源（規格一，最高權重 90-100）
+    "reuters.com": 100, "bloomberg.com": 100, "wsj.com": 100,
+    "cnbc.com": 100, "ft.com": 95,
+    "apnews.com": 95, "ap.org": 95,
+    "marketwatch.com": 85, "barrons.com": 85,
+    "finance.yahoo.com": 80,    # Yahoo Finance（主來源中）
     "nasdaq.com": 85, "nyse.com": 85,
-    "marketwatch.com": 80, "barrons.com": 80,
-    # 中等權重（規格 13-16）
-    "finance.yahoo.com": 65, "yahoo.com": 60,
-    "investing.com": 60, "tradingview.com": 55, "seekingalpha.com": 55,
-    # 華語輔助（規格 17-21）
-    "cnyes.com": 50, "udn.com": 50, "money.udn.com": 50,
-    "chinatimes.com": 50, "moneydj.com": 50, "wantgoo.com": 45,
-    # 補充常見可信
-    "ft.com": 90, "forbes.com": 60, "businessinsider.com": 50,
-    "fool.com": 45, "zacks.com": 50,
+    # 🇺🇸 US 次級可信來源（60-79）
+    "investing.com": 65, "yahoo.com": 65,
+    "tradingview.com": 60, "seekingalpha.com": 60,
+    "forbes.com": 60, "cnn.com": 60,
+    "businessinsider.com": 50,
+    "fool.com": 50,             # Motley Fool（規格「可參考但不可當唯一依據」）
+    "zacks.com": 55, "benzinga.com": 50, "thestreet.com": 50,
+    # 🇹🇼 TW 主流財經（規格二，中文化解讀 / 50-70）
+    "cnyes.com": 65,            # 鉅亨網 / Anue
+    "anue.com": 65,
+    "udn.com": 60, "money.udn.com": 65,    # 經濟日報
+    "chinatimes.com": 60, "ctee.com.tw": 65,   # 工商時報
+    "cna.com.tw": 60,           # 中央社
+    "moneydj.com": 60,
+    "tw.stock.yahoo.com": 60,   # Yahoo 奇摩股市
+    "tw.yahoo.com": 55,
+    # 🇹🇼 TW 延伸解讀（不宜當即時主來源 / 40-55）
+    "businesstoday.com.tw": 50, # 今周刊
+    "wealth.com.tw": 50,        # 財訊
+    "wantgoo.com": 45,
 }
 
 US_NEWS_SOURCE_NAMES = {
-    "reuters.com": "Reuters", "bloomberg.com": "Bloomberg", "wsj.com": "WSJ",
-    "cnbc.com": "CNBC", "apnews.com": "AP", "ap.org": "AP",
-    "nasdaq.com": "Nasdaq", "nyse.com": "NYSE",
+    # US 一手
+    "reuters.com": "Reuters", "bloomberg.com": "Bloomberg",
+    "wsj.com": "WSJ", "cnbc.com": "CNBC", "ft.com": "FT",
+    "apnews.com": "AP", "ap.org": "AP",
     "marketwatch.com": "MarketWatch", "barrons.com": "Barron's",
-    "finance.yahoo.com": "Yahoo Finance", "yahoo.com": "Yahoo",
-    "investing.com": "Investing.com", "tradingview.com": "TradingView",
-    "seekingalpha.com": "Seeking Alpha",
-    "cnyes.com": "鉅亨網", "udn.com": "經濟日報", "money.udn.com": "經濟日報",
-    "chinatimes.com": "工商時報", "moneydj.com": "MoneyDJ", "wantgoo.com": "玩股網",
-    "ft.com": "FT", "forbes.com": "Forbes",
-    "businessinsider.com": "Business Insider", "fool.com": "Motley Fool", "zacks.com": "Zacks",
+    "finance.yahoo.com": "Yahoo Finance",
+    "nasdaq.com": "Nasdaq", "nyse.com": "NYSE",
+    # US 次級
+    "investing.com": "Investing.com", "yahoo.com": "Yahoo",
+    "tradingview.com": "TradingView", "seekingalpha.com": "Seeking Alpha",
+    "forbes.com": "Forbes", "cnn.com": "CNN",
+    "businessinsider.com": "Business Insider",
+    "fool.com": "Motley Fool",
+    "zacks.com": "Zacks", "benzinga.com": "Benzinga", "thestreet.com": "TheStreet",
+    # TW 主流財經
+    "cnyes.com": "鉅亨網", "anue.com": "Anue 鉅亨",
+    "udn.com": "經濟日報", "money.udn.com": "經濟日報",
+    "chinatimes.com": "工商時報", "ctee.com.tw": "工商時報",
+    "cna.com.tw": "中央社",
+    "moneydj.com": "MoneyDJ",
+    "tw.stock.yahoo.com": "Yahoo 奇摩股市", "tw.yahoo.com": "Yahoo 奇摩",
+    # TW 延伸
+    "businesstoday.com.tw": "今周刊",
+    "wealth.com.tw": "財訊",
+    "wantgoo.com": "玩股網",
 }
+
+# v10.9.176：來源 tier 分類（給事件卡顯示「主來源 + 中文摘要參考」+ 推薦股嚴篩用）
+# 規格三、五：US 一手 vs TW 中文化解讀 vs 內容農場 要區分
+def _us_news_source_tier(url: str = "", source_name: str = "") -> str:
+    """v10.9.176：依 URL 或來源名回 tier
+    回傳 'us_primary' / 'us_secondary' / 'tw_mainstream' / 'tw_general' / 'low'
+    """
+    w = _us_news_compute_weight(url, source_name)
+    name = (source_name or _us_news_source_name(url) or "").lower()
+    # TW 來源優先用名稱判斷（不靠 url，因為 Google News 轉址）
+    tw_mainstream_names = ["鉅亨", "anue", "經濟日報", "工商時報", "中央社",
+                            "moneydj", "yahoo 奇摩", "yahoo 股市"]
+    tw_general_names = ["今周刊", "財訊", "玩股網"]
+    is_tw_mainstream = any(k in name for k in tw_mainstream_names)
+    is_tw_general = any(k in name for k in tw_general_names)
+    if is_tw_mainstream:    return "tw_mainstream"
+    if is_tw_general:        return "tw_general"
+    # US 用權重判
+    if w >= 80:              return "us_primary"
+    if w >= 50:              return "us_secondary"
+    return "low"
 
 def _us_news_source_weight(url: str) -> int:
     """v10.9.112：URL → 來源權重；未列出回 10（低）。"""
@@ -8963,21 +9010,34 @@ def _us_news_source_name(url: str) -> str:
 
 # v10.9.117：source 名稱 → 權重（用於 Google News 抓的新聞，link 是 google.com 轉址抓不到原始 domain）
 US_NEWS_NAME_WEIGHTS = {
+    # 🇺🇸 US 一手
     "Reuters": 100, "Bloomberg": 100, "Bloomberg.com": 100,
     "Wall Street Journal": 100, "WSJ": 100, "The Wall Street Journal": 100,
     "CNBC": 100, "CNBC.com": 100,
-    "Associated Press": 90, "AP News": 90, "AP": 90,
+    "Associated Press": 95, "AP News": 95, "AP": 95,
+    "Financial Times": 95, "FT": 95,
     "Nasdaq": 85, "Nasdaq.com": 85, "NYSE": 85,
-    "MarketWatch": 80, "Barron's": 80, "Barrons": 80,
-    "Yahoo Finance": 65, "Yahoo": 60,
-    "Investing.com": 60, "TradingView": 55, "Seeking Alpha": 55,
-    "鉅亨網": 50, "經濟日報": 50, "工商時報": 50,
-    "MoneyDJ": 50, "玩股網": 45, "財訊快報": 50,
-    "Financial Times": 90, "FT": 90, "Forbes": 60,
-    "Business Insider": 50, "Motley Fool": 45, "The Motley Fool": 45,
-    "Zacks": 50, "Zacks Investment Research": 50,
-    "TheStreet": 45, "Benzinga": 50,
-    "CNN Business": 60, "CNN": 55,
+    "MarketWatch": 85, "Barron's": 85, "Barrons": 85,
+    "Yahoo Finance": 80,
+    # 🇺🇸 US 次級
+    "Yahoo": 65, "Investing.com": 65,
+    "TradingView": 60, "Seeking Alpha": 60,
+    "Forbes": 60, "CNN Business": 60, "CNN": 60,
+    "Business Insider": 50,
+    "Motley Fool": 50, "The Motley Fool": 50,
+    "Zacks": 55, "Zacks Investment Research": 55,
+    "TheStreet": 50, "Benzinga": 50,
+    # 🇹🇼 TW 主流財經（規格二）
+    "鉅亨網": 65, "鉅亨美股": 65, "Anue 鉅亨": 65, "Anue": 65,
+    "經濟日報": 65, "聯合新聞網": 60,
+    "工商時報": 65, "工商": 65,
+    "中央社": 60, "中央通訊社": 60, "CNA": 60,
+    "MoneyDJ": 60, "MoneyDJ 理財網": 60,
+    "Yahoo 奇摩股市": 60, "Yahoo奇摩股市": 60, "Yahoo奇摩": 55, "Yahoo 奇摩": 55,
+    # 🇹🇼 TW 延伸（不宜當即時主來源）
+    "今周刊": 50, "今周刊雜誌": 50,
+    "財訊": 50, "財訊雜誌": 50, "財訊快報": 50,
+    "玩股網": 45,
 }
 
 def _us_news_source_weight_by_name(name: str) -> int:
