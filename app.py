@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.169"
+VERSION              = "10.9.170"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -5505,10 +5505,23 @@ def get_tw_stock_name_fallback(stock_id: str) -> str:
 # ══════════════════════════════════════════
 #  台股資料
 # ══════════════════════════════════════════
+# v10.9.170：判斷台股是否在盤中（給 MIS / cache 邏輯用，避免重複實作）
+def _tw_in_trading_hours() -> bool:
+    """週一~五 09:00-13:30（含集合競價）= True"""
+    now = now_taipei()
+    if now.weekday() >= 5:
+        return False
+    m = now.hour * 60 + now.minute
+    return (9 * 60) <= m <= (13 * 60 + 30)
+
+
 def _fetch_tw_mis(stock_id: str) -> dict:
     """v10.9.107: TWSE MIS API。回傳 raw dict 或 None。
-    包含 price/prev/open/high/low/vol/name/is_realtime。"""
+    包含 price/prev/open/high/low/vol/name/is_realtime。
+    v10.9.170：盤中 z="-" 不再 fallback 到 prev（會造成「189 + 0%」假象），
+                改為跳過 MIS，讓 Yahoo 接手即時報價"""
     headers = {"User-Agent": "Mozilla/5.0"}
+    in_trading = _tw_in_trading_hours()
     for ex in ["tse", "otc"]:
         try:
             url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex}_{stock_id}.tw&json=1&delay=0"
@@ -5525,6 +5538,13 @@ def _fetch_tw_mis(stock_id: str) -> dict:
             if z not in ["-","","0",None]:
                 price = float(z); is_rt = True
             else:
+                # v10.9.170：盤中 z="-" → 別假裝 prev 是當前價
+                if in_trading:
+                    dlog("TW_STOCK",
+                         f"MIS {stock_id} {ex} 盤中 z=- → 跳過讓 Yahoo 接手"
+                         f"（避免昨收當前價 bug）")
+                    continue
+                # 盤後 / 週末：用 prev 當「最新已知」OK
                 price = prev; is_rt = False
             tv = d.get("tv", "-"); v = d.get("v", "-")
             vol_lots = None
@@ -5626,6 +5646,7 @@ def _fetch_tw_yahoo(stock_id: str) -> dict:
 
 def _validate_tw_sources(mis: dict, yahoo: dict) -> tuple:
     """v10.9.107: 多源驗證 — 返回 (picked, validation_label)。
+    v10.9.170：盤中 MIS is_realtime=False 時優先 Yahoo（MIS 可能是 fallback 到昨收）
     規則：
       兩源差 < 1%  → ✓ 採 TWSE（官方）
       兩源差 1~5% → ⚠ 採 TWSE，標 Yahoo 偏差
@@ -5644,6 +5665,13 @@ def _validate_tw_sources(mis: dict, yahoo: dict) -> tuple:
     if mp <= 0 or yp <= 0:
         chosen = mis if mp > 0 else yahoo
         return chosen, "⚠ 一源異常，採另一源"
+    # v10.9.170：盤中 MIS 標 is_realtime=False = 用昨收當前價，棄之
+    if _tw_in_trading_hours() and not mis.get("is_realtime") and yahoo:
+        return yahoo, f"⚠ MIS 盤中非即時，採 Yahoo（TWSE={mp:.2f} / Yahoo={yp:.2f}）"
+    # v10.9.170：MIS 跟 prev 同價、Yahoo 不同 → 強烈懷疑 MIS 是昨收
+    if (mis.get("prev") and abs(mp - mis["prev"]) < 0.01
+        and abs(yp - mp) > 0.5):
+        return yahoo, f"⚠ MIS 疑為昨收，採 Yahoo（TWSE={mp:.2f} 同昨收 / Yahoo={yp:.2f}）"
     diff_pct = abs(mp - yp) / mp * 100
     if diff_pct < 1.0:
         return mis, f"✓ 雙源一致（TWSE={mp:.2f} / Yahoo={yp:.2f}）"
@@ -5740,7 +5768,13 @@ def get_tw_stock(stock_id: str) -> dict:
         }
         if ex_div:
             result["ex_dividend"] = ex_div["cash"]
-        TW_STOCK_CACHE[stock_id] = (result, time.time())  # v10.9.151 cache
+        # v10.9.170：盤中拿到非即時 + 0% 漲跌 = 強烈懷疑昨收冒充當前價，**不寫快取**
+        # 避免「3 分鐘內所有用戶都拿到錯誤 189+0%」
+        if _tw_in_trading_hours() and not is_rt and abs(pct) < 0.01:
+            dlog("TW_STOCK",
+                 f"{stock_id} 盤中非即時且 0% 漲跌，疑似昨收冒充 → 不寫快取")
+        else:
+            TW_STOCK_CACHE[stock_id] = (result, time.time())  # v10.9.151 cache
         return result
 
     # 兩源全失敗 → 嘗試 STOCK_DAY
