@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.168"
+VERSION              = "10.9.169"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9928,60 +9928,100 @@ def _filter_and_dedup_category_news(items: list, count: int = 10,
     return merged[:count]
 
 
-# v10.9.166：AI 重要度判讀（規格第九章「高/中/低」）
-_NEWS_IMPORTANCE_PROMPT = """你是美股新聞重要度判讀員。
-規格定義（嚴格遵守，不可自創）：
+# v10.9.169：擴增 AI 判讀 — 重要度 + 情緒 + 對股價影響 + 是否已反映 + 風險（投資研究報告風格）
+# 規格出處：project_us_news_spec.md 八章 + v2 補充「AI 分析呈現方式」
+_NEWS_ANALYSIS_PROMPT = """你是 20 年台股 / 美股投資顧問，負責對新聞做專業判讀。
 
-【高 high】財報明顯優/劣於預期、財測上下修、Fed 利率決議、CPI/PPI/非農重大變化、
-重大併購、重大產品發表、出口管制、關稅政策、大型訴訟、CEO/CFO 異動、
-分析師大幅調目標價、重大產業需求變化
+【規格定義（嚴格遵守、不可自創）】
 
-【中 mid】產業趨勢延伸分析、法人觀點調整、一般產品進度、市場情緒變化、ETF 資金流變動
+▸ importance（重要度）
+- high: 財報明顯優/劣於預期、財測上下修、Fed 決議、CPI/PPI/非農重大、重大併購、
+        重大產品發表、出口管制、關稅、大型訴訟、CEO/CFO 異動、分析師大幅調目標價
+- mid:  產業趨勢延伸、法人觀點調整、一般產品進度、市場情緒、ETF 資金流
+- low:  泛市場評論、無新資訊重複、社群討論、標題黨、影響不明顯
 
-【低 low】泛泛市場評論、無新資訊重複報導、單純社群討論、標題黨、影響不明顯
+▸ sentiment（情緒 6 種狀態）
+- 偏多 / 偏空 / 中性 / 觀望 / 短多長空 / 短空長多
 
-對下面每則新聞，輸出純 JSON array（無 markdown 包裝）：
+▸ impact（對股價影響，1 句具體）
+例：「半導體族群短線跟漲」「壓抑成長股估值」「中性，影響有限」
+
+▸ already_priced（是否已反映在股價）
+- true: 利多/利空已 priced in，追價風險高
+- false: 尚未反映，仍有空間
+
+▸ risk（風險提醒，1 句；若無顯著風險回 ""）
+例：「跌破關鍵支撐恐連動殺到 X」「美債殖利率若繼續升將擴大壓力」
+
+【投資研究報告風格範例】
+- 「新聞情緒偏多，但股價已反映部分利多，短線追價風險升高。」
+- 「雖然消息面偏利多，但目前仍受美債殖利率與科技股估值壓力影響，建議列入觀察。」
+- 「中長線基本面未變，短線雜訊；可逢回檔評估。」
+
+【絕對禁止】
+「請評估」「需審慎判斷」「多重因素」「請自行判斷」這類 GPT 廢話。
+
+【輸出格式：純 JSON array，沒 markdown 包裝】
 [
-  {"i": 1, "imp": "high/mid/low", "why": "1 句原因"},
-  {"i": 2, "imp": "...", "why": "..."},
+  {"i":1,"imp":"high/mid/low","sent":"偏多/偏空/中性/觀望/短多長空/短空長多",
+   "impact":"...","priced":true/false,"risk":"...","why":"重要度 1 句原因"},
   ...
 ]
-順序需與輸入相同。why 1 句即可。
+順序需與輸入相同。every key 必填（risk 可空字串）。
 """
 
-def ai_classify_news_importance(items: list, timeout: int = 15) -> list:
-    """v10.9.166：批次 Groq 判讀新聞重要度
-    回傳 items（每筆加上 importance / importance_reason）
+
+def ai_analyze_news_batch(items: list, timeout: int = 20) -> list:
+    """v10.9.169：擴增批次 AI 判讀（取代 v10.9.166 ai_classify_news_importance）
+    回傳 items（每筆加上 importance / sentiment / impact / already_priced / risk / importance_reason）
     AI 失敗時保持原列表，不影響顯示。"""
     if not items or not is_ai_enabled():
         return items
     try:
         data_block = "\n".join([
-            f"{i+1}. [{it.get('source','')}] {it.get('title','')[:120]}"
+            f"{i+1}. [{it.get('source','')}] {it.get('title','')[:130]}"
             for i, it in enumerate(items)
         ])
         ans = groq_chat(
-            messages=[{"role": "system", "content": _NEWS_IMPORTANCE_PROMPT},
+            messages=[{"role": "system", "content": _NEWS_ANALYSIS_PROMPT},
                       {"role": "user", "content": data_block}],
-            max_tokens=1200, temperature=0.2, timeout=timeout)
+            max_tokens=2500, temperature=0.25, timeout=timeout)
         if not ans: return items
         cleaned = re.sub(r"^```(?:json)?\s*", "", ans.strip())
         cleaned = re.sub(r"\s*```$", "", cleaned)
         arr = json.loads(cleaned)
         if not isinstance(arr, list): return items
-        # 對齊 index
+        # 合法 sentiment 值（規格 6 狀態）
+        valid_sent = {"偏多", "偏空", "中性", "觀望", "短多長空", "短空長多"}
         by_i = {int(x.get("i", 0)): x for x in arr if isinstance(x, dict)}
         for i, it in enumerate(items, start=1):
             x = by_i.get(i)
-            if x:
-                imp = (x.get("imp") or "").lower()
-                if imp in ("high", "mid", "low"):
-                    it["importance"] = imp
-                    it["importance_reason"] = x.get("why", "")[:80]
-        dlog("NEWS_FILTER", f"AI 重要度：{len(by_i)}/{len(items)} 判讀完成")
+            if not x: continue
+            imp = (x.get("imp") or "").lower()
+            if imp in ("high", "mid", "low"):
+                it["importance"] = imp
+                it["importance_reason"] = (x.get("why") or "")[:100]
+            sent = (x.get("sent") or "").strip()
+            if sent in valid_sent:
+                it["sentiment"] = sent
+            impact = (x.get("impact") or "").strip()
+            if impact:
+                it["impact"] = impact[:150]
+            priced = x.get("priced")
+            if isinstance(priced, bool):
+                it["already_priced"] = priced
+            risk = (x.get("risk") or "").strip()
+            if risk:
+                it["risk_alert"] = risk[:150]
+        dlog("NEWS_FILTER", f"AI 完整判讀：{len(by_i)}/{len(items)} 篇")
     except Exception as e:
-        dlog("NEWS_FILTER", f"AI 重要度判讀失敗：{type(e).__name__}: {str(e)[:80]}")
+        dlog("NEWS_FILTER", f"AI 判讀失敗：{type(e).__name__}: {str(e)[:80]}")
     return items
+
+
+# v10.9.166 → v10.9.169：別名（向後相容；舊呼叫端不會壞）
+def ai_classify_news_importance(items: list, timeout: int = 15) -> list:
+    return ai_analyze_news_batch(items, timeout=timeout)
 
 
 def get_category_news(category: str, count: int = 10) -> list:
@@ -10103,8 +10143,8 @@ def make_news_carousel(title: str, color: str, items: list,
             "body": {"type": "box", "layout": "vertical",
                      "backgroundColor": "#FDF6F0", "paddingAll": "12px",
                      "spacing": "sm", "contents": [
-                # v10.9.166：規格實際做到的事
-                {"type": "text", "text": "📡 過篩農場 / 同事件合併 / AI 重要度",
+                # v10.9.169：規格實際做到的事
+                {"type": "text", "text": "📡 過篩農場 / 同事件合併 / 重要度 / 情緒 / 風險",
                  "size": "xs", "color": "#A05A48", "weight": "bold"},
                 {"type": "text", "text": f"本次共 {len(items[:10])} 則 / 來自 {n_src} 個媒體",
                  "size": "xxs", "color": "#5B4040", "wrap": True},
@@ -10121,10 +10161,10 @@ def make_news_carousel(title: str, color: str, items: list,
                  "backgroundColor": "#FAE6DE", "cornerRadius": "6px",
                  "paddingAll": "8px", "contents": [
                     {"type": "text",
-                     "text": "Lumistock 不是新聞搬運工 — 已過篩內容農場、合併同事件多家報導、AI 標重要度高/中/低。",
+                     "text": "Lumistock 不是新聞搬運工 — 已過篩農場、合併同事件、AI 標重要度 / 情緒 / 對股價影響 / 風險。",
                      "size": "xxs", "color": "#A05A48", "wrap": True},
                     {"type": "text",
-                     "text": "（情緒判讀 / 6 類分類 / 台股連動 在後續版本推出）",
+                     "text": "（推薦股新聞評分 / 美股→台股聯動 在 v170-171 推出）",
                      "size": "xxs", "color": "#7AABBE", "wrap": True, "margin": "xs"},
                  ]},
                 # 底部免責
@@ -10137,6 +10177,12 @@ def make_news_carousel(title: str, color: str, items: list,
 
     # v10.9.166：重要度顯示對應
     imp_label = {"high": "🔴 高", "mid": "🟡 中", "low": "🟢 低"}
+    # v10.9.169：情緒顯示對應（規格 6 狀態）
+    sent_color = {
+        "偏多": "#D97A5C", "偏空": "#7AABBE",
+        "中性": "#8B6B5A", "觀望": "#A07560",
+        "短多長空": "#C9886B", "短空長多": "#8DA5BE",
+    }
 
     for i, n in enumerate(items[:10], start=1):
         t = n.get("title", "")
@@ -10145,6 +10191,10 @@ def make_news_carousel(title: str, color: str, items: list,
         date = n.get("date", "")
         importance = n.get("importance", "")
         imp_reason = n.get("importance_reason", "")
+        sentiment = n.get("sentiment", "")
+        impact_text = n.get("impact", "")
+        priced = n.get("already_priced")
+        risk_alert = n.get("risk_alert", "")
         other_srcs = n.get("other_sources") or []
         # 事件卡：來源 + 其他來源（若有）
         src_text = f"📰 {src}"
@@ -10157,22 +10207,60 @@ def make_news_carousel(title: str, color: str, items: list,
             {"type": "text", "text": t, "size": "sm",
              "color": "#5B4040", "weight": "bold", "wrap": True},
         ]
-        # v10.9.166：重要度 badge
+        # v10.9.169：重要度 + 情緒同一行 badge
+        badge_row = []
         if importance and importance in imp_label:
+            badge_row += [
+                {"type": "text", "text": "重要度", "size": "xxs",
+                 "color": "#9B6B5A", "flex": 0},
+                {"type": "text", "text": "  " + imp_label[importance],
+                 "size": "xxs", "color": "#5B4040", "weight": "bold", "flex": 0},
+            ]
+        if sentiment and sentiment in sent_color:
+            if badge_row:
+                badge_row.append({"type": "text", "text": "  ",
+                                  "size": "xxs", "color": "#FDF6F0", "flex": 0})
+            badge_row += [
+                {"type": "text", "text": "情緒", "size": "xxs",
+                 "color": "#9B6B5A", "flex": 0},
+                {"type": "text", "text": f"  {sentiment}", "size": "xxs",
+                 "color": sent_color[sentiment], "weight": "bold", "flex": 0},
+            ]
+        if badge_row:
             body_contents.append({
                 "type": "box", "layout": "horizontal",
-                "margin": "sm", "contents": [
-                    {"type": "text", "text": "重要度", "size": "xxs",
-                     "color": "#9B6B5A", "flex": 0},
-                    {"type": "text", "text": "  " + imp_label[importance],
-                     "size": "xxs", "color": "#5B4040", "weight": "bold", "flex": 0},
+                "margin": "sm", "contents": badge_row,
+            })
+        # 重要度原因
+        if imp_reason:
+            body_contents.append({
+                "type": "text", "text": imp_reason,
+                "size": "xxs", "color": "#8B6B5A", "wrap": True, "margin": "xs",
+            })
+        # v10.9.169：對股價影響（研究報告風格）
+        if impact_text:
+            body_contents.append({
+                "type": "text", "margin": "sm",
+                "text": f"💡 {impact_text}",
+                "size": "xxs", "color": "#5B4040", "wrap": True,
+            })
+        # v10.9.169：是否已反映
+        if priced is True:
+            body_contents.append({
+                "type": "text", "margin": "xs",
+                "text": "⚠ 此利多/利空可能已反映在股價，追價需注意",
+                "size": "xxs", "color": "#A05A48", "wrap": True,
+            })
+        # v10.9.169：風險警示
+        if risk_alert:
+            body_contents.append({
+                "type": "box", "layout": "horizontal",
+                "backgroundColor": "#FAE6DE", "cornerRadius": "6px",
+                "paddingAll": "6px", "margin": "sm", "contents": [
+                    {"type": "text", "text": f"⚠ {risk_alert}",
+                     "size": "xxs", "color": "#A05A48", "wrap": True}
                 ]
             })
-            if imp_reason:
-                body_contents.append({
-                    "type": "text", "text": imp_reason,
-                    "size": "xxs", "color": "#8B6B5A", "wrap": True, "margin": "xs",
-                })
         # v10.9.166：其他佐證來源（事件卡精神）
         if other_srcs:
             body_contents.append({
