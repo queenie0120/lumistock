@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.170"
+VERSION              = "10.9.171"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10142,6 +10142,220 @@ def get_yahoo_finance_rss(category: str, count: int = 10) -> list:
         return []
 
 
+# ═══════════════════════════════════════════════════════════════
+# v10.9.171：美股新聞 → 台股聯動分析（規格十二 + v2 補充）
+# 從本次美股新聞偵測題材，輸出對台股的具體聯動影響
+# ═══════════════════════════════════════════════════════════════
+
+# v10.9.171：硬編題材偵測關鍵字 → 對應台股影響
+_US_NEWS_LINKAGE_MAP = [
+    {
+        "keys": ["NVDA", "Nvidia", "輝達", "黃仁勳", "H100", "H200", "B100", "B200",
+                 "Blackwell", "AI chip", "AI 晶片"],
+        "label": "🤖 NVDA / AI 晶片",
+        "tw_impact": "AI 伺服器：2330 台積電（獨家代工）/ 2382 廣達 / "
+                     "2376 技嘉 / 6669 緯穎 ‧ 散熱：3017 奇鋐 ‧ "
+                     "PCB：2383 台光電 / 8046 南電",
+    },
+    {
+        "keys": ["AMD", "Lisa Su"],
+        "label": "💻 AMD",
+        "tw_impact": "封測：3711 日月光投控 / 6147 頎邦 ‧ "
+                     "代工：2330 台積電 ‧ IC 設計：3034 聯詠",
+    },
+    {
+        "keys": ["AVGO", "Broadcom"],
+        "label": "💎 Broadcom",
+        "tw_impact": "ASIC / 客製化晶片：2330 台積電 ‧ "
+                     "網通 / 交換器供應鏈：2345 智邦 / 6285 啟碁",
+    },
+    {
+        "keys": ["AAPL", "Apple", "iPhone", "蘋果"],
+        "label": "🍎 Apple",
+        "tw_impact": "蘋概股：2317 鴻海 / 3008 大立光 / 3406 玉晶光 / "
+                     "4938 和碩 / 2354 鴻準 / 2474 可成",
+    },
+    {
+        "keys": ["TSLA", "Tesla", "特斯拉", "Elon Musk", "馬斯克"],
+        "label": "🚗 Tesla / 電動車",
+        "tw_impact": "車用 / 電池：2308 台達電 / 1536 和大 / 2231 為升 / "
+                     "1722 台肥 / 6121 新普",
+    },
+    {
+        "keys": ["TSM", "Taiwan Semi", "TSMC"],
+        "label": "🏭 TSM ADR",
+        "tw_impact": "直接連動：2330 台積電 ‧ 帶動權值股 / 大盤情緒",
+    },
+    {
+        "keys": ["MSFT", "Microsoft", "微軟", "Azure", "Copilot"],
+        "label": "☁️ Microsoft / 雲端",
+        "tw_impact": "雲端供應鏈：2382 廣達 / 6669 緯穎 / 2376 技嘉 ‧ "
+                     "AI 推論：2330 台積電",
+    },
+    {
+        "keys": ["META", "Facebook", "Instagram"],
+        "label": "📘 Meta",
+        "tw_impact": "資料中心：2382 廣達 / 6669 緯穎 ‧ "
+                     "AI 算力：2330 台積電",
+    },
+    {
+        "keys": ["GOOGL", "GOOG", "Alphabet", "Google"],
+        "label": "🔍 Google / Alphabet",
+        "tw_impact": "雲端 / TPU：2330 台積電 ‧ AI 應用受惠族群",
+    },
+    {
+        "keys": ["AMZN", "Amazon", "AWS"],
+        "label": "📦 Amazon / AWS",
+        "tw_impact": "雲端伺服器供應鏈：2382 廣達 / 6669 緯穎 / 4938 和碩",
+    },
+    {
+        "keys": ["SOX", "費半", "費城半導體", "semiconductor index"],
+        "label": "💎 費半 SOX",
+        "tw_impact": "全台半導體族群：2330 / 2454 / 3711 / 2303 / 6515 / "
+                     "IC 設計族群同步",
+    },
+    {
+        "keys": ["Fed", "聯準會", "FOMC", "Powell", "鮑爾", "升息", "降息"],
+        "label": "🏦 Fed / 聯準會",
+        "tw_impact": "鷹派 → 美元強、台幣弱、外資撤 ‧ "
+                     "鴿派 → 成長股 / AI / 科技股受惠",
+    },
+    {
+        "keys": ["CPI", "PPI", "inflation", "通膨", "通脹"],
+        "label": "📈 CPI / 通膨",
+        "tw_impact": "通膨升 → Fed 鷹派預期 → 壓抑科技估值 ‧ "
+                     "通膨降 → 風險偏好回升",
+    },
+    {
+        "keys": ["非農", "nonfarm", "unemployment", "失業率", "jobs"],
+        "label": "👷 非農 / 就業",
+        "tw_impact": "強勁就業 → Fed 緊縮預期 → 科技股壓力 ‧ "
+                     "弱就業 → 降息預期 → 成長股反彈",
+    },
+    {
+        "keys": ["10-year", "10Y", "treasury yield", "美債", "殖利率"],
+        "label": "📉 美債殖利率",
+        "tw_impact": "升 → 壓抑成長股 / AI / 高估值科技股 ‧ "
+                     "降 → 資金流回科技股 / 成長股",
+    },
+    {
+        "keys": ["DXY", "dollar index", "美元指數"],
+        "label": "💵 DXY 美元",
+        "tw_impact": "強 → 新興市場 / 台股外資撤 / 台幣貶 ‧ "
+                     "弱 → 新興市場 / 商品 / 黃金受惠",
+    },
+    {
+        "keys": ["VIX", "恐慌", "volatility"],
+        "label": "😱 VIX 恐慌指數",
+        "tw_impact": "高 → 風險偏好下降 / 推薦股信心應下調 ‧ "
+                     "低 → 風險偏好回升 / 樂觀情緒",
+    },
+    {
+        "keys": ["gold", "黃金", "金價"],
+        "label": "🥇 黃金",
+        "tw_impact": "漲 → 避險升溫 / 不利成長股 ‧ "
+                     "跌 → 風險偏好回升",
+    },
+    {
+        "keys": ["oil", "crude", "原油", "WTI", "Brent"],
+        "label": "🛢 原油",
+        "tw_impact": "漲 → 航運 2603/2609 利空、傳產成本壓 ‧ "
+                     "跌 → 航運成本減 / 內需股利多",
+    },
+    {
+        "keys": ["tariff", "關稅", "trade war", "貿易戰"],
+        "label": "⚔️ 關稅 / 貿易戰",
+        "tw_impact": "升級 → 出口股 / 科技股壓力 ‧ "
+                     "和解 → 出口股反彈 / 大盤情緒回升",
+    },
+]
+
+
+def _detect_us_news_themes(items: list) -> list:
+    """v10.9.171：從美股新聞列表偵測涉及的題材
+    回傳 [{label, tw_impact, hit_news_titles[]}, ...]"""
+    if not items: return []
+    detected = {}  # label → entry
+    for it in items:
+        title = it.get("title", "")
+        for theme in _US_NEWS_LINKAGE_MAP:
+            for kw in theme["keys"]:
+                if kw.lower() in title.lower():
+                    if theme["label"] not in detected:
+                        detected[theme["label"]] = {
+                            "label": theme["label"],
+                            "tw_impact": theme["tw_impact"],
+                            "hit_titles": [],
+                        }
+                    if len(detected[theme["label"]]["hit_titles"]) < 2:
+                        detected[theme["label"]]["hit_titles"].append(title[:50])
+                    break  # 該則新聞已 match 此題材，跳過其他 keys
+    return list(detected.values())
+
+
+def _build_us_to_tw_linkage_bubble(themes: list, color: str) -> dict:
+    """v10.9.171：產出「美股 → 台股聯動」分析 bubble
+    themes 為 _detect_us_news_themes 結果"""
+    if not themes:
+        # 沒偵測到題材也給個友善訊息
+        body_contents = [
+            {"type": "text",
+             "text": "📡 本次新聞未偵測到明確的美→台聯動題材關鍵字。",
+             "size": "xs", "color": "#5B4040", "wrap": True},
+            {"type": "text",
+             "text": "建議搭配台股大盤、費半 SOX、美債殖利率走勢綜合判斷。",
+             "size": "xxs", "color": "#8B6B5A", "wrap": True, "margin": "sm"},
+        ]
+    else:
+        body_contents = [
+            {"type": "text",
+             "text": "依本次美股新聞重點偵測到以下台股族群聯動：",
+             "size": "xxs", "color": "#5B4040", "wrap": True},
+            {"type": "separator", "color": "#E8C4B4", "margin": "sm"},
+        ]
+        for t in themes[:7]:    # 最多 7 個題材避免太擠
+            body_contents.append({
+                "type": "text", "text": t["label"], "size": "sm",
+                "color": "#A05A48", "weight": "bold", "margin": "sm",
+            })
+            body_contents.append({
+                "type": "text", "text": t["tw_impact"], "size": "xxs",
+                "color": "#5B4040", "wrap": True,
+            })
+            if t.get("hit_titles"):
+                body_contents.append({
+                    "type": "text",
+                    "text": "📰 " + " / ".join(t["hit_titles"]),
+                    "size": "xxs", "color": "#7AABBE", "wrap": True, "margin": "xs",
+                })
+    body_contents += [
+        {"type": "separator", "color": "#E8C4B4", "margin": "sm"},
+        {"type": "box", "layout": "vertical",
+         "backgroundColor": "#FAE6DE", "cornerRadius": "6px",
+         "paddingAll": "6px", "contents": [
+             {"type": "text",
+              "text": "⚠ 聯動為「歷史傾向」，實際走勢仍受台股大盤、外資籌碼、產業基本面綜合影響",
+              "size": "xxs", "color": "#A05A48", "wrap": True},
+         ]},
+        {"type": "text", "text": "⚠️ 僅供參考，非投資建議",
+         "size": "xxs", "color": "#B89BC4", "align": "center", "margin": "sm"},
+    ]
+    return {
+        "type": "bubble", "size": "kilo",
+        "header": {"type": "box", "layout": "vertical",
+                   "backgroundColor": "#E89B82", "paddingAll": "10px",
+                   "contents": [
+                       {"type": "text", "text": "🇹🇼 對台股聯動",
+                        "size": "lg", "color": "#FFFFFF", "weight": "bold"},
+                       {"type": "text", "text": "美股新聞 → 台股族群影響",
+                        "size": "xxs", "color": "#F0D0C0", "wrap": True},
+                   ]},
+        "body": {"type": "box", "layout": "vertical",
+                 "backgroundColor": "#FDF6F0", "paddingAll": "12px",
+                 "spacing": "xs", "contents": body_contents}
+    }
+
+
 def make_news_carousel(title: str, color: str, items: list,
                         market_type: str = "") -> dict:
     """v10.9.75：通用新聞 carousel（台股/美股/國際大盤新聞用）。
@@ -10198,7 +10412,7 @@ def make_news_carousel(title: str, color: str, items: list,
                      "text": "Lumistock 不是新聞搬運工 — 已過篩農場、合併同事件、AI 標重要度 / 情緒 / 對股價影響 / 風險。",
                      "size": "xxs", "color": "#A05A48", "wrap": True},
                     {"type": "text",
-                     "text": "（推薦股新聞評分 / 美股→台股聯動 在 v170-171 推出）",
+                     "text": "（推薦股新聞評分 在後續版本推出；美股→台股聯動已內建）",
                      "size": "xxs", "color": "#7AABBE", "wrap": True, "margin": "xs"},
                  ]},
                 # 底部免責
@@ -10329,6 +10543,15 @@ def make_news_carousel(title: str, color: str, items: list,
                        ]},
         }
         bubbles.append(bubble)
+    # v10.9.171：美股新聞末端加「對台股聯動」分析 bubble（規格十二）
+    if market_type == "us" and items and len(bubbles) < 12:
+        try:
+            themes = _detect_us_news_themes(items)
+            linkage = _build_us_to_tw_linkage_bubble(themes, color)
+            if linkage:
+                bubbles.append(linkage)
+        except Exception as e:
+            dlog("NEWS_FILTER", f"聯動 bubble 失敗：{type(e).__name__}: {str(e)[:80]}")
     if not bubbles:
         return None
     return {"type": "carousel", "contents": bubbles}
