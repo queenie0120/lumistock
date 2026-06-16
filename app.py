@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.176"
+VERSION              = "10.9.177"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10005,13 +10005,23 @@ def _filter_and_dedup_category_news(items: list, count: int = 10,
                 break
         if merged_into is None:
             # 新事件
-            it["other_sources"] = []          # 同事件其他來源（不含主來源）
+            it["other_sources"] = []          # 同事件其他來源（不含主來源）— 保留 backward compat
+            it["chinese_refs"] = []           # v10.9.177：TW 主流/延伸（中文摘要參考）
+            it["other_us_srcs"] = []          # v10.9.177：US 其他來源（次級或同級）
             merged.append(it)
         else:
-            # 加進主事件的 other_sources（去重 + 不重複自己）
-            if it["source"] != merged_into["source"] and \
-               it["source"] not in merged_into["other_sources"]:
-                merged_into["other_sources"].append(it["source"])
+            # v10.9.177：依 tier 分流加進 chinese_refs / other_us_srcs
+            tier = _us_news_source_tier(it.get("url",""), it["source"])
+            if it["source"] != merged_into["source"]:
+                if tier in ("tw_mainstream", "tw_general"):
+                    if it["source"] not in merged_into["chinese_refs"]:
+                        merged_into["chinese_refs"].append(it["source"])
+                else:
+                    if it["source"] not in merged_into["other_us_srcs"]:
+                        merged_into["other_us_srcs"].append(it["source"])
+                # 統一也存 other_sources（給舊邏輯 / 統計用）
+                if it["source"] not in merged_into["other_sources"]:
+                    merged_into["other_sources"].append(it["source"])
 
     merged_out = len(enriched) - len(merged)
     dlog("NEWS_FILTER",
@@ -10531,12 +10541,15 @@ def make_news_carousel(title: str, color: str, items: list,
         # v10.9.173：分類
         cat = n.get("category", "")
         other_srcs = n.get("other_sources") or []
-        # 事件卡：來源 + 其他來源（若有）
+        # v10.9.177：分主來源 vs 中文摘要參考
+        chinese_refs = n.get("chinese_refs") or []
+        other_us_srcs = n.get("other_us_srcs") or []
+        # 事件卡 header source line：主來源 + US 其他 + 中文
         src_text = f"📰 {src}"
-        if other_srcs:
-            src_text += f"　+ {('、'.join(other_srcs[:3]))}"
-            if len(other_srcs) > 3:
-                src_text += "..."
+        if other_us_srcs:
+            src_text += f"　+ {('、'.join(other_us_srcs[:2]))}"
+            if len(other_us_srcs) > 2:
+                src_text += "…"
         # 卡片 body 區塊
         body_contents = [
             {"type": "text", "text": t, "size": "sm",
@@ -10605,8 +10618,23 @@ def make_news_carousel(title: str, color: str, items: list,
                      "size": "xxs", "color": "#A05A48", "wrap": True}
                 ]
             })
-        # v10.9.166：其他佐證來源（事件卡精神）
-        if other_srcs:
+        # v10.9.166 → v10.9.177：依語言分顯示
+        # 中文摘要參考（TW 主流/延伸）
+        if chinese_refs:
+            body_contents.append({
+                "type": "text", "margin": "sm",
+                "text": f"🇹🇼 中文摘要參考：{'、'.join(chinese_refs[:5])}",
+                "size": "xxs", "color": "#7AABBE", "wrap": True,
+            })
+        # US 其他佐證來源（若 header 沒列完）
+        if other_us_srcs and len(other_us_srcs) > 2:
+            body_contents.append({
+                "type": "text", "margin": "xs",
+                "text": f"🇺🇸 同事件其他 US：{'、'.join(other_us_srcs[2:7])}",
+                "size": "xxs", "color": "#7AABBE", "wrap": True,
+            })
+        # backward compat：若都沒分類但 other_sources 有東西（罕見）
+        elif other_srcs and not chinese_refs and not other_us_srcs:
             body_contents.append({
                 "type": "text", "margin": "sm",
                 "text": f"📡 同事件其他來源：{'、'.join(other_srcs[:5])}",
