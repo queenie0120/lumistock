@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.171"
+VERSION              = "10.9.172"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -11242,6 +11242,9 @@ def make_rec_card(rank:int, s:dict)->dict:
     tech_txt = ai.get("tech") or ("、".join(s.get("tech_signals",[])[:3]) or "—")
     chip_txt = ai.get("chip") or ("、".join(s.get("chip_signals",[])[:3]) or "—")
     news_txt = ai.get("news") or s.get("sentiment","中性")
+    # v10.9.172：新聞影響評分 (-10 ~ +10)
+    news_impact = ai.get("news_impact")
+    news_reason = ai.get("news_reason", "")
     style = ai.get("style", "波段")
     risk = ai.get("risk") or "短線波動仍需留意大盤與國際雜訊"
     confidence = ai.get("confidence", "中")
@@ -11311,6 +11314,19 @@ def make_rec_card(rank:int, s:dict)->dict:
                         {"type":"text","text":news_txt,"size":"xxs","color":"#5B4040","flex":5,"wrap":True}
                     ]},
                 ]},
+                # v10.9.172：新聞影響評分（規格十）
+                *([{"type":"box","layout":"horizontal","margin":"sm","contents":[
+                    {"type":"text","text":"📰 新聞影響","size":"xxs",
+                     "color":"#9B6B5A","flex":2,"weight":"bold"},
+                    {"type":"text",
+                     "text":f"{news_impact:+d} 分（-10~+10）",
+                     "size":"xxs",
+                     "color":"#D97A5C" if (news_impact or 0)>0 else ("#7AABBE" if (news_impact or 0)<0 else "#8B6B5A"),
+                     "weight":"bold","flex":5,"wrap":True},
+                ]}] if (news_impact is not None and news_impact != 0) else []),
+                *([{"type":"text","text":news_reason,
+                    "size":"xxs","color":"#8B6B5A","wrap":True,"margin":"xs"}]
+                  if news_reason else []),
                 # 支撐 / 壓力 / 停損 / 目標
                 *([{"type":"separator","color":"#E8C4B4"},
                    {"type":"text","text":"📍 價位區間（近 60 天）","size":"xxs","color":"#A05A48","weight":"bold"},
@@ -11563,6 +11579,14 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
 - fit（適合對象）：短線/波段/中長線/存股，加適合的投資人類型
 - watch（觀察條件）：用什麼訊號決定加碼或退場（例如「跌破 20 日線停損」「KD 死亡交叉減碼」）
 
+【v10.9.172：新聞影響評分（規格十）】
+- news_impact：整數 -10 ~ +10
+  - 加分：多家主流媒體一致報導利多、財報優、產業趨勢明確、公司展望上修
+  - 不加分：來源可信度低 / 標題利多但內容普通 / 利多已反映在股價
+  - 扣分：財報不如預期、展望下修、訴訟、監管、產品延遲、地緣風險
+  - 沒新聞 / 中性 → 0
+- news_reason：1 句說明評分原因（例「外資 + Reuters 同步報導 AI 訂單，但已反映在股價」）
+
 【輸出格式：純 JSON array，沒有 markdown 包裝】
 [
   {
@@ -11575,6 +11599,8 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
     "tech": "技術面 1 句",
     "chip": "籌碼面 1 句",
     "news": "消息面 1 句",
+    "news_impact": 5,
+    "news_reason": "新聞影響原因 1 句",
     "style": "短線/波段/中長線/存股 擇一",
     "confidence": "高/中/低"
   },
