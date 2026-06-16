@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.173"
+VERSION              = "10.9.174"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -13108,6 +13108,202 @@ def make_holding_analysis_card(rank: int, h: dict) -> dict:
     }
 
 
+# v10.9.174：跨持股風險分析（產業集中度 + 單檔曝險）
+def _analyze_holdings_risk(holdings_data: list) -> dict:
+    """計算跨持股風險指標，回傳 dict"""
+    if not holdings_data:
+        return {}
+    total_market = sum(h["market_value"] for h in holdings_data)
+    if total_market <= 0:
+        return {}
+
+    # 1. 單檔集中度
+    single_concentration = []
+    for h in holdings_data:
+        w = h["market_value"] / total_market * 100
+        single_concentration.append({
+            "sid": h["sid"], "name": h["name"], "weight": w,
+        })
+    single_concentration.sort(key=lambda x: -x["weight"])
+
+    # 2. 產業集中度（從 INDUSTRY_CACHE 拿）
+    industry_weight = {}
+    industry_unknown_weight = 0
+    for h in holdings_data:
+        ind = INDUSTRY_CACHE.get(h["sid"], "") or "未分類"
+        w = h["market_value"] / total_market * 100
+        if ind == "未分類":
+            industry_unknown_weight += w
+        else:
+            industry_weight[ind] = industry_weight.get(ind, 0) + w
+    industry_sorted = sorted(industry_weight.items(),
+                             key=lambda x: -x[1])
+
+    # 3. 科技類偏重（半導體 + 電子相關）
+    tech_keywords = ["半導體", "電子", "光電", "通信", "電腦", "電機"]
+    tech_weight = sum(w for ind, w in industry_weight.items()
+                     if any(k in ind for k in tech_keywords))
+
+    # 4. 警示
+    alerts = []
+    if len(holdings_data) < 3:
+        alerts.append({
+            "level": "high",
+            "msg": f"持股檔數 {len(holdings_data)} 檔，組合過度集中",
+            "suggest": "建議至少分散到 5 檔以上不同產業，降低個別公司風險",
+        })
+    if single_concentration and single_concentration[0]["weight"] > 30:
+        h = single_concentration[0]
+        alerts.append({
+            "level": "high",
+            "msg": f"{h['sid']} {h['name']} 占 {h['weight']:.1f}%（> 30%）",
+            "suggest": "單檔過度集中，公司特有風險暴露大；可考慮減碼分散",
+        })
+    elif single_concentration and single_concentration[0]["weight"] > 20:
+        h = single_concentration[0]
+        alerts.append({
+            "level": "mid",
+            "msg": f"{h['sid']} {h['name']} 占 {h['weight']:.1f}%（接近 30%）",
+            "suggest": "若繼續加碼會明顯集中，後續加碼可考慮其他標的",
+        })
+    if industry_sorted and industry_sorted[0][1] > 50:
+        ind, w = industry_sorted[0]
+        alerts.append({
+            "level": "high",
+            "msg": f"{ind} 業占 {w:.1f}%（> 50%）",
+            "suggest": "單一產業過度曝險，產業景氣轉差時整體部位會同步受壓",
+        })
+    elif industry_sorted and industry_sorted[0][1] > 35:
+        ind, w = industry_sorted[0]
+        alerts.append({
+            "level": "mid",
+            "msg": f"{ind} 業占 {w:.1f}%（> 35%）",
+            "suggest": "產業集中度偏高，留意該產業景氣循環",
+        })
+    if tech_weight > 60:
+        alerts.append({
+            "level": "high",
+            "msg": f"科技類（半導體+電子族群）占 {tech_weight:.1f}%（> 60%）",
+            "suggest": "高度科技偏重，AI 題材降溫或美債殖利率升時跌幅恐放大",
+        })
+    elif tech_weight > 45:
+        alerts.append({
+            "level": "mid",
+            "msg": f"科技類占 {tech_weight:.1f}%（接近 60%）",
+            "suggest": "科技偏重，可考慮加入防禦類分散",
+        })
+    if not alerts:
+        alerts.append({
+            "level": "ok",
+            "msg": "持股結構分散合理",
+            "suggest": "繼續維持並定期重新檢視",
+        })
+
+    return {
+        "total_market": total_market,
+        "n_holdings": len(holdings_data),
+        "top_single": single_concentration[:5],
+        "top_industry": industry_sorted[:5],
+        "industry_unknown_weight": industry_unknown_weight,
+        "tech_weight": tech_weight,
+        "alerts": alerts,
+    }
+
+
+def make_holdings_risk_card(risk: dict) -> dict:
+    """v10.9.174：跨持股風險分析 bubble"""
+    if not risk: return None
+
+    # 警示底色
+    level_color = {"high": "#F2B4A5", "mid": "#F8D9A8", "ok": "#C5E1B5"}
+    level_emoji = {"high": "🔴", "mid": "🟡", "ok": "🟢"}
+
+    body_contents = [
+        {"type": "text", "text": "🏭 產業集中度",
+         "size": "sm", "color": "#A05A48", "weight": "bold"},
+    ]
+    # 產業前 5
+    for ind, w in risk["top_industry"][:5]:
+        body_contents.append({
+            "type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": ind, "size": "xxs",
+                 "color": "#5B4040", "flex": 3, "wrap": True},
+                {"type": "text", "text": f"{w:.1f}%", "size": "xxs",
+                 "color": "#D97A5C" if w > 40 else "#5B4040",
+                 "weight": "bold" if w > 40 else "regular",
+                 "flex": 1, "align": "end"},
+            ]
+        })
+    if risk["industry_unknown_weight"] > 0:
+        body_contents.append({
+            "type": "text",
+            "text": f"未分類 {risk['industry_unknown_weight']:.1f}%",
+            "size": "xxs", "color": "#8B6B5A", "wrap": True,
+        })
+    body_contents.append({"type": "separator", "color": "#C9D8C0"})
+
+    # 單檔集中度 top 3
+    body_contents.append({
+        "type": "text", "text": "📊 單檔集中度",
+        "size": "sm", "color": "#A05A48", "weight": "bold",
+    })
+    for h in risk["top_single"][:3]:
+        body_contents.append({
+            "type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": f"{h['sid']} {h['name']}",
+                 "size": "xxs", "color": "#5B4040", "flex": 3, "wrap": True},
+                {"type": "text", "text": f"{h['weight']:.1f}%",
+                 "size": "xxs",
+                 "color": "#D97A5C" if h["weight"] > 25 else "#5B4040",
+                 "weight": "bold" if h["weight"] > 25 else "regular",
+                 "flex": 1, "align": "end"},
+            ]
+        })
+    body_contents.append({"type": "separator", "color": "#C9D8C0"})
+
+    # 警示
+    body_contents.append({
+        "type": "text", "text": "⚠ 風險檢查",
+        "size": "sm", "color": "#A05A48", "weight": "bold",
+    })
+    for a in risk["alerts"][:5]:
+        body_contents.append({
+            "type": "box", "layout": "vertical",
+            "backgroundColor": level_color.get(a["level"], "#FAE6DE"),
+            "cornerRadius": "6px", "paddingAll": "6px", "spacing": "xs",
+            "margin": "xs", "contents": [
+                {"type": "text",
+                 "text": f"{level_emoji.get(a['level'],'⚠')} {a['msg']}",
+                 "size": "xxs", "color": "#5B4040",
+                 "weight": "bold", "wrap": True},
+                {"type": "text", "text": a["suggest"],
+                 "size": "xxs", "color": "#5B4040", "wrap": True},
+            ]
+        })
+    body_contents.append({
+        "type": "text",
+        "text": "⚠️ 僅供參考，依個人風險承受度調整",
+        "size": "xxs", "color": "#B89BC4",
+        "align": "center", "margin": "sm",
+    })
+
+    return {
+        "type": "bubble", "size": "mega",
+        "header": {"type": "box", "layout": "vertical",
+                   "backgroundColor": "#5B8B6B", "paddingAll": "12px",
+                   "contents": [
+                       {"type": "text", "text": "🛡 持股風險分析",
+                        "size": "lg", "color": "#FFFFFF", "weight": "bold"},
+                       {"type": "text",
+                        "text": "產業集中度 / 單檔曝險 / 結構警示",
+                        "size": "xxs", "color": "#E0EDD8"},
+                   ]},
+        "body": {"type": "box", "layout": "vertical",
+                 "backgroundColor": "#FDF6F0", "paddingAll": "12px",
+                 "spacing": "sm", "contents": body_contents}
+    }
+
+
 def make_holdings_analysis_overview(holdings_data: list) -> dict:
     """v10.9.167：持股分析封面 — 統整資訊"""
     total_market = sum(h["market_value"] for h in holdings_data)
@@ -13320,9 +13516,19 @@ def build_and_push_holdings_analysis(user_id: str):
             h["ai"] = ai_map.get(h["sid"], {})
 
         # 5. Flex carousel
+        # v10.9.174：含跨持股風險分析 bubble
         overview = make_holdings_analysis_overview(top)
+        risk_info = _analyze_holdings_risk(top)
+        risk_card = make_holdings_risk_card(risk_info)
         cards = [make_holding_analysis_card(i+1, h) for i, h in enumerate(top)]
-        flex = {"type": "carousel", "contents": [overview] + cards}
+        # LINE carousel 上限 12：overview + risk + N 卡片 ≤ 12
+        # 若 N=10，總共 1+1+10=12 剛好
+        bubbles = [overview]
+        if risk_card:
+            bubbles.append(risk_card)
+        bubbles += cards
+        bubbles = bubbles[:12]   # 安全 cap
+        flex = {"type": "carousel", "contents": bubbles}
         push_flex(user_id, flex, "📋 我的持股分析")
     except Exception as e:
         dlog("HOLDING_AI", f"主流程失敗：{type(e).__name__}: {str(e)[:120]}")
