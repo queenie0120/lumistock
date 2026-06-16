@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.177"
+VERSION              = "10.9.178"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4322,10 +4322,16 @@ def get_taiwan_gold_price() -> dict:
     shop = _fetch_silver_shop_gold()
     if shop and shop.get("gold_sell_per_tael"):
         return {
-            "price": shop["gold_sell_per_tael"],      # per 兩（賣出 / 一般人買的價）
+            # v10.9.178：銀樓飾金真實單位是「錢」，price 仍維持 per 兩給舊 caller backward compat
+            "price": shop["gold_sell_per_tael"],      # per 兩（舊欄位保留）
             "gram_price": shop["gold_sell_per_gram"], # per 公克
-            "buy_price": shop["gold_buy_per_tael"],   # 回收價
+            "buy_price": shop["gold_buy_per_tael"],
             "buy_gram_price": shop["gold_buy_per_gram"],
+            # v10.9.178：新增 per 錢欄位 — Flex 顯示主軸
+            "qian_price": shop["gold_sell_per_qian"],
+            "buy_qian_price": shop["gold_buy_per_qian"],
+            "platinum_sell_per_qian": shop["platinum_sell_per_qian"],
+            "platinum_buy_per_qian": shop["platinum_buy_per_qian"],
             "platinum_sell_per_tael": shop["platinum_sell_per_tael"],
             "platinum_buy_per_tael":  shop["platinum_buy_per_tael"],
             "platinum_sell_per_gram": shop["platinum_sell_per_gram"],
@@ -5398,41 +5404,77 @@ def make_taiwan_gold_flex(data: dict) -> dict:
         type_tag = source
         header_color = "#E8C99B"
 
-    contents = [
-        {"type":"box","layout":"horizontal","contents":[
-            {"type":"text","text":"每兩（37.5 克）","size":"xxs","color":"#A07560","flex":3},
-            {"type":"text","text":"賣出 / 一般人買價","size":"xxs","color":"#9B6B5A","flex":4,"align":"end"},
-        ]},
-        {"type":"text","text":f"NT$ {price:,.0f}","size":"xxl","weight":"bold","color":"#E89B82"},
-        {"type":"text","text":f"每公克 NT$ {gram_price:,.2f}","size":"sm","color":"#A07560"},
-    ]
+    # v10.9.178：jewelry 模式 — 顯示主軸 = 每錢（銀樓真實單位）
+    # 其他模式（bullion / passbook / estimate）仍以原單位（兩 / 公克）為主
+    qian_price = data.get("qian_price")
+    buy_qian_price = data.get("buy_qian_price")
+
+    if source_type == "jewelry" and qian_price:
+        contents = [
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":"每錢（3.75 克）","size":"xxs","color":"#A07560","flex":3},
+                {"type":"text","text":"賣出 / 一般人買價","size":"xxs","color":"#9B6B5A","flex":4,"align":"end"},
+            ]},
+            # 主軸：每錢價（最大字）
+            {"type":"text","text":f"NT$ {qian_price:,.0f}",
+             "size":"xxl","weight":"bold","color":"#E89B82"},
+            # 副：每兩 + 每公克
+            {"type":"text",
+             "text":f"每兩 NT$ {price:,.0f}　每公克 NT$ {gram_price:,.2f}",
+             "size":"xxs","color":"#A07560","wrap":True},
+        ]
+    else:
+        # 其他模式：每兩為主（既有行為）
+        contents = [
+            {"type":"box","layout":"horizontal","contents":[
+                {"type":"text","text":"每兩（37.5 克）","size":"xxs","color":"#A07560","flex":3},
+                {"type":"text","text":"賣出 / 一般人買價","size":"xxs","color":"#9B6B5A","flex":4,"align":"end"},
+            ]},
+            {"type":"text","text":f"NT$ {price:,.0f}","size":"xxl","weight":"bold","color":"#E89B82"},
+            {"type":"text","text":f"每公克 NT$ {gram_price:,.2f}","size":"sm","color":"#A07560"},
+        ]
+
     # 回收價（only 銀樓飾金有）
     if buy_price and source_type == "jewelry":
+        # v10.9.178：回收價也以「錢」為主軸
         contents += [
             {"type":"separator","color":"#F0D5C0"},
             {"type":"box","layout":"horizontal","contents":[
                 {"type":"text","text":"回收價（賣回去）","size":"xxs","color":"#A07560","flex":3},
-                {"type":"text","text":f"NT$ {buy_price:,.0f} / 兩","size":"xxs","color":"#7AABBE","flex":4,"align":"end","weight":"bold"},
+                {"type":"text",
+                 "text":f"NT$ {buy_qian_price:,.0f} / 錢" if buy_qian_price else f"NT$ {buy_price:,.0f} / 兩",
+                 "size":"xs","color":"#7AABBE","flex":4,"align":"end","weight":"bold"},
             ]},
-            {"type":"text","text":f"每公克 NT$ {buy_gram:,.2f}",
-             "size":"xxs","color":"#7AABBE"},
+            {"type":"text",
+             "text":f"每兩 NT$ {buy_price:,.0f}　每公克 NT$ {buy_gram:,.2f}",
+             "size":"xxs","color":"#7AABBE","wrap":True},
         ]
 
     # 白金（only 銀樓飾金有）
     plat_sell = data.get("platinum_sell_per_tael")
     plat_buy = data.get("platinum_buy_per_tael")
+    plat_sell_qian = data.get("platinum_sell_per_qian")
+    plat_buy_qian = data.get("platinum_buy_per_qian")
     if plat_sell and source_type == "jewelry":
+        # v10.9.178：白金也以「錢」為主
         contents += [
             {"type":"separator","color":"#F0D5C0","margin":"sm"},
             {"type":"text","text":"⚪ 白金（鉑金）","size":"sm","color":"#A05A48","weight":"bold"},
             {"type":"box","layout":"horizontal","contents":[
-                {"type":"text","text":"賣出 / 兩","size":"xxs","color":"#A07560","flex":3},
-                {"type":"text","text":f"NT$ {plat_sell:,.0f}","size":"xxs","color":"#5B4040","flex":4,"align":"end","weight":"bold"},
+                {"type":"text","text":"賣出 / 錢","size":"xxs","color":"#A07560","flex":3},
+                {"type":"text",
+                 "text":f"NT$ {plat_sell_qian:,.0f}" if plat_sell_qian else f"NT$ {plat_sell:,.0f}/兩",
+                 "size":"xs","color":"#5B4040","flex":4,"align":"end","weight":"bold"},
             ]},
             {"type":"box","layout":"horizontal","contents":[
-                {"type":"text","text":"回收 / 兩","size":"xxs","color":"#A07560","flex":3},
-                {"type":"text","text":f"NT$ {plat_buy:,.0f}","size":"xxs","color":"#7AABBE","flex":4,"align":"end"},
+                {"type":"text","text":"回收 / 錢","size":"xxs","color":"#A07560","flex":3},
+                {"type":"text",
+                 "text":f"NT$ {plat_buy_qian:,.0f}" if plat_buy_qian else f"NT$ {plat_buy:,.0f}/兩",
+                 "size":"xs","color":"#7AABBE","flex":4,"align":"end"},
             ]},
+            {"type":"text",
+             "text":f"（每兩 {plat_sell:,.0f}　每公克 {plat_sell/37.5:,.0f}）",
+             "size":"xxs","color":"#A07560","wrap":True},
         ]
 
     # 來源 + 時間
