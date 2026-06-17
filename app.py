@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.178"
+VERSION              = "10.9.179"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4025,6 +4025,9 @@ def make_forex_menu_flex() -> dict:
                 ("🇭🇰 HKD/TWD 港幣台幣","查HKDTWD"),
                 ("🇰🇷 KRW/TWD 韓元台幣","查KRWTWD"),
                 ("🇦🇺 AUD/TWD 澳幣台幣","查AUDTWD"),
+                ("🇨🇦 CAD/TWD 加幣台幣","查CADTWD"),
+                ("🇨🇭 CHF/TWD 瑞郎台幣","查CHFTWD"),
+                ("🇸🇬 SGD/TWD 星元台幣","查SGDTWD"),
             ]
         ),
         # 💵 美元核心（v10.9.33 新增區）
@@ -4178,6 +4181,9 @@ FOREX_SYMBOLS = {
     "查HKDTWD": ("HKDTWD=X", "🇭🇰 HKD/TWD 港幣台幣"),
     "查KRWTWD": ("KRWTWD=X", "🇰🇷 KRW/TWD 韓元台幣"),
     "查AUDTWD": ("AUDTWD=X", "🇦🇺 AUD/TWD 澳幣台幣"),
+    "查CADTWD": ("CADTWD=X", "🇨🇦 CAD/TWD 加幣台幣"),    # v10.9.179
+    "查CHFTWD": ("CHFTWD=X", "🇨🇭 CHF/TWD 瑞郎台幣"),    # v10.9.179
+    "查SGDTWD": ("SGDTWD=X", "🇸🇬 SGD/TWD 星元台幣"),    # v10.9.179
     # 💵 美元核心
     "查DXY":    ("DX-Y.NYB", "💵 DXY 美元指數"),
     # 🌏 國際主要貨幣對（保留，代表全球資金方向）
