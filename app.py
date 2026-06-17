@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.179"
+VERSION              = "10.9.180"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1763,6 +1763,40 @@ def get_ex_dividend_info(stock_id: str) -> dict:
         "source": info.get("source", "unknown"),
         "note": info.get("note", ""),
         "date": info.get("date"),
+    }
+
+
+def get_upcoming_ex_dividend_info(stock_id: str, within_days: int = 14) -> dict:
+    """v10.9.180：查未來 within_days 天內是否有除權息（不含今天本身）。
+    回傳 None = 無；回傳 dict = {days, cash, stock, date, source}。
+    今天 = 除權息日 → 用 get_ex_dividend_info（這個函數只看未來）。
+    """
+    if stock_id not in EX_DIVIDEND_CALENDAR:
+        _lazy_load_exdiv_for_stock(stock_id)
+    info = EX_DIVIDEND_CALENDAR.get(stock_id)
+    if not info:
+        return None
+    date_str = info.get("date", "")
+    if not date_str or len(date_str) != 8:
+        return None
+    try:
+        ex_date = datetime.strptime(date_str, "%Y%m%d").date()
+        today = now_taipei().date()
+        days_to_go = (ex_date - today).days
+    except Exception:
+        return None
+    if days_to_go <= 0 or days_to_go > within_days:
+        return None
+    cash = info.get("cash", 0) or 0
+    stock = info.get("stock", 0) or 0
+    if cash <= 0 and stock <= 0:
+        return None
+    return {
+        "days": days_to_go,
+        "cash": cash,
+        "stock": stock,
+        "date": date_str,
+        "source": info.get("source", "unknown"),
     }
 
 
@@ -5816,6 +5850,11 @@ def get_tw_stock(stock_id: str) -> dict:
         }
         if ex_div:
             result["ex_dividend"] = ex_div["cash"]
+        else:
+            # v10.9.180：近期除權息提醒（14 天內）
+            upcoming = get_upcoming_ex_dividend_info(stock_id, within_days=14)
+            if upcoming:
+                result["upcoming_ex_div"] = upcoming
         # v10.9.170：盤中拿到非即時 + 0% 漲跌 = 強烈懷疑昨收冒充當前價，**不寫快取**
         # 避免「3 分鐘內所有用戶都拿到錯誤 189+0%」
         if _tw_in_trading_hours() and not is_rt and abs(pct) < 0.01:
@@ -14471,7 +14510,8 @@ def make_ma_row(label,value):
 
 def make_stock_flex(symbol,name,market_type,status,source,
                     price,chg,pct,open_p,high,low,vol,
-                    kline,news_list,query_time,ex_dividend=None,meta=None):
+                    kline,news_list,query_time,ex_dividend=None,meta=None,
+                    upcoming_ex_div=None):
     is_up=chg>=0; color="#D97A5C" if is_up else "#7AABBE"
     arrow="▲" if is_up else "▼"; sign="+" if is_up else ""
     spark=kline.get("spark","▄▄▄▄▄▄▄▄▄▄"); trend=kline.get("trend","--")
@@ -14537,6 +14577,17 @@ def make_stock_flex(symbol,name,market_type,status,source,
                 *([{"type":"box","layout":"horizontal","backgroundColor":"#FAE6DE","cornerRadius":"6px","paddingAll":"8px","contents":[
                     {"type":"text","text":f"💰 今日除息 {ex_dividend} 元（漲跌已修正）","size":"xs","color":"#A05A48","weight":"bold","wrap":True}
                 ]}] if ex_dividend else []),
+                # v10.9.180：近期除權息提醒（14 天內）
+                *([{"type":"box","layout":"vertical","backgroundColor":"#F5E0D0","cornerRadius":"6px","paddingAll":"8px","spacing":"xs","contents":[
+                    {"type":"text",
+                     "text":f"📅 {upcoming_ex_div['days']} 天後除權息（{upcoming_ex_div['date'][:4]}/{upcoming_ex_div['date'][4:6]}/{upcoming_ex_div['date'][6:8]}）",
+                     "size":"xs","color":"#A05A48","weight":"bold","wrap":True},
+                    {"type":"text",
+                     "text":(f"配息 {upcoming_ex_div['cash']} 元" if upcoming_ex_div.get('cash',0)>0 else "")
+                            + ("　" if upcoming_ex_div.get('cash',0)>0 and upcoming_ex_div.get('stock',0)>0 else "")
+                            + (f"配股 {upcoming_ex_div['stock']} 元" if upcoming_ex_div.get('stock',0)>0 else ""),
+                     "size":"xxs","color":"#8B6B5A","wrap":True},
+                ]}] if upcoming_ex_div else []),
                 {"type":"separator","color":"#E8C4B4"},
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"box","layout":"vertical","flex":1,"contents":[
@@ -14625,7 +14676,8 @@ def get_stock_flex(symbol:str, user_id:str="")->tuple:
                                tw.get("open","N/A"),tw["high"],tw["low"],tw["vol"],
                                kline,news,query_time,
                                ex_dividend=tw.get("ex_dividend"),
-                               meta=tw.get("meta")),None
+                               meta=tw.get("meta"),
+                               upcoming_ex_div=tw.get("upcoming_ex_div")),None
     else:
         us=get_us_stock(symbol)
         if not us: return None,f"查無此股票：{symbol}\n請確認代碼是否正確"
