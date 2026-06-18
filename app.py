@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.183"
+VERSION              = "10.9.184"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10033,6 +10033,61 @@ def get_tw_stock_news_with_ai(stock_id: str, cn_name: str, count: int = 4) -> li
 #  特色：原文 + 中文翻譯（美股）+ 情緒分析 + 影響台股
 # ══════════════════════════════════════════
 
+def get_google_news_en(query: str, count: int = 10) -> list:
+    """v10.9.184：en-US locale Google News，抓 Reuters / Bloomberg / CNBC 等英文外電。
+    規格§2/§3 要求：美股 + 國際新聞必須有英文主流外電覆蓋。
+    回傳 [{title, url, source, date}]。
+    """
+    url = (f"https://news.google.com/rss/search?q={requests.utils.quote(query)}"
+           f"&hl=en-US&gl=US&ceid=US:en")
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            record_health("Google News EN", False, f"HTTP {r.status_code}")
+            return []
+        root = ET.fromstring(r.content)
+        items = root.findall(".//item")
+        out, seen = [], set()
+        for it in items:
+            raw_title = clean_title(it.findtext("title", "") or "")
+            link = (it.findtext("link", "") or "").strip()
+            if not raw_title or not link:
+                continue
+            src_el = it.find("source")
+            source = (src_el.text if src_el is not None else "") or ""
+            title = raw_title
+            if " - " in raw_title:
+                head, tail = raw_title.rsplit(" - ", 1)
+                if not source:
+                    source = tail.strip()
+                title = head.strip()
+            if not source:
+                source = "綜合報導"
+            if not is_real_news(title):
+                continue
+            norm = normalize_title(title)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            pub = (it.findtext("pubDate", "") or "").strip()
+            date_short = pub
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(pub)
+                date_short = dt.astimezone(TZ_TAIPEI).strftime("%m/%d %H:%M")
+            except: pass
+            out.append({"title": title, "url": link, "source": source, "date": date_short})
+            if len(out) >= count:
+                break
+        if out:
+            record_health("Google News EN", True)
+        return out
+    except Exception as e:
+        dlog("NEWS", f"Google News EN 失敗：{type(e).__name__}: {e}")
+        record_health("Google News EN", False, f"{type(e).__name__}")
+        return []
+
+
 def get_google_news_multi(query: str, count: int = 10) -> list:
     """v10.9.76：Google News RSS 多來源新聞，回傳 [{title,url,source,date}]。
     特色：一個 query 涵蓋多家媒體（UDN/中央社/中時/自由/cnyes/換日線…），來源多元。
@@ -10316,8 +10371,19 @@ def get_category_news(category: str, count: int = 10) -> list:
         g = get_google_news_multi("台股 加權指數 台積電 上市櫃", count=raw_count)
         merged = (y or []) + (g or [])
     elif category == "us":
-        merged = get_google_news_multi(
-            "美股 道瓊 那斯達克 標普500 費城半導體 Fed 聯準會", count=raw_count)
+        # v10.9.184：並行抓 zh-TW + en-US，en-US 帶來 Reuters / Bloomberg / CNBC / WSJ
+        from concurrent.futures import ThreadPoolExecutor
+        def _zh(): return get_google_news_multi(
+            "美股 道瓊 那斯達克 標普500 費城半導體 Fed 聯準會", count=raw_count) or []
+        def _en(): return get_google_news_en(
+            "US stocks Dow Nasdaq SP500 Fed earnings", count=raw_count) or []
+        merged = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fs = [pool.submit(_zh), pool.submit(_en)]
+            for f in fs:
+                try: merged += f.result(timeout=11)
+                except Exception as e:
+                    dlog("CAT_NEWS", f"US fetch part fail: {type(e).__name__}")
     elif category == "intl":
         merged = get_google_news_multi(
             "國際財經 歐洲股市 日本股市 全球經濟 油價 黃金 IMF", count=raw_count)
