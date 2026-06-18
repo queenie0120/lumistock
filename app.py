@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.182"
+VERSION              = "10.9.183"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9025,6 +9025,22 @@ US_NEWS_SOURCE_WEIGHTS = {
     "businesstoday.com.tw": 50, # 今周刊
     "wealth.com.tw": 50,        # 財訊
     "wantgoo.com": 45,
+    # 🇹🇼 v10.9.183：補充常見中型媒體（規格§6 C 級 50%；解「過篩過嚴 → 看似單源」）
+    "ltn.com.tw": 50,           # 自由時報 / 自由財經
+    "ec.ltn.com.tw": 50,        # 自由財經
+    "setn.com": 40,             # 三立新聞網
+    "ettoday.net": 40,          # ETtoday 財經雲
+    "nownews.com": 40,          # NOWnews 今日新聞
+    "tvbs.com.tw": 40,          # TVBS 新聞
+    "ctitv.com.tw": 40,         # 中天新聞網
+    "pts.org.tw": 50,           # 公視新聞網
+    "ctwant.com": 35,           # CTWANT
+    "ctee.com.tw": 65,          # 工商時報（已有但確保 domain match）
+    "wantrich.chinatimes.com": 50, # 旺得富理財網（中時旗下）
+    "ftnnews.com": 35,          # FTNN 新聞
+    "cmoney.tw": 45,            # CMoney 投資網誌
+    "storm.mg": 45,             # 風傳媒（信傳媒）
+    "twreporter.org": 55,       # 報導者（深度）
 }
 
 US_NEWS_SOURCE_NAMES = {
@@ -9053,6 +9069,20 @@ US_NEWS_SOURCE_NAMES = {
     "businesstoday.com.tw": "今周刊",
     "wealth.com.tw": "財訊",
     "wantgoo.com": "玩股網",
+    # v10.9.183：中型媒體顯示名
+    "ltn.com.tw": "自由時報", "ec.ltn.com.tw": "自由財經",
+    "setn.com": "三立新聞網",
+    "ettoday.net": "ETtoday",
+    "nownews.com": "NOWnews",
+    "tvbs.com.tw": "TVBS",
+    "ctitv.com.tw": "中天新聞網",
+    "pts.org.tw": "公視新聞網",
+    "ctwant.com": "CTWANT",
+    "wantrich.chinatimes.com": "旺得富",
+    "ftnnews.com": "FTNN 新聞",
+    "cmoney.tw": "CMoney",
+    "storm.mg": "風傳媒",
+    "twreporter.org": "報導者",
 }
 
 # v10.9.176：來源 tier 分類（給事件卡顯示「主來源 + 中文摘要參考」+ 推薦股嚴篩用）
@@ -9065,8 +9095,18 @@ def _us_news_source_tier(url: str = "", source_name: str = "") -> str:
     name = (source_name or _us_news_source_name(url) or "").lower()
     # TW 來源優先用名稱判斷（不靠 url，因為 Google News 轉址）
     tw_mainstream_names = ["鉅亨", "anue", "經濟日報", "工商時報", "中央社",
-                            "moneydj", "yahoo 奇摩", "yahoo 股市"]
-    tw_general_names = ["今周刊", "財訊", "玩股網"]
+                            "moneydj", "yahoo 奇摩", "yahoo 股市",
+                            "聯合新聞網", "udn",  # v10.9.183
+                            "旺得富",            # v10.9.183（中時旗下財經）
+                            "自由財經"]          # v10.9.183（自由時報財經版）
+    # v10.9.183：補一般中型媒體（規格§6 C 級 50%）→ tier=tw_general
+    tw_general_names = ["今周刊", "財訊", "玩股網",
+                         "自由時報", "三立", "setn",
+                         "nownews", "今日新聞", "ettoday",
+                         "tvbs", "中天", "公視", "pnn",
+                         "cmoney", "ctwant", "pchome", "ftnn",
+                         "line today", "中時", "風傳媒", "信傳媒",
+                         "報導者", "東森", "好房", "msn 財經"]
     is_tw_mainstream = any(k in name for k in tw_mainstream_names)
     is_tw_general = any(k in name for k in tw_general_names)
     if is_tw_mainstream:    return "tw_mainstream"
@@ -9125,6 +9165,35 @@ US_NEWS_NAME_WEIGHTS = {
     "今周刊": 50, "今周刊雜誌": 50,
     "財訊": 50, "財訊雜誌": 50, "財訊快報": 50,
     "玩股網": 45,
+    # 🇹🇼 v10.9.183：補常見中型媒體（規格§6 C 級 50%）
+    "旺得富理財網": 50, "旺得富": 50,
+    "自由財經": 50, "自由時報": 45, "ec.ltn.com.tw": 50,
+    "LINE TODAY": 40, "LINE Today": 40,
+    "三立新聞網SETN.com": 40, "三立新聞網": 40, "SETN.com": 40, "三立財經": 50,
+    "NOWnews今日新聞": 40, "NOWnews 今日新聞": 40, "NOWnews": 40,
+    "CTWANT": 35,
+    "PChome Online 新聞": 35, "PChome": 35, "PChome 新聞": 35,
+    "FTNN 新聞": 35, "FTNN新聞": 35, "FTNN": 35,
+    "中天新聞網": 40, "中天新聞": 40,
+    "CMoney投資網誌": 45, "CMoney 投資網誌": 45, "CMoney": 45,
+    "公視新聞網PNN": 50, "公視新聞網": 50, "公視 PNN": 50, "公視": 50,
+    "TVBS新聞網": 40, "TVBS 新聞網": 40, "TVBS": 40,
+    "東森財經新聞": 45, "東森財經": 45, "ETtoday財經雲": 40, "ETtoday 財經雲": 40, "ETtoday": 40,
+    "信傳媒": 40, "風傳媒": 45,
+    "聯合新聞網": 60, "UDN": 60,
+    "中時新聞網": 50, "中時電子報": 50, "中時": 50,
+    "好房網News": 25,            # 房地產為主，財經低
+    "報導者": 55, "報導者 The Reporter": 55,
+    # 🇺🇸 v10.9.183：補英文中型媒體（en-US locale 常見）
+    "Stocktwits": 35,
+    "The Economic Times": 40, "Economic Times": 40,
+    "NDTV Profit": 35,
+    "FXEmpire": 45, "FXStreet": 50,
+    "The Business Times": 60,   # 新加坡商業時報
+    "Yahoo Finance UK": 75,
+    "Investor's Business Daily": 70, "IBD": 70,
+    "TipRanks": 40,
+    "MSN": 30, "MSN 財經": 30,
 }
 
 def _us_news_source_weight_by_name(name: str) -> int:
