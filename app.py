@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.180"
+VERSION              = "10.9.181"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -11456,6 +11456,12 @@ def make_rec_card(rank:int, s:dict)->dict:
     # v10.9.172：新聞影響評分 (-10 ~ +10)
     news_impact = ai.get("news_impact")
     news_reason = ai.get("news_reason", "")
+    # v10.9.181：新聞性質判讀（規格§10.11、10.12）
+    news_horizon = (ai.get("news_horizon") or "").strip()
+    news_priced_in = (ai.get("news_priced_in") or "").strip()
+    # 「中性」當作沒填，避免每張卡片都顯示「中性／中性」雜訊
+    if news_horizon == "中性": news_horizon = ""
+    if news_priced_in == "中性": news_priced_in = ""
     style = ai.get("style", "波段")
     risk = ai.get("risk") or "短線波動仍需留意大盤與國際雜訊"
     confidence = ai.get("confidence", "中")
@@ -11538,6 +11544,17 @@ def make_rec_card(rank:int, s:dict)->dict:
                 *([{"type":"text","text":news_reason,
                     "size":"xxs","color":"#8B6B5A","wrap":True,"margin":"xs"}]
                   if news_reason else []),
+                # v10.9.181：新聞性質（影響期 + 已反映度）
+                *([{"type":"box","layout":"horizontal","margin":"xs","contents":[
+                    *([{"type":"text",
+                        "text":f"📅 影響期：{news_horizon}",
+                        "size":"xxs","color":"#8B6B5A","flex":1,"wrap":True}]
+                      if news_horizon else []),
+                    *([{"type":"text",
+                        "text":f"💹 {news_priced_in}",
+                        "size":"xxs","color":"#8B6B5A","flex":1,"align":"end","wrap":True}]
+                      if news_priced_in else []),
+                ]}] if (news_horizon or news_priced_in) else []),
                 # 支撐 / 壓力 / 停損 / 目標
                 *([{"type":"separator","color":"#E8C4B4"},
                    {"type":"text","text":"📍 價位區間（近 60 天）","size":"xxs","color":"#A05A48","weight":"bold"},
@@ -11798,6 +11815,18 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
   - 沒新聞 / 中性 → 0
 - news_reason：1 句說明評分原因（例「外資 + Reuters 同步報導 AI 訂單，但已反映在股價」）
 
+【v10.9.181：新聞性質判讀（規格十.11、十.12 強制）】
+- news_horizon：擇一 — "短線題材" / "中長線基本面" / "兩者皆有" / "中性"
+  - 短線題材：法人單日進出、單日題材、單日傳聞、單日升降評
+  - 中長線基本面：財報、財測、產業趨勢、產品線、訂單能見度
+  - 兩者皆有：既有短期情緒也有結構性題材（例 AI 訂單上修）
+  - 中性：沒新聞 / 影響不明 → "中性"
+- news_priced_in：擇一 — "已反映" / "部分反映" / "未反映" / "中性"
+  - 判斷依據：股價近期漲跌幅 vs 新聞利多/利空強度
+  - 利多但股價已大漲一段 → 已反映
+  - 利空但股價跌幅有限 → 部分反映
+  - 沒新聞 / 強度不明 → "中性"
+
 【輸出格式：純 JSON array，沒有 markdown 包裝】
 [
   {
@@ -11812,6 +11841,8 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
     "news": "消息面 1 句",
     "news_impact": 5,
     "news_reason": "新聞影響原因 1 句",
+    "news_horizon": "短線題材/中長線基本面/兩者皆有/中性 擇一",
+    "news_priced_in": "已反映/部分反映/未反映/中性 擇一",
     "style": "短線/波段/中長線/存股 擇一",
     "confidence": "高/中/低"
   },
@@ -11824,7 +11855,7 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
     answer = groq_chat(
         messages=[{"role": "system", "content": system_prompt},
                   {"role": "user", "content": user_msg}],
-        max_tokens=2500, temperature=0.3, timeout=30)
+        max_tokens=2800, temperature=0.3, timeout=30)  # v10.9.181 提高給 2 新欄位空間
     if not answer:
         return {}
     # 嘗試解析 JSON
