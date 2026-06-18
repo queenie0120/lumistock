@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.181"
+VERSION              = "10.9.182"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -11746,6 +11746,32 @@ def make_rec_flex(scored:list, mkt:dict, source_note:str,
     bubbles=[overview]+[make_rec_card(i+1,s) for i,s in enumerate(scored[:10])]
     return {"type":"carousel","contents":bubbles}
 
+def _count_unique_news_sources(news_list: list) -> int:
+    """v10.9.182：數新聞 URL 的 unique 2nd-level domain（規格§10.8 跨來源驗證指標）。
+    支援 [(title, url), ...] 與 [{"url": ...}, ...] 兩種格式。
+    """
+    if not news_list:
+        return 0
+    from urllib.parse import urlparse
+    domains = set()
+    for item in news_list[:5]:
+        url = ""
+        if isinstance(item, tuple) and len(item) >= 2:
+            url = item[1] or ""
+        elif isinstance(item, dict):
+            url = item.get("url", "") or ""
+        if not url:
+            continue
+        try:
+            netloc = urlparse(url).netloc.lower().replace("www.", "")
+            parts = netloc.split(".")
+            if len(parts) >= 2:
+                domains.add(".".join(parts[-2:]))
+        except Exception:
+            pass
+    return len(domains)
+
+
 def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
     """v10.9.135：批次 AI 分析 top 候選股，回傳
     {sid: {reason, entry, risk, fit, watch, tech, chip, news, style, confidence}}
@@ -11869,6 +11895,28 @@ def ai_analyze_top_picks_batch(stocks: list, mkt: dict) -> dict:
         for item in arr:
             if isinstance(item, dict) and item.get("sid"):
                 out[str(item["sid"])] = item
+        # v10.9.182：§10.8 2 源交叉驗證 score gate
+        # 新聞來源 <2 → news_impact 上限 ±3，並在 news_reason 標註
+        sid_to_stock = {str(s["sid"]): s for s in stocks}
+        capped_count = 0
+        for sid_key, item in out.items():
+            stock = sid_to_stock.get(sid_key)
+            if not stock:
+                continue
+            src_count = _count_unique_news_sources(stock.get("news_list", []))
+            item["news_source_count"] = src_count
+            impact = item.get("news_impact")
+            if isinstance(impact, (int, float)) and src_count < 2 and abs(impact) > 3:
+                clamped = 3 if impact > 0 else -3
+                orig = int(impact)
+                item["news_impact"] = clamped
+                item["news_impact_capped"] = True
+                old_reason = (item.get("news_reason") or "").strip()
+                tag = f"⚠ 單一來源（{src_count} 家），原評 {orig:+d} 已上限 ±3"
+                item["news_reason"] = f"{tag}。{old_reason}" if old_reason else tag
+                capped_count += 1
+        if capped_count:
+            dlog("REC", f"§10.8 2 源 gate：{capped_count} 檔 news_impact 被上限")
         dlog("REC", f"AI 批次分析：{len(out)} 檔 OK")
         return out
     except Exception as e:
