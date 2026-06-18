@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.184"
+VERSION              = "10.9.185"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10385,8 +10385,26 @@ def get_category_news(category: str, count: int = 10) -> list:
                 except Exception as e:
                     dlog("CAT_NEWS", f"US fetch part fail: {type(e).__name__}")
     elif category == "intl":
-        merged = get_google_news_multi(
-            "國際財經 歐洲股市 日本股市 全球經濟 油價 黃金 IMF", count=raw_count)
+        # v10.9.185：實機 trace 發現舊版 7 詞長 query 在 Google News AND 模式下只回 2 則 → 過濾後 0
+        #            → 「暫無可信新聞」永遠出現
+        # 修：拆 4-5 個短 query，並行 + en-US 抓 Reuters/Bloomberg 國際版主流
+        # 規格§3 要求：利率 / 美債 / 美元 / 黃金 / 原油 / 匯率 / 全球股市 / 地緣
+        from concurrent.futures import ThreadPoolExecutor
+        sub_count = max(5, raw_count // 3)  # 每 query 配額（合計約 raw_count * 1.5）
+        def _q_en_fed():   return get_google_news_en("Fed inflation Treasury yields", count=sub_count) or []
+        def _q_en_world(): return get_google_news_en("ECB BOJ Europe Japan markets", count=sub_count) or []
+        def _q_en_comm():  return get_google_news_en("oil gold commodities OPEC", count=sub_count) or []
+        def _q_en_fx():    return get_google_news_en("dollar DXY currencies emerging markets", count=sub_count) or []
+        def _q_zh():       return get_google_news_multi("美債 美元 黃金 原油 全球經濟", count=sub_count) or []
+        merged = []
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            fs = [pool.submit(_q_en_fed),  pool.submit(_q_en_world),
+                  pool.submit(_q_en_comm), pool.submit(_q_en_fx),
+                  pool.submit(_q_zh)]
+            for f in fs:
+                try: merged += f.result(timeout=11)
+                except Exception as e:
+                    dlog("CAT_NEWS", f"intl fetch part fail: {type(e).__name__}")
     elif category == "geo":
         q1 = get_google_news_multi("地緣政治 OR 國際衝突 OR 戰爭", count=raw_count)
         q2 = get_google_news_multi("制裁 OR 軍事行動 OR 外交危機 OR 邊境緊張", count=raw_count)
