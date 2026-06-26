@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.185"
+VERSION              = "10.9.186"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -10406,10 +10406,24 @@ def get_category_news(category: str, count: int = 10) -> list:
                 except Exception as e:
                     dlog("CAT_NEWS", f"intl fetch part fail: {type(e).__name__}")
     elif category == "geo":
-        q1 = get_google_news_multi("地緣政治 OR 國際衝突 OR 戰爭", count=raw_count)
-        q2 = get_google_news_multi("制裁 OR 軍事行動 OR 外交危機 OR 邊境緊張", count=raw_count)
-        q3 = get_google_news_multi("國安 OR 聯合國決議 OR 政變 OR 國際情勢", count=raw_count)
-        merged = (q1 or []) + (q2 or []) + (q3 or [])
+        # v10.9.186：規格§4 — 地緣不能只靠國外媒體，但也不能只靠中文
+        #   en-US：Reuters / Bloomberg / AP / FT 國際主流（用戶要求）
+        #   zh-TW：中央社 / 工商時報 / 經濟日報 / 鉅亨網（追蹤台股投資人視角，速度快）
+        from concurrent.futures import ThreadPoolExecutor
+        sub_count = max(5, raw_count // 3)
+        def _q1(): return get_google_news_multi("地緣政治 OR 國際衝突 OR 戰爭", count=sub_count) or []
+        def _q2(): return get_google_news_multi("制裁 OR 軍事行動 OR 外交危機 OR 邊境緊張", count=sub_count) or []
+        def _q3(): return get_google_news_multi("台海 OR 中美關係 OR 晶片禁令 OR 出口管制 OR 關稅", count=sub_count) or []
+        def _q_en_tw_us(): return get_google_news_en("China Taiwan US tension chip sanctions export controls", count=sub_count) or []
+        def _q_en_war():   return get_google_news_en("Russia Ukraine Israel Iran Middle East", count=sub_count) or []
+        merged = []
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            fs = [pool.submit(_q1), pool.submit(_q2), pool.submit(_q3),
+                  pool.submit(_q_en_tw_us), pool.submit(_q_en_war)]
+            for f in fs:
+                try: merged += f.result(timeout=11)
+                except Exception as e:
+                    dlog("CAT_NEWS", f"geo fetch part fail: {type(e).__name__}")
     else:
         return []
 
