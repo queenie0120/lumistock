@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.186"
+VERSION              = "10.9.187"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -3280,9 +3280,11 @@ def delete_portfolio_from_sheets(user_id, symbol):
         sheet = get_sheet("自選股")
         if sheet:
             records = sheet.get_all_records()
-            for i, row in enumerate(records, start=2):
-                if str(row.get("用戶ID"))==user_id and str(row.get("股票代號"))==symbol:
-                    sheet.delete_rows(i); break
+            # v10.9.187：自選股分頁是追加式，同檔會有多列 → 全部刪除（由下往上避免列號位移）
+            hits = [i for i, row in enumerate(records, start=2)
+                    if str(row.get("用戶ID"))==user_id and str(row.get("股票代號"))==symbol]
+            for i in reversed(hits):
+                sheet.delete_rows(i)
     except: pass
 
 def update_tw_data_to_sheets(stock_id, data):
@@ -3565,6 +3567,10 @@ def block_user_by_name(reg_name: str, reason: str) -> str:
         if not sheet or not bl: return "❌ 系統錯誤"
         for i, row in enumerate(sheet.get_all_records(), start=2):
             if str(row.get("註冊姓名"))==reg_name:
+                # v10.9.187：不可封鎖 Owner 或管理者（避免 Owner 被鎖在外）
+                target_uid = str(row.get("user_id"))
+                if is_owner(target_uid) or is_admin(target_uid):
+                    return f"⛔ 無法封鎖 Owner 或管理者：{reg_name}"
                 now = now_taipei().strftime("%Y-%m-%d %H:%M")
                 sheet.update_cell(i,7,"封鎖")
                 bl.append_row([str(row.get("user_id")), reg_name, reason, now, "封鎖"])
@@ -3807,12 +3813,29 @@ def calc_buy_fee(price: float, shares: int, user_id: str) -> int:
     raw = trade_value * TW_COMMISSION_RATE * discount
     return max(TW_MIN_COMMISSION, int(raw))
 
-def calc_sell_fee_tax(price: float, shares: int, user_id: str) -> tuple:
-    """賣出手續費 + 證交稅。回傳 (fee, tax)。"""
+TW_ETF_TAX_RATE          = 0.001         # 一般 ETF 證交稅 0.1%
+TW_BOND_ETF_TAX_FREE_END = "2026-12-31"  # 債券 ETF 停徵期限；延長案待確認，到期前需人工檢查
+
+def tw_sell_tax_rate(stock_id: str = "") -> float:
+    """v10.9.187：依證券種類回傳證交稅率。
+    00 開頭 = ETF 0.1%；00 開頭且 B 結尾 = 債券 ETF（停徵期間 0）；其餘 0.3%。
+    未帶代號時維持舊行為 0.3%。"""
+    sid = str(stock_id or "").upper().replace(".TWO", "").replace(".TW", "")
+    if sid.startswith("00"):
+        if sid.endswith("B") and now_taipei().strftime("%Y-%m-%d") <= TW_BOND_ETF_TAX_FREE_END:
+            return 0.0
+        return TW_ETF_TAX_RATE
+    return TW_TAX_RATE
+
+def fmt_tax_rate(stock_id: str = "") -> str:
+    return f"{tw_sell_tax_rate(stock_id) * 100:.1f}%"
+
+def calc_sell_fee_tax(price: float, shares: int, user_id: str, stock_id: str = "") -> tuple:
+    """賣出手續費 + 證交稅。回傳 (fee, tax)。v10.9.187：稅率依 stock_id 區分 ETF。"""
     trade_value = price * shares
     discount = get_user_fee_discount(user_id)
     fee = max(TW_MIN_COMMISSION, int(trade_value * TW_COMMISSION_RATE * discount))
-    tax = int(trade_value * TW_TAX_RATE)
+    tax = int(trade_value * tw_sell_tax_rate(stock_id))
     return fee, tax
 
 def restore_portfolio_from_sheets() -> int:
@@ -3841,15 +3864,21 @@ def restore_portfolio_from_sheets() -> int:
             try:
                 shares = int(float(shares_s))
                 buy_price = float(price_s)
-                if shares <= 0 or buy_price <= 0:
-                    continue
             except:
                 continue
             # 正規化：台股代號統一去掉 .TW，避免「2330」與「2330.TW」重複
             norm_symbol = symbol.replace(".TW", "") if symbol.replace(".TW","").isdigit() else symbol
+            # v10.9.187：股數 <= 0 的列是「清倉紀錄」→ 移除較早的同檔紀錄
+            # （舊版直接 continue，導致賣光後重啟持股復活）
+            if shares <= 0:
+                portfolio.pop(_pf_key(uid, norm_symbol), None)
+                continue
+            if buy_price <= 0:
+                continue
             # v10.9.73：複合 key（user_id|symbol）多使用者隔離，後寫覆蓋同一人同檔
             portfolio[_pf_key(uid, norm_symbol)] = {"user_id": uid, "shares": shares, "buy_price": buy_price}
-        if portfolio:
+        if portfolio or len(rows) >= 2:
+            # v10.9.187：即使全部清倉也要寫回（否則 /tmp 殘留舊資料）
             # 合併：Sheets 還原優先，但保留 /tmp 既有未同步的（理論上不該有）
             save_portfolio(portfolio)
             dlog("PORTFOLIO", f"從 Sheets 還原 {len(portfolio)} 檔持股")
@@ -5628,12 +5657,11 @@ def _fetch_tw_mis(stock_id: str) -> dict:
                     continue
                 # 盤後 / 週末：用 prev 當「最新已知」OK
                 price = prev; is_rt = False
-            tv = d.get("tv", "-"); v = d.get("v", "-")
+            # v10.9.187：MIS 欄位 v = 當日累積成交量（張）、tv = 最近一盤成交量。
+            # 舊版優先取 tv，盤中會顯示極小的張數 → 改為只用 v。
+            v = d.get("v", "-")
             vol_lots = None
-            if tv not in ["-","","0",None]:
-                try: vol_lots = int(float(str(tv).replace(",", "")))
-                except: pass
-            elif v not in ["-","","0",None]:
+            if v not in ["-","",None]:
                 try: vol_lots = int(float(str(v).replace(",", "")))
                 except: pass
             return {
@@ -6246,8 +6274,12 @@ def get_kline_analysis(closes: list) -> dict:
     gains=[max(closes[i]-closes[i-1],0) for i in range(1,len(closes))]
     losses=[max(closes[i-1]-closes[i],0) for i in range(1,len(closes))]
     ag=sum(gains[-14:])/min(14,len(gains)) if gains else 0
-    al=sum(losses[-14:])/min(14,len(losses)) if losses else 0.001
-    rsi=100-(100/(1+ag/al)) if al else 50
+    al=sum(losses[-14:])/min(14,len(losses)) if losses else 0
+    # v10.9.187：近 14 日無下跌時舊版回傳 50（誤標中性）→ 無漲無跌 50、只漲 100
+    if al == 0:
+        rsi = 50 if ag == 0 else 100
+    else:
+        rsi = 100-(100/(1+ag/al))
     if   rsi>80: rl="短線過熱"
     elif rsi>70: rl="短線偏熱"
     elif rsi<20: rl="極度超賣"
@@ -7050,7 +7082,7 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
 
     # v10.9.82：含手續費 + 證交稅
     gross = sell_price * sell_shares
-    fee, tax = calc_sell_fee_tax(sell_price, sell_shares, user_id)
+    fee, tax = calc_sell_fee_tax(sell_price, sell_shares, user_id, norm)
     net_proceeds = gross - fee - tax
     cost_total = cost_avg * sell_shares
     realized_pnl = net_proceeds - cost_total
@@ -7086,7 +7118,7 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
            f"　賣出 {sell_shares:,} 股 @ {sell_price:,.2f}\n"
            f"　毛收入　{gross:>10,.0f}\n"
            f"　手續費　-{fee:>9,}（折數 {disc_str}）\n"
-           f"　證交稅　-{tax:>9,}（0.3%）\n"
+           f"　證交稅　-{tax:>9,}（{fmt_tax_rate(norm)}）\n"
            f"　淨收入　{net_proceeds:>10,.0f}\n"
            f"　成本　　{cost_total:>10,.0f}（均價 {cost_avg:,.2f}）\n"
            f"　{sign}　{realized_pnl:+,.0f} 元（{pct:+.2f}%）\n"
@@ -7311,7 +7343,7 @@ def make_sell_preview_flex(items: list, user_id: str) -> dict:
             held_n = int(held.get("shares", 0))
             if shares <= held_n:
                 gross = price * shares
-                fee, tax = calc_sell_fee_tax(price, shares, user_id)
+                fee, tax = calc_sell_fee_tax(price, shares, user_id, norm)
                 net = gross - fee - tax
                 pnl = net - cost * shares
                 rec.update({"cost": cost, "gross": gross, "fee": fee, "tax": tax,
@@ -7331,7 +7363,7 @@ def make_sell_preview_flex(items: list, user_id: str) -> dict:
         "header": {"type":"box","layout":"vertical","backgroundColor":"#E89B82","paddingAll":"14px",
             "contents":[
                 {"type":"text","text":"💸 賣出預覽","size":"lg","color":"#FFFFFF","weight":"bold"},
-                {"type":"text","text":f"手續費 {disc_str} ‧ 證交稅 0.3%","size":"xxs","color":"#FDF6F0","margin":"xs"}
+                {"type":"text","text":f"手續費 {disc_str} ‧ 證交稅 股0.3%/ETF0.1%","size":"xxs","color":"#FDF6F0","margin":"xs"}
             ]},
         "body": {"type":"box","layout":"vertical","backgroundColor":"#FDF6F0","paddingAll":"14px","spacing":"sm",
             "contents":[
@@ -7592,7 +7624,7 @@ def format_sell_import_preview(items: list, user_id: str) -> str:
     discount = get_user_fee_discount(user_id)
     disc_str = f"{int(discount*100)}%" if discount < 1.0 else "無折扣"
     lines = ["💸 辨識結果 — 賣出交易",
-             f"（手續費折數 {disc_str}　證交稅 0.3%）",
+             f"（手續費折數 {disc_str}　證交稅 股0.3%/ETF0.1%）",
              "━━━━━━━━━━━━━━"]
     total_pnl = 0
     can_process = 0
@@ -7615,7 +7647,7 @@ def format_sell_import_preview(items: list, user_id: str) -> str:
             held_n = int(held.get("shares", 0))
             if shares <= held_n:
                 gross = price * shares
-                fee, tax = calc_sell_fee_tax(price, shares, user_id)
+                fee, tax = calc_sell_fee_tax(price, shares, user_id, norm)
                 net = gross - fee - tax
                 pnl = net - cost * shares
                 total_pnl += pnl
@@ -11289,8 +11321,12 @@ def score_technical(closes:list, pct:float)->dict:
     gains=[max(closes[i]-closes[i-1],0) for i in range(1,len(closes))]
     losses=[max(closes[i-1]-closes[i],0) for i in range(1,len(closes))]
     ag=sum(gains[-14:])/min(14,len(gains)) if gains else 0
-    al=sum(losses[-14:])/min(14,len(losses)) if losses else 0.001
-    rsi=100-(100/(1+ag/al)) if al else 50
+    al=sum(losses[-14:])/min(14,len(losses)) if losses else 0
+    # v10.9.187：近 14 日無下跌時舊版回傳 50（誤標中性）→ 無漲無跌 50、只漲 100
+    if al == 0:
+        rsi = 50 if ag == 0 else 100
+    else:
+        rsi = 100-(100/(1+ag/al))
     if   45<=rsi<=70: score+=10; signals.append(f"RSI健康({rsi:.0f})")
     elif rsi<30:      score+=5;  signals.append(f"RSI超賣({rsi:.0f})")
     elif rsi>80:      score-=5
@@ -14528,7 +14564,7 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
         gross_pct = (price - bp) / bp * 100 if price and bp else 0
         # v10.9.92：賣出費稅（台股有，美股無）
         if sid.isdigit() and price:
-            fee, tax = calc_sell_fee_tax(price, shares, user_id)
+            fee, tax = calc_sell_fee_tax(price, shares, user_id, sid)
         else:
             fee, tax = 0, 0
         fee_tax = fee + tax
@@ -14725,7 +14761,7 @@ def get_portfolio_summary(user_id:str)->str:
             shares=data["shares"]; bp=data["buy_price"]
             gross=(price-bp)*shares
             if sid.isdigit() and price:
-                fee, tax = calc_sell_fee_tax(price, shares, user_id); ft = fee+tax
+                fee, tax = calc_sell_fee_tax(price, shares, user_id, sid); ft = fee+tax
             else:
                 ft = 0
             net = gross - ft
@@ -15041,7 +15077,8 @@ def add_header(response):
 
 @app.route("/callback",methods=["POST"])
 def callback():
-    signature=request.headers["X-Line-Signature"]
+    signature=request.headers.get("X-Line-Signature")
+    if not signature: abort(400)  # v10.9.187：缺簽章回 400，不再 500
     body=request.get_data(as_text=True)
     try: handler.handle(body,signature)
     except InvalidSignatureError: abort(400)
@@ -15126,6 +15163,10 @@ def handle_postback(event):
 
         # ── 查使用者詳情
         if action == "user_detail":
+            # v10.9.187：後端權限檢查（舊版任何註冊用戶可自組 postback 查他人資料）
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 無權限")
+                return
             name = params.get("name", "")
             if name:
                 reply_text(event.reply_token, get_user_detail(name))

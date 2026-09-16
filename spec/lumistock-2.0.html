@@ -1,0 +1,681 @@
+<title>Lumistock 2.0 升級規格</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;700&family=Noto+Sans+TC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --ground:#FBF7F8; --paper:#FFFFFF; --ink:#3A2F38; --ink-2:#6E5F6A; --line:#EADFE4; --tint:#F5ECF1;
+  --lav:#9E7FB8; --lav-soft:#EFE6F5; --apricot:#C98B77; --apricot-soft:#FBEDE7;
+  --ok:#4F8A6B; --ok-soft:#E5F2EA; --warn:#B07A2A; --warn-soft:#FAF0DC;
+  --bad:#B4574A; --bad-soft:#F9E4E0; --unk:#6F7F95; --unk-soft:#E8EDF3;
+  --code:#F4EEF2;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#1D181C; --paper:#262026; --ink:#F1E8EE; --ink-2:#BBAAB6; --line:#3B3139; --tint:#2E262D;
+    --lav:#C9B0DB; --lav-soft:#352B3D; --apricot:#E8B8A8; --apricot-soft:#3A2B27;
+    --ok:#8CC7A5; --ok-soft:#22362B; --warn:#E3B566; --warn-soft:#3A301D;
+    --bad:#EE9E90; --bad-soft:#3F2622; --unk:#A9B8CC; --unk-soft:#283140; --code:#2F272E;
+  }
+}
+:root[data-theme="dark"]{
+    --ground:#1D181C; --paper:#262026; --ink:#F1E8EE; --ink-2:#BBAAB6; --line:#3B3139; --tint:#2E262D;
+    --lav:#C9B0DB; --lav-soft:#352B3D; --apricot:#E8B8A8; --apricot-soft:#3A2B27;
+    --ok:#8CC7A5; --ok-soft:#22362B; --warn:#E3B566; --warn-soft:#3A301D;
+    --bad:#EE9E90; --bad-soft:#3F2622; --unk:#A9B8CC; --unk-soft:#283140; --code:#2F272E;
+}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font:16px/1.75 "Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;padding-inline:16px;padding-block:0 64px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:230px minmax(0,1fr);gap:48px}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);align-self:start;max-height:100vh;overflow:auto;padding-block:40px 24px;font-size:13.5px}
+nav.toc b{display:block;font-size:11px;letter-spacing:.12em;color:var(--ink-2);margin-bottom:8px}
+nav.toc a{display:block;color:var(--ink-2);text-decoration:none;padding:3px 0 3px 10px;border-left:2px solid var(--line)}
+nav.toc a:hover,nav.toc a:focus-visible{color:var(--lav);border-left-color:var(--lav);outline:none}
+main{min-width:0;padding-block:40px 0}
+h1,h2,h3{font-family:"Noto Serif TC","Songti TC",serif;text-wrap:balance;line-height:1.35;margin:0}
+h1{font-size:clamp(28px,4vw,38px)}
+h2{font-size:25px;margin-top:64px;padding-top:12px;border-top:1px solid var(--line)}
+h3{font-size:19px;margin-top:32px}
+h4{font-size:15.5px;margin:20px 0 4px}
+p,li{max-width:72ch}
+p{margin:10px 0}
+ul,ol{padding-left:1.3em;margin:8px 0}
+li{margin:3px 0}
+a{color:var(--lav)}
+.eyebrow{font-size:12px;letter-spacing:.14em;color:var(--apricot);font-weight:700}
+.lede{color:var(--ink-2);font-size:17px}
+code,.mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;font-size:.88em}
+code{background:var(--code);padding:1px 5px;border-radius:4px}
+pre{background:var(--code);padding:14px 16px;border-radius:8px;overflow-x:auto;font:13.5px/1.6 "IBM Plex Mono",ui-monospace,monospace;margin:12px 0}
+.tbl{overflow-x:auto;margin:14px 0;border:1px solid var(--line);border-radius:8px;background:var(--paper)}
+table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;vertical-align:top;padding:8px 12px;border-bottom:1px solid var(--line)}
+th{background:var(--tint);font-weight:700;white-space:nowrap;font-size:13px}
+tr:last-child td{border-bottom:0}
+td.nw{white-space:nowrap}
+.pill{display:inline-block;font-size:12px;font-weight:700;padding:1px 8px;border-radius:99px;white-space:nowrap}
+.s-ok{background:var(--ok-soft);color:var(--ok)}
+.s-fix{background:var(--warn-soft);color:var(--warn)}
+.s-no{background:var(--bad-soft);color:var(--bad)}
+.s-unk{background:var(--unk-soft);color:var(--unk)}
+.s-done{background:var(--lav-soft);color:var(--lav)}
+.note{background:var(--apricot-soft);border-radius:8px;padding:12px 16px;margin:16px 0}
+.note.lav{background:var(--lav-soft)}
+.note strong:first-child{display:block;margin-bottom:2px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin:16px 0}
+.box{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+.box h4{margin-top:0}
+.mod{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:18px 0}
+.mod h3{margin-top:0;font-size:18px}
+.mod dl{display:grid;grid-template-columns:120px minmax(0,1fr);gap:6px 16px;margin:12px 0 0;font-size:14.5px}
+.mod dt{color:var(--ink-2);font-weight:700}
+.mod dd{margin:0}
+.mod dd ul{margin:0}
+.flow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:14px 0;font-size:14px}
+.flow span{background:var(--paper);border:1px solid var(--line);padding:4px 10px;border-radius:6px}
+.flow i{color:var(--apricot);font-style:normal}
+.legend{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:13.5px;color:var(--ink-2);margin:8px 0}
+.meta{font-size:13px;color:var(--ink-2)}
+@media (max-width:860px){
+  .wrap{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;max-height:none;padding-block:24px 0;columns:2;column-gap:16px}
+  .mod dl{grid-template-columns:1fr}
+  .mod dt{margin-top:6px}
+}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+html{scroll-behavior:smooth}
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="目錄">
+  <b>目錄</b>
+  <a href="#s0">本次交付狀態</a>
+  <a href="#s1">1 現況盤點與缺口</a>
+  <a href="#s2">2 架構與使用流程</a>
+  <a href="#s3">3 講義規則校正</a>
+  <a href="#s4">4 模組規格</a>
+  <a href="#s5">5 資料模型與來源</a>
+  <a href="#s6">6 報告與 LINE 模板</a>
+  <a href="#s7">7 P0–P3 工作清單</a>
+  <a href="#s8">8 v10.9.187 交付紀錄</a>
+  <a href="#s9">9 驗收情境對照</a>
+  <a href="#s10">10 待決定與待補</a>
+</nav>
+
+<main>
+<div class="eyebrow">慧股拾光 Lumistock – by Hui</div>
+<h1>Lumistock 2.0 升級規格</h1>
+<p class="lede">依妳的升級需求文件整理成可執行規格。依據是 GitHub <code>queenie0120/lumistock</code> 目前的程式碼（v10.9.186，<code>app.py</code> 17,445 行）。</p>
+<p class="meta">撰寫日期 2026-09-16 · 規格版本 2.0-draft-1 · 本文件是規劃，除第 8 節標明的離線測試外，沒有任何功能經過 Render 實測。</p>
+
+<section id="s0">
+<h2>本次交付狀態</h2>
+<div class="grid2">
+  <div class="box"><h4>已完成</h4><ul>
+    <li>讀完整份程式碼的結構，逐模組盤點（僅讀程式碼判斷）</li>
+    <li>P0 修正 10 個已確認的 bug，版本 <b>v10.9.187</b></li>
+    <li>建立離線回歸測試 17 項：舊版 10 項失敗，新版 17 項全過</li>
+    <li>本規格文件</li>
+  </ul></div>
+  <div class="box"><h4>沒有做到／做不到</h4><ul>
+    <li><b>六章講義 PDF 沒有附上</b>，第 3 節只根據妳文件裡的摘要校正，頁碼無法核對</li>
+    <li>沙盒連不到 TWSE、Yahoo、FinMind、LINE，<b>沒有任何即時資料測試</b></li>
+    <li>沒有推送到 GitHub，也沒有部署</li>
+    <li>原「研究報告 79 項」完整清單不在手上，只保留追蹤</li>
+  </ul></div>
+</div>
+<div class="legend">
+  <span><span class="pill s-done">離線測試通過</span> 邏輯經 mock 測試，未在 Render 實測</span>
+  <span><span class="pill s-ok">程式存在</span> 讀碼看起來完整，但未實測，等同待確認</span>
+  <span><span class="pill s-fix">存在但待修</span> 讀碼發現具體問題</span>
+  <span><span class="pill s-no">尚未實作</span></span>
+  <span><span class="pill s-unk">待確認</span> 需要實測或外部資料才能判斷</span>
+</div>
+<div class="note lav"><strong>關於「已驗證可用」</strong>妳要求的四種標記中，「已驗證可用」需要在正式環境跑過固定測試案例。我這次無法連線，所以<b>沒有任何項目標成已驗證可用</b>。讀碼看起來完整的標成「程式存在（待實測）」，歸入「待確認」。</div>
+</section>
+
+<section id="s1">
+<h2>1 現況盤點與缺口</h2>
+<p>方法：分三組讀 <code>app.py</code>（行情與市場、新聞與 AI 與推薦、持股與權限與推播），每個疑點回到原始碼確認行號。行號以 v10.9.186 為準。</p>
+
+<h3>1.1 行情、名稱、市場環境</h3>
+<div class="tbl"><table>
+<tr><th>功能</th><th>狀態</th><th>現況與證據</th></tr>
+<tr><td>股票名稱快取</td><td class="nw"><span class="pill s-ok">程式存在</span></td><td>內建 <code>stock_names.py</code> 2,352 筆 → FinMind → TPEx → TWSE ISIN → 保底表。2330「台積電」、3533「嘉澤」都在內建表。</td></tr>
+<tr><td>00904 名稱</td><td class="nw"><span class="pill s-unk">待確認</span></td><td>內建表為「新光臺灣半導體30」（2026/05 下載）。MIS 失敗時會落回此名；需與 TWSE 現行簡稱核對。</td></tr>
+<tr><td>台股報價 <code>get_tw_stock</code></td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>MIS＋Yahoo 交叉比對。成交量取錯欄位 <span class="pill s-done">v10.9.187 已修</span>；收盤後 MIS 仍標「盤中」(5621)；除權息參考價可能重複扣現金股利 (5823)；TPEx 備援欄位索引可疑 (5939)。</td></tr>
+<tr><td>開高收低判斷</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>程式沒有紅黑 K 判斷，卡片顏色只看與昨收比。Yahoo 的 O/H/L/C 各自濾掉 None 後取最後一筆，缺值時四價可能不是同一天 (5693)。</td></tr>
+<tr><td>最後查詢／資料時間</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>時區正確，但顯示的是「抓取時間」，不是交易所報價時間；加上 3 分鐘快取，顯示時間可能比資料新。</td></tr>
+<tr><td>美股報價</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>盤後狀態的漲跌只算盤後段 (6010)；v7 quote 可能需 crumb，實際只剩單一來源（待確認）；成交量顯示「萬／億」不是 K/M/B。</td></tr>
+<tr><td>技術指標</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>MA 5/20/60/120/240、RSI14、KD9、MACD 12/26/9 都有。RSI 近 14 日全漲時回傳 50 <span class="pill s-done">已修</span>。KD 只用收盤價近似高低；FinMind 還原價失敗時退回未還原價；STOCK_DAY 備援只有當月，長均線算不出。</td></tr>
+<tr><td>全球大盤</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>有加權、櫃買、道瓊、Nasdaq、S&amp;P、DAX、CAC、FTSE、日經、恆生、上證、KOSPI、Russell、SOX、VIX。尚未依規格分成美洲／歐洲／亞洲／台灣／中國／商品／波動率七區。大盤 <code>z="-"</code> 時靜默失敗 (11480)。</td></tr>
+<tr><td>美債殖利率</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>顯示「2Y」的其實是 <code>^IRX</code>（13 週國庫券），2Y−10Y 利差與倒掛判斷失真 (4516)。需要換資料源，列入 P0 待決定。</td></tr>
+<tr><td>外匯</td><td class="nw"><span class="pill s-unk">待確認</span></td><td>設定了 11 種對台幣（USD、JPY、EUR、GBP、CNY、HKD、KRW、AUD、CAD、CHF、SGD）＋DXY。<b>程式裡沒有「五大貨幣」的設定</b>，確切五種需妳指定。</td></tr>
+<tr><td>台灣金價</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>以銀樓「每錢」為主，換算每兩；選單寫「每兩」但卡片主軸是每錢。未標純度與報價性質（賣出／買進）。黃金期貨另外顯示，但 <code>XAUUSD=X</code> 可能已失效（待確認）。</td></tr>
+<tr><td>原油</td><td class="nw"><span class="pill s-unk">待確認</span></td><td>WTI <code>CL=F</code>、Brent <code>BZ=F</code> 為期貨；Dubai 用 <code>OQ=F</code>，Yahoo 可能無資料。</td></tr>
+<tr><td>底部期貨區塊</td><td class="nw"><span class="pill s-ok">已移除</span></td><td>註解說明已移除 (3950)，程式碼中找不到期指代號。</td></tr>
+</table></div>
+
+<h3>1.2 新聞、AI、推薦</h3>
+<div class="tbl"><table>
+<tr><th>功能</th><th>狀態</th><th>現況與證據</th></tr>
+<tr><td>台股個股新聞</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>FinMind 新聞 → Google News。Google 連結是 <code>news.google.com</code> 轉址，永遠過不了白名單 (9680)，實際只剩鉅亨整體頭條，可能與個股無關。去重是標題相似度 ≥0.5 直接丟掉，不合併事件。</td></tr>
+<tr><td>美股新聞</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>v10.9.184–186 加入英文來源與事件合併。AI 過濾全空時回傳空陣列，不是註解說的退回原結果 (9469)。</td></tr>
+<tr><td>新聞時間與狀態</td><td class="nw"><span class="pill s-no">尚未實作</span></td><td>部分來源丟掉發布日期，日期沒有年份；沒有更新時間；沒有「傳聞／公司說法／官方確認」狀態。</td></tr>
+<tr><td>新聞重複計分</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>中性新聞得滿分 15 (11269)；AI 概念股新聞分進趨勢子分，再進品質層，一路帶到總分。</td></tr>
+<tr><td>財經新聞 AI 分析</td><td class="nw"><span class="pill s-ok">程式存在</span></td><td>Groq llama-3.3-70b 做情緒、摘要、翻譯、台股聯動。</td></tr>
+<tr><td>AI 問答</td><td class="nw"><span class="pill s-ok">程式存在</span></td><td>有「不可編造數字」指示，並附資料區。但資料區沒有標示每個數字的來源與時間；知識題允許模型自由回答；價格數字可能被當成股票代號 (8360)。</td></tr>
+<tr><td>推薦分類</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>有趨勢、成長、存股（股息）、防禦、波段、低基期、AI 概念、籌碼、觀察榜。<b>缺「價值」</b>。缺資料一律 0 分，不排除也不標示。</td></tr>
+<tr><td>月營收年增率</td><td class="nw"><span class="pill s-unk">待確認</span></td><td>程式讀 <code>revenue_year_growth</code> 欄位 (8156)，FinMind 月營收資料集可能沒有這個欄位。若是，所有年增率為 0，成長股評分失效。需要實際呼叫一次確認。</td></tr>
+<tr><td>估值（P/E、P/B、情境）</td><td class="nw"><span class="pill s-no">尚未實作</span></td><td>「估值過熱」以 20 日漲幅代替 (12495)。</td></tr>
+<tr><td>三大報表、FCF、CCC、杜邦</td><td class="nw"><span class="pill s-no">尚未實作</span></td><td>只抓最新一季 EPS、毛利率、營益率、營收。</td></tr>
+<tr><td>產業研究、論點卡、結構化報告</td><td class="nw"><span class="pill s-no">尚未實作</span></td><td>產業只有寫死的名稱與題材表；「研究報告」是 AI 問答的一種 prompt 模式。</td></tr>
+<tr><td>美股→台股聯動</td><td class="nw"><span class="pill s-ok">程式存在</span></td><td>人工寫死的供應鏈對照表，沒有營收曝險或揭露證據欄位。</td></tr>
+<tr><td>研究報告 79 項</td><td class="nw"><span class="pill s-unk">待確認</span></td><td>已知 8 面向分配為 13／12／9／8／6／12／11／8，缺逐項清單。見第 6.3 節對照表。</td></tr>
+</table></div>
+
+<h3>1.3 持股、除權息、推播、權限</h3>
+<div class="tbl"><table>
+<tr><th>功能</th><th>狀態</th><th>現況與證據</th></tr>
+<tr><td>持股買賣、均價、截圖匯入</td><td class="nw"><span class="pill s-ok">程式存在</span></td><td>加權平均含買進手續費；Groq vision 辨識截圖。</td></tr>
+<tr><td>持股 Sheets 還原</td><td class="nw"><span class="pill s-done">離線測試通過</span></td><td>賣光、刪除後重啟持股會復活 <span class="pill s-done">已修</span>。</td></tr>
+<tr><td>證交稅</td><td class="nw"><span class="pill s-done">離線測試通過</span></td><td>原本 ETF 一律 0.3% <span class="pill s-done">已修為依代號區分</span>。代號含字母的債券 ETF（如 00679B）在其他地方會被 <code>isdigit()</code> 當成美股，仍待修。</td></tr>
+<tr><td>持股併發寫入</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>JSON 讀寫沒有鎖，截圖執行緒、webhook、警報同時寫會互相覆蓋。</td></tr>
+<tr><td>停損／目標提醒</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>只處理台股；自訂停損只存 /tmp，重啟遺失；沒有除權息修正。</td></tr>
+<tr><td>除權息多層來源</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>FinMind → TWSE → TPEx → 內建表，四層。<b>內建表最後日期 2026/05/19，已過期約 4 個月</b>。只處理現金股利；配股、拆股不調整持股股數與成本。</td></tr>
+<tr><td>推播</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>LINE 早上 06:30 推健檢與持股警報，用 <code>threading.Timer</code>，不判斷交易日、假日、美國夏令時間；沒有重試；多 worker 會重複。晚間推播尚未實作。</td></tr>
+<tr><td>Gmail 推播</td><td class="nw"><span class="pill s-no">尚未實作</span></td><td>程式碼沒有 SMTP 或 Gmail API。</td></tr>
+<tr><td>權限（後端）</td><td class="nw"><span class="pill s-done">離線測試通過</span></td><td>一般用戶可自組 <code>user_detail</code> postback 查他人 user_id <span class="pill s-done">已修</span>；管理者可封鎖 Owner <span class="pill s-done">已修</span>。其他管理動作有檢查。</td></tr>
+<tr><td>Rich Menu 五張</td><td class="nw"><span class="pill s-ok">程式存在</span></td><td>一般用戶、Owner 主頁／管理頁、管理者主頁／管理頁。新色系（一般粉白玫瑰金、Owner 粉白、管理者粉紫）是否已套用到圖檔，待妳目視確認。</td></tr>
+<tr><td>VIP</td><td class="nw"><span class="pill s-no">尚未實作</span></td><td>方案與價格未定。</td></tr>
+<tr><td>資料耐久性</td><td class="nw"><span class="pill s-fix">存在但待修</span></td><td>自訂停損、推播設定、AI 統計、各種等待狀態只存在 /tmp，Render 重啟即遺失。</td></tr>
+</table></div>
+</section>
+
+<section id="s2">
+<h2>2 架構與使用流程</h2>
+<h3>2.1 研究主線</h3>
+<div class="flow"><span>總經環境</span><i>→</i><span>產業／子產業</span><i>→</i><span>供需與價值鏈</span><i>→</i><span>商業模式與優勢</span><i>→</i><span>財報品質</span><i>→</i><span>估值情境</span><i>→</i><span>籌碼與技術</span><i>→</i><span>催化劑與風險</span><i>→</i><span>決策條件</span><i>→</i><span>追蹤與覆盤</span></div>
+<p>這是研究的完整路徑，不是固定模板。入口可以從公司開始（Bottom-up），也可以從總經或產業開始（Top-down）。每個標的依商業模式選用財務指標與估值方法，例如銀行不算 FCF，虧損生技不用 P/E。</p>
+
+<h3>2.2 系統分層</h3>
+<div class="tbl"><table>
+<tr><th>層</th><th>職責</th><th>對應現有程式</th></tr>
+<tr><td>介面層</td><td>LINE Bot（摘要＋展開入口）、研究報告網頁、管理後台、Gmail</td><td><code>handle_message</code>、<code>handle_postback</code>、Flex 卡片</td></tr>
+<tr><td>研究服務層</td><td>M3 產業、M4 公司、M5 財報、M6 估值、M7 時機、M8 決策與論點卡、M9 報告組裝</td><td>大部分尚未實作；推薦評分可逐步改接</td></tr>
+<tr><td>計算層（決定性）</td><td>所有公式、口徑轉換、TTM、還原價、指標。純函式，可單元測試</td><td>技術指標、手續費等零散函式</td></tr>
+<tr><td>AI 層</td><td>只做有來源的解釋、推論、反方檢查、新聞分類；不產生數字</td><td><code>groq_chat</code> 與各 prompt</td></tr>
+<tr><td>資料層</td><td>供應商介面、快取、重試、來源狀態、快照與版本</td><td>各 <code>_fetch_*</code>、<code>_load_*</code>；Sheets、/tmp</td></tr>
+<tr><td>排程與通知</td><td>交易日曆、推播佇列、去重、重試、稽核</td><td><code>threading.Timer</code></td></tr>
+</table></div>
+<div class="note"><strong>架構建議：漸進拆分，不整包重寫</strong>v11.0 整包覆蓋的教訓仍然適用。建議從新增的研究模組開始，把新程式寫在獨立檔案（例如 <code>research/valuation.py</code>），<code>app.py</code> 只加呼叫點。現有穩定功能先保持原位，等有測試保護後才搬移。</div>
+
+<h3>2.3 使用者旅程：查股到覆盤</h3>
+<div class="tbl"><table>
+<tr><th>步驟</th><th>使用者動作</th><th>看到什麼</th><th>回答的問題</th></tr>
+<tr><td class="nw">1 查股</td><td>輸入 2330、台積電、NVDA</td><td>證券卡：名稱、市場、幣別、價格、交易時段、資料時間、兩層趨勢</td><td>這是什麼、現在多少</td></tr>
+<tr><td class="nw">2 市場脈絡</td><td>點「全球大盤」「外匯資金」</td><td>七區大盤、殖利率 2Y→10Y→30Y、匯率方向、事件日曆</td><td>Q1 市場發生什麼事</td></tr>
+<tr><td class="nw">3 研究摘要</td><td>點「AI 分析」</td><td>一句結論、品質／價格／時機三軸、資料完整度、展開連結</td><td>Q2–Q5</td></tr>
+<tr><td class="nw">4 完整報告</td><td>點「看完整報告」</td><td>12 節報告，事實／計算／推論／情境分色</td><td>Q2–Q6 的證據</td></tr>
+<tr><td class="nw">5 建立論點卡</td><td>加入持股或觀察時選「記錄論點」</td><td>買入原因、預期、價值區間、失效條件，綁定報告版本</td><td>Q6 什麼會推翻判斷</td></tr>
+<tr><td class="nw">6 追蹤</td><td>被動接收</td><td>財報、EPS 修正、除權息、新聞事件、條件觸發通知</td><td>論點是否仍成立</td></tr>
+<tr><td class="nw">7 覆盤</td><td>賣出或定期檢視</td><td>盈利變化 vs 倍數變化、含息報酬 vs 實際損益、當時判斷對照</td><td>Q7 錯在哪裡</td></tr>
+</table></div>
+</section>
+
+<section id="s3">
+<h2>3 講義規則校正</h2>
+<p>講義 PDF 未附上，以下根據妳文件中的摘要與常見簡化寫法，改成有適用條件的規則。拿到 PDF 後，我會逐章核對頁碼並補充這張表。</p>
+<div class="tbl"><table>
+<tr><th>簡化說法</th><th>問題</th><th>系統採用的規則</th></tr>
+<tr><td>營收成長 ＝ 市場成長 × 市占變化</td><td>乘法用錯，而且沒有區分百分點與相對成長</td><td>營收成長 ＝ (1＋市場成長)(1＋市占相對成長) − 1。前提：市占以營收計、市場與公司營收口徑相同。<br>驗算：市場 +20%、市占 10%→20%，得 1.2×2−1 ＝ <b>140%</b>。</td></tr>
+<tr><td>市占從 10% 到 20% 成長 10%</td><td>混淆百分點與相對變化</td><td>顯示「+10 個百分點（相對 +100%）」，兩者同時呈現。</td></tr>
+<tr><td>量價分開再相加</td><td>忽略交互項；與市占法同時用會重複計算價格效果</td><td>(1＋銷量成長)(1＋ASP 成長) − 1。一個成長拆解只選一條路徑：量價或市場×市占。</td></tr>
+<tr><td>TAM ÷ 公司總營收 ＝ 市占</td><td>多業務公司口徑不符</td><td>按分部對應子市場；沒有分部營收時標「無法計算」。</td></tr>
+<tr><td>CAGR 直接套公式</td><td>期初為零或負值時無意義</td><td>期初、期末都 &gt;0 且年數 ≥1 才算，否則不顯示。</td></tr>
+<tr><td>集中度高 ＝ 好產業</td><td>忽略監管、需求、價格戰</td><td>CR 指標只作為競爭結構證據，要搭配供需、價格、估值才能下判斷。</td></tr>
+<tr><td>週期固定六階段輪轉</td><td>實際階段會重疊、跳過</td><td>每個階段各自有證據與信心度，允許同時成立或「無法判斷」。</td></tr>
+<tr><td>PEG &lt; 1 便宜</td><td>忽略成長率單位、期間、品質差異</td><td>PEG ＝ P/E ÷ (成長率×100)，註明預測期間；成長 ≤0 或低基期不算；只用於同業比較。</td></tr>
+<tr><td>跌回歷史均值就是便宜；±1σ 是上下限</td><td>結構改變時歷史不適用；估值帶不是價格邊界</td><td>估值帶只作比較；報告必須說明重評原因（公司、產業、總經／資金）。</td></tr>
+<tr><td>用今天的共識畫過去的 Forward P/E</td><td>前視偏差</td><td>只用當時存下的共識快照；沒有快照就不畫。系統從上線日開始存快照。</td></tr>
+<tr><td>CFO／淨利 &gt;1 代表品質好</td><td>淨利 ≤0 或極小時失真</td><td>淨利 ≤0 或絕對值低於營收 1% 時標「不適用」，並搭配營運資本變化解讀。</td></tr>
+<tr><td>DPO 越長越好</td><td>可能代表付款困難</td><td>DPO 上升要同時看現金、短債與供應商集中度才能判斷。</td></tr>
+<tr><td>高 ROE ＝ 好公司</td><td>權益為負或很小時虛高；回購與高槓桿會推高</td><td>用平均權益；權益 ≤0 不排名；杜邦三因子同時顯示。</td></tr>
+<tr><td>報酬 ＝ EPS 成長％＋P/E 變化％</td><td>忽略交互項</td><td>價格倍數 ＝ EPS 倍數 × P/E 倍數，前提是兩期 EPS 都 &gt;0 且口徑一致。<br>例：EPS ×1.3、P/E ×0.8，價格 ×1.04（+4%），不是 +10%。</td></tr>
+<tr><td>TSM ADR 與 2330 直接比價</td><td>忽略 ADR 比率與幣別</td><td>1 ADR ＝ 5 股普通股（公司揭露，實作時以存託憑證資料再確認），每股價值換算時同時轉換匯率。</td></tr>
+<tr><td>升息 ＝ 股市跌</td><td>忽略升息原因與已反映的預期</td><td>比較利率期貨隱含路徑的變化，並區分原因是景氣過熱還是通膨衝擊。</td></tr>
+</table></div>
+</section>
+
+<section id="s4">
+<h2>4 模組規格</h2>
+<p>每個模組固定六欄：回答什麼、資料、計算／推論、缺漏處理、使用者看到什麼、驗收。資料來源代號對照第 5.3 節。</p>
+
+<div class="mod" id="m1"><h3>M1 證券主檔與行情</h3><dl>
+<dt>回答</dt><dd>這是哪一檔、在哪交易、現在多少、資料是幾點的。</dd>
+<dt>資料</dt><dd>代號、中英文名、市場、證券種類（普通股／ETF／債券 ETF／ADR／特別股）、幣別、交易單位、ADR 比率、交易時段；報價含交易所時間戳。</dd>
+<dt>計算</dt><dd><ul><li>漲跌 ＝ 現價 − 參考價。除權息日參考價以交易所公告為準，不自行扣減。</li><li>K 棒顏色：收盤 ≥ 開盤為紅（台股慣例），與漲跌分開顯示。</li><li>O/H/L/C 必須來自同一根 K 棒，任一缺值整根標示不完整。</li><li>成交量：台股張、美股 K/M/B，並註明是否為盤中累計。</li></ul></dd>
+<dt>缺漏</dt><dd>名稱查不到顯示代號加「名稱待確認」；主來源失敗改用備援並標示來源；超過時限標「延遲 N 分」。</dd>
+<dt>看到</dt><dd>證券卡上顯示「報價時間 13:30（交易所）· 查詢 14:02」，並標示資料狀態：即時、延遲或收盤。</dd>
+<dt>驗收</dt><dd>2330、3533、00878、00904、00679B、AAPL、NVDA、TSM；「台積」等相似名稱；盤中、收盤後、週末各查一次，名稱、幣別、種類、量、時間都正確。</dd>
+</dl></div>
+
+<div class="mod" id="m2"><h3>M2 市場環境與台美聯動</h3><dl>
+<dt>回答</dt><dd>Q1：市場發生什麼事、利率與匯率往哪走、美股 AI 股的變化會不會傳到台股。</dd>
+<dt>資料</dt><dd><ul><li>七區：美洲（道瓊、S&amp;P 500、Nasdaq、Russell 2000）、歐洲（DAX、CAC、FTSE）、亞洲（日經、KOSPI）、台灣（加權、櫃買）、中國（上證、恆生）、商品（金、油、天然氣）、波動率（VIX）。SOX 放美洲。</li><li>總經：CPI、PPI、非農、失業率，每筆分公布值、前值、修正值、公布前共識；Fed 決議、點陣圖、利率期貨隱含機率。</li><li>殖利率 2Y→10Y→30Y；匯率對 TWD 五種＋USD 基準；金價分台灣每兩（標純度與買賣價）與國際期貨；WTI、Brent、Dubai 分別標示現貨、期貨或基準價。</li><li>聯動清單：NVDA、MSFT、AAPL、AMD、AVGO、META、AMZN、GOOGL、TSLA、TSM ADR，每條台股關係都要附證據。</li></ul></dd>
+<dt>計算</dt><dd><ul><li>曲線形狀：10Y−2Y、30Y−10Y 利差，以及和 20 個交易日前比較的變化。</li><li>匯率文字：USD/TWD 上升 ＝ 美元升值、台幣貶值，不能寫反。</li><li>傳導：美股事件先分成估值衝擊、需求衝擊、個別事件三類，再依證據強度對相關台股觸發「風險重評」，不直接扣分。</li></ul></dd>
+<dt>缺漏</dt><dd>共識值沒有來源時只顯示實際值，不計算驚喜；Dubai 沒有期貨資料就顯示「無可用期貨報價」。</dd>
+<dt>看到</dt><dd>大盤卡依七區分頁；總經事件卡顯示「實際 3.1% ／ 共識 3.0% ／ 前值 3.2%（修正自 3.3%）」，並附官方來源。</dd>
+<dt>驗收</dt><dd>USD/TWD 從 32.0 升到 32.5 時，文字寫台幣貶值；2Y 不再使用 13 週國庫券；NVDA 大跌時只有證據清單內的台股被標示重評，而且每檔附理由。</dd>
+</dl></div>
+
+<div class="mod" id="m3"><h3>M3 產業研究引擎</h3><dl>
+<dt>回答</dt><dd>產業多大、成長從哪來、供需是緊還是鬆、利潤被誰拿走、瓶頸何時解除、週期在哪。</dd>
+<dt>資料</dt><dd>產業身分證：母產業、子產業、地區、市場定義、TAM／SAM、滲透率、CAGR、銷量、ASP、市占、資料日期與預測情境。供需：庫存、報價、交期、稼動率、CapEx、訂單、擴產與退出。價值鏈：上中下游代表公司、毛利率、營業利益金額。</dd>
+<dt>計算</dt><dd>採用第 3 節的公式；CR3／CR5／CR10；利潤池 ＝ 環節營收 × 營業利益率（口徑校準後）；週期階段各自評估證據與信心。</dd>
+<dt>缺漏</dt><dd>產業數據多半來自研究機構（付費）或公司法說，一律記錄來源與日期；超過 12 個月標「陳舊」；只有增速、沒有水準數據時，供需結論顯示「無法確認」。</dd>
+<dt>看到</dt><dd>產業卡：一句狀態（例如「供需改善中，信心中」），下列三項證據與兩項不確定性。</dd>
+<dt>驗收</dt><dd>多業務公司（例如同時做代工與封裝）必須分部對應；市占 10%→20% 案例得 140%；只有成長率時不輸出供不應求。</dd>
+</dl></div>
+
+<div class="mod" id="m4"><h3>M4 公司基本面引擎</h3><dl>
+<dt>回答</dt><dd>Q2：怎麼賺錢、為什麼能成長、優勢能維持多久。</dd>
+<dt>資料</dt><dd>分部與地區營收、收入類型、商業模式九格、同業財務數字、客戶與供應商集中度、付款條件、治理（股權、董監、關係人交易、稀釋、回購、併購）、管理層過去指引與實際結果。</dd>
+<dt>計算</dt><dd><ul><li>競爭優勢三類（成本、差異化、利基），每類都要有數字證據，例如毛利率高於同業中位數且持續 N 年。</li><li>護城河四類，每類記錄有效期限、替代風險與反證。</li><li>指引可信度 ＝ 過去 8 季指引區間命中率。</li><li>專屬指標依商業模式選用，例如軟體 ARR／NRR、銀行淨利差／信用成本。</li></ul></dd>
+<dt>缺漏</dt><dd>未揭露分部就標「未揭露」；沒有數字支持的優勢不列出，只放進「待驗證假設」。</dd>
+<dt>看到</dt><dd>公司卡：收入結構圖、優勢三條（附數字）、護城河失效條件、治理警示。</dd>
+<dt>驗收</dt><dd>「品牌強」這類沒有數字的描述不可出現在優勢欄；指標定義與來源都能點開查看。</dd>
+</dl></div>
+
+<div class="mod" id="m5"><h3>M5 財報分析引擎</h3><dl>
+<dt>回答</dt><dd>Q3：財報是否支持投資論點、現金品質好不好、有沒有異常。</dd>
+<dt>資料</dt><dd>近 8 季與 5 年三大報表完整科目（見需求文件 8.1）、會計準則、Non-GAAP 調節表、公布前共識快照、管理層指引、公布後共識修正。台股來源：公開資訊觀測站＋FinMind；美股來源：SEC XBRL。</dd>
+<dt>計算</dt><dd><ul><li>累計轉單季：Q3 單季 ＝ 9 個月累計 − 半年累計；Q4 ＝ 全年 − 前三季，並標「衍生」。</li><li>FCF ＝ CFO − |CapEx|，CapEx 包含購置不動產廠房設備，是否含無形資產需註明。</li><li>CCR、DSO／DIO／DPO／CCC（平均餘額 ÷ 期間流量 × 實際天數）。</li><li>ROE／ROA／ROIC、杜邦三因子、利息保障倍數、淨負債。</li><li>成長拆解：量、價、組合、費用率、股數。</li><li>預期差 ＝ 實際 − 公布前共識，只在有快照時計算。</li></ul></dd>
+<dt>缺漏</dt><dd>不足 8 季就顯示實際涵蓋期間；金融保險業改用淨利差、逾放比、資本適足率等專屬指標，不算 FCF 與流動比率。</dd>
+<dt>看到</dt><dd>財務健檢表：趨勢小圖、異常提示（寫「值得研究」，不寫「造假」）、口徑標籤（IFRS／GAAP／Non-GAAP，基本／稀釋）。</dd>
+<dt>驗收</dt><dd>財年不等於日曆年的公司（例如 AAPL、NVDA）期間正確；累計不被當成單季；淨利為負時 CCR 顯示不適用；應收帳款成長超過營收時觸發提示。</dd>
+</dl></div>
+
+<div class="mod" id="m6"><h3>M6 估值引擎</h3><dl>
+<dt>回答</dt><dd>Q4：價格反映了多少預期、合理價值區間怎麼來。</dd>
+<dt>資料</dt><dd>EPS（TTM／NTM／下一財年，GAAP 或 Non-GAAP，基本或稀釋）與來源類型（公司指引、分析師共識、自建估計），另含日期、分析師數量與修正歷程；股數、淨負債、非控制權益；歷史價格；同業倍數。</dd>
+<dt>計算</dt><dd><ul><li>方法依規則選擇：穩定獲利用 P/E；資產型與金融業用 P/B；虧損成長股用 EV/Sales；重資本產業用 EV/EBITDA；DCF 為選配。</li><li>歷史估值帶：只用 EPS &gt;0 的期間，顯示平均、中位數、分位數、標準差。</li><li>三情境：情境價 ＝ 匹配期間 EPS × 合理倍數，分開標示估值日與目標日。</li><li>EV 法：股權價值 ＝ EV − 淨負債 − 非控制權益，再除以稀釋股數。</li><li>潛在變化 ＝ 情境價 ÷ 現價 − 1；年化 ＝ (情境價 ÷ 現價)^(1/年) − 1。</li><li>敏感度表：EPS ±10%、倍數 ±2x 交叉。</li></ul></dd>
+<dt>缺漏</dt><dd>EPS ≤0 或接近 0 時不算 P/E 與 PEG；沒有共識快照時不畫歷史 Forward P/E；ADR 必須先按比率與匯率換算。</dd>
+<dt>看到</dt><dd>估值卡：三情境價格、每個情境的假設、敏感度格、「情境不是保證報酬」註記。</dd>
+<dt>驗收</dt><dd>虧損公司不出現低 P/E；TSM ADR 與 2330 分開計算；同一快照重跑結果相同；NTM 與下一財年分開標示。</dd>
+</dl></div>
+
+<div class="mod" id="m7"><h3>M7 時機、籌碼與技術</h3><dl>
+<dt>回答</dt><dd>Q5 的時機部分：現在的市場狀態與個股位置，適合等待還是觀察。</dd>
+<dt>資料</dt><dd>還原與未還原日 K（至少 260 個交易日）、成交量；台股三大法人、融資融券、借券；美股盤前盤後、期權（若有來源）；VIX、市場廣度。</dd>
+<dt>計算</dt><dd><ul><li>指標參數固定並記錄版本：MA 5/20/60/120/240、RSI14（Wilder 平滑，由參數設定）、KD 9-3-3（使用高低價）、MACD 12/26/9（完整序列）。</li><li>爆量 ＝ 當日量 ÷ 20 日均量 ≥ 2，比較基期可設定。</li><li>兩層趨勢標籤規則表，例如「突破」＝ 收盤站上 60 日高點且量 ≥ 1.5 倍。</li><li>技術指標一律用還原價；除權息缺口不視為跌破。</li></ul></dd>
+<dt>缺漏</dt><dd>K 棒數量不足時對應指標顯示「資料不足」，不回傳 50 之類的預設值；「主力」只能用供應商定義並標註。</dd>
+<dt>看到</dt><dd>第一層市場用語，第二層技術細節，另附基本面與產業趨勢佐證。</dd>
+<dt>驗收</dt><dd>全漲序列 RSI ≈100；除息日不觸發跌破；只有 20 根 K 棒時長均線顯示資料不足。</dd>
+</dl></div>
+
+<div class="mod" id="m8"><h3>M8 決策矩陣與論點卡</h3><dl>
+<dt>回答</dt><dd>Q5、Q6：現在該怎麼做、什麼會推翻判斷。</dd>
+<dt>資料</dt><dd>M3–M7 輸出、證據完整度、使用者持有狀態。</dd>
+<dt>計算</dt><dd><ul><li>三軸各自評等 A／B／C／資料不足，不合成單一總分：品質（M4＋M5）、價格（M6）、時機（M7）。另附風險軸與證據完整度（%）。</li><li>狀態規則：值得研究（品質 ≥B、價格資料不足或中性）；品質佳但估值偏高（品質 A、價格 C）；等待證據（任一關鍵軸資料不足）；條件成立（品質 ≥B、價格 ≥B、時機觸發使用者條件）；論點轉弱（失效條件命中）；資料不足（完整度 &lt;50%）。</li><li>若要提供分數，必須附權重、版本、適用族群與缺值處理；信心分數不是勝率。</li></ul></dd>
+<dt>缺漏</dt><dd>缺值不算 0 分；缺少技術買點不降低品質評等。</dd>
+<dt>看到</dt><dd>論點卡：買入原因、預期、價值區間、觀察事件、失效條件、報告版本號與建立日期，建立後不可改寫，只能新增版本。</dd>
+<dt>驗收</dt><dd>品質 A、價格 C、技術轉強時顯示「品質佳但估值偏高」，不顯示條件成立。</dd>
+</dl></div>
+
+<div class="mod" id="m9"><h3>M9 研究報告組裝</h3><dl>
+<dt>回答</dt><dd>把 Q1–Q6 整理成一份可追溯的文件。</dd>
+<dt>資料</dt><dd>同一個資料快照 ID 下的 M1–M8 輸出、原始來源連結。</dd>
+<dt>計算</dt><dd>模板組裝由程式完成；LLM 只填「推論」與「反方論點」欄位，輸入必須附來源 ID。每句推論都要引用至少一個事實或計算 ID。</dd>
+<dt>缺漏</dt><dd>任一節資料不足就寫明缺什麼、影響哪個結論；只有新聞摘要時不能宣稱讀過財報或法說。</dd>
+<dt>看到</dt><dd>見第 6 節模板。</dd>
+<dt>驗收</dt><dd>用同一快照重跑，數字完全相同；每個數字都能點回來源；推論句沒有引用時報告不發布。</dd>
+</dl></div>
+
+<div class="mod" id="m10"><h3>M10 新聞與事件</h3><dl>
+<dt>回答</dt><dd>發生什麼事、是真的嗎、影響營運還是只影響情緒。</dd>
+<dt>資料</dt><dd>原始來源優先（交易所、公開資訊觀測站、SEC、公司 IR、主管機關）；媒體白名單（WSJ、Bloomberg、CNBC、Reuters、AP；台股沿用現有的鉅亨、經濟日報、工商、MoneyDJ、財訊等）；Yahoo 等平台必須辨識原始供稿來源。</dd>
+<dt>計算</dt><dd><ul><li>事件合併：標題相似度＋實體（公司、數字、日期）比對，同一事件保留所有來源。</li><li>狀態：傳聞、公司說法、官方確認。</li><li>情緒與營運影響是兩個欄位；每個事件只在一個模組計分，其他模組引用事件 ID，避免重複加減分。</li><li>Google News 連結先解析出原始網址，再判斷是否在白名單。</li></ul></dd>
+<dt>缺漏</dt><dd>無法解析原文時標「來源未確認」並降權；日期必須含年份與時區。</dd>
+<dt>看到</dt><dd>事件卡：一行標題、狀態標籤、來源數、發布／更新時間、受影響公司、營運傳導說明、原文連結。</dd>
+<dt>驗收</dt><dd>五家媒體轉載同一則新聞只顯示一個事件、推播一次、計分一次；中性新聞不再得滿分。</dd>
+</dl></div>
+
+<div class="mod" id="m11"><h3>M11 持股健檢與覆盤</h3><dl>
+<dt>回答</dt><dd>組合是否真正分散、論點還成立嗎、Q7 賺賠來自哪裡。</dd>
+<dt>資料</dt><dd>交易紀錄（時間、價格、股數、費用、匯率）、論點卡、公司行動、產業與供應鏈標籤。</dd>
+<dt>計算</dt><dd><ul><li>集中度：產業、共同客戶或供應鏈、幣別、市場、事件的曝險比重。</li><li>覆盤：價格倍數 ＝ EPS 倍數 × P/E 倍數，另列股息貢獻。</li><li>報酬分三種：股價報酬、含息報酬、實際損益（依時間加權或金額加權，並註明）。</li><li>錯誤歸因：論點、資料、估值、時機、執行五類，由使用者勾選，系統提供當時快照作對照。</li></ul></dd>
+<dt>缺漏</dt><dd>交易缺費用時標「未計費用」；EPS ≤0 的期間不做倍數分解。</dd>
+<dt>看到</dt><dd>健檢卡：前三大曝險、觸發中的條件；覆盤頁：當時結論與現在事實並排顯示。</dd>
+<dt>驗收</dt><dd>單次跌 8% 不判定基本面失效；賣光或刪除後重啟不復活（v10.9.187 已有離線測試）；舊結論不能被修改。</dd>
+</dl></div>
+
+<div class="mod" id="m12"><h3>M12 除權息與公司行動</h3><dl>
+<dt>回答</dt><dd>今天的價差是除權息造成的，還是真的下跌；持股股數與成本是否正確。</dd>
+<dt>資料</dt><dd>事件日、現金股利、股票股利、拆併股比率、確認狀態、來源、修訂紀錄。</dd>
+<dt>計算</dt><dd><ul><li>五層來源：官方預告 → 可追溯第三方 → 盤中公告 → 媒體與公司公告交叉確認 → 使用者回報或人工補表。</li><li>還原係數由程式計算；原始價、還原價、含息報酬三條序列並存。</li><li>配股與拆股依比率調整持股股數與均價，每個事件只調整一次（以事件 ID 冪等處理）。</li></ul></dd>
+<dt>缺漏</dt><dd>公司行動待確認時，暫停該檔依價格觸發的自動提醒，並告知原因；財務風險訊號照常提醒。</dd>
+<dt>看到</dt><dd>個股卡：「今日除息 1.2 元，參考價 xx，漲跌已調整」；持股卡：「已依配股 50 股／千股調整」。</dd>
+<dt>驗收</dt><dd>除息日不觸發停損；同日除息加拆股時價格、股數、成本一致；重跑調整不會重複扣。</dd>
+</dl></div>
+
+<div class="mod" id="m13"><h3>M13 推播與排程</h3><dl>
+<dt>回答</dt><dd>在對的時間收到不重複、資料正確的通知。</dd>
+<dt>資料</dt><dd>台股與美股交易日曆（含假日）、美東時區（自動處理夏令時間）、訂閱設定、持股、事件佇列。</dd>
+<dt>計算</dt><dd><ul><li>排程是可設定的清單，例如台股盤前、台股收盤後、美股盤前、美股收盤後。「每日兩次」或「兩市場各兩次」由妳決定，不預設四封。</li><li>去重鍵 ＝ 使用者＋類型＋交易日＋內容雜湊。</li><li>最多重試 3 次，採指數退避；資料來源失敗時改寄「資料暫缺」通知，不寄錯誤數字。</li><li>單一 worker 或外部排程觸發，避免多 worker 重複推播。</li></ul></dd>
+<dt>缺漏</dt><dd>假日不寄；資料時間超過門檻時，在內容開頭標示。</dd>
+<dt>看到</dt><dd>Gmail 與 LINE 摘要：市場、持股變動、事件、新聞原文連結、論點變更、資料時間。</dd>
+<dt>驗收</dt><dd>美國夏令時間切換當週排程正確；重試不重寄；國定假日不寄。</dd>
+</dl></div>
+
+<div class="mod" id="m14"><h3>M14 權限、後台與稽核</h3><dl>
+<dt>回答</dt><dd>誰能做什麼，發生過什麼。</dd>
+<dt>資料</dt><dd>角色表、封鎖紀錄、推播紀錄、資料異常、人工覆核紀錄。</dd>
+<dt>計算</dt><dd>每個管理 action 在後端集中檢查權限（寫成 decorator 或 action→角色對照表）；Owner 與管理者不可被封鎖；每個管理動作寫入稽核紀錄。</dd>
+<dt>缺漏</dt><dd>權限表讀取失敗時一律拒絕，不預設放行。</dd>
+<dt>看到</dt><dd>後台：用戶查詢、封鎖與解除、推播紀錄、資料異常清單、覆核佇列。</dd>
+<dt>驗收</dt><dd>一般用戶自組任何管理 postback 都被拒絕，並留下紀錄（v10.9.187 已補 <code>user_detail</code>，其餘 action 要逐一建測試）。</dd>
+</dl></div>
+
+<div class="mod" id="m15"><h3>M15 篩選與 AI 問答</h3><dl>
+<dt>回答</dt><dd>哪些標的值得研究，以及使用者的自由提問。</dd>
+<dt>資料</dt><dd>M1–M8 的結構化輸出；ETF 另有專用資料（追蹤指數、費用率、折溢價、成分股、配息來源）。</dd>
+<dt>計算</dt><dd><ul><li>篩選分類：推薦、趨勢、成長、價值（新增）、股息、防禦、波段、低基期突破、AI 概念、籌碼集中。</li><li>每個分類必須通過四道檢查：產業、公司、價格、時機；資料不足時放入「觀察」，不參與排名。</li><li>AI 問答回答中的每個數字必須來自資料區，並顯示來源與時間；紀念品等題目必須查當年公告，不能從記憶回答。</li></ul></dd>
+<dt>缺漏</dt><dd>缺值不算 0 分；知識題標示「一般知識，非即時資料」。</dd>
+<dt>看到</dt><dd>篩選結果：每檔寫出入選理由與主要風險，以及缺哪些資料。</dd>
+<dt>驗收</dt><dd>財報抓不到的標的不會出現在成長榜前段；問答中的價格數字不被誤判為股票代號。</dd>
+</dl></div>
+</section>
+
+<section id="s5">
+<h2>5 資料模型與來源</h2>
+<h3>5.1 儲存方案</h3>
+<p>目前資料分散在 Google Sheets（使用者、持股、紀錄）與 Render 的 <code>/tmp</code>（設定、快取、狀態，重啟即遺失）。研究資料需要快照、版本與查詢，Sheets 不適合承載。</p>
+<div class="tbl"><table>
+<tr><th>選項</th><th>優點</th><th>顧慮</th></tr>
+<tr><td>A. 維持 Sheets＋新增託管 Postgres</td><td>管理資料保留原位，研究資料放資料庫；可做快照與版本</td><td>免費方案的保存期限與容量要查證（Render、Supabase、Neon 條款待確認）</td></tr>
+<tr><td>B. 全部留在 Sheets</td><td>不需新服務</td><td>API 速率限制、沒有交易保證、財報與快照資料量撐不住</td></tr>
+<tr><td>C. SQLite 放 Render 持久磁碟</td><td>簡單</td><td>需要付費磁碟；單機，不能多 worker</td></tr>
+</table></div>
+<p>建議 A。這個決定會影響成本，需要妳確認，列在第 10 節。</p>
+
+<h3>5.2 資料實體</h3>
+<p>每筆關鍵數據共用「觀測值信封」欄位：</p>
+<pre>標的 security_id · 市場 · 指標 metric · 值 value（缺值用 NULL）
+狀態 status: ok | not_disclosed | not_applicable | fetch_failed | stale
+幣別 · 倍率 unit_scale · 口徑 basis（IFRS/GAAP/NonGAAP, basic/diluted, 單季/累計/TTM）
+期間起 period_start · 期間迄 period_end · 財年 fiscal_year · 季 fiscal_q
+實際/預估 is_estimate · 來源 source_id · 連結 url
+公布時間 published_at（交易所時區）· 抓取時間 fetched_at（UTC）
+版本 revision · 快照 snapshot_id</pre>
+<div class="tbl"><table>
+<tr><th>實體</th><th>主要欄位</th><th>說明</th></tr>
+<tr><td>securities</td><td>id、代號、市場、中英文名、種類、幣別、ADR 比率、上市狀態、財年結束月</td><td>取代 NAME_CACHE 作為唯一主檔</td></tr>
+<tr><td>segments／industry_links</td><td>公司、分部、子產業、營收占比、期間</td><td>多業務公司分部對應</td></tr>
+<tr><td>prices_daily</td><td>日期、OHLCV、原始／還原、來源</td><td>O/H/L/C 同一列，不可拆開取值</td></tr>
+<tr><td>corporate_actions</td><td>事件 ID、類型、日期、金額與比率、確認狀態、來源層級、修訂</td><td>冪等調整持股</td></tr>
+<tr><td>financials_raw</td><td>觀測值信封＋原始科目名稱</td><td>保留原始值，不覆寫</td></tr>
+<tr><td>metrics_derived</td><td>觀測值信封＋公式版本＋輸入 ID 清單</td><td>可回溯計算</td></tr>
+<tr><td>consensus_snapshots</td><td>標的、指標、目標期間、值、分析師數、快照日</td><td>只增不改；歷史 Forward P/E 唯一來源</td></tr>
+<tr><td>macro_series</td><td>序列、公布值、前值、修正值、共識、公布時間</td><td>區分首次公布與修正</td></tr>
+<tr><td>news_events</td><td>事件 ID、狀態、來源清單、發布／更新時間、實體、情緒、營運影響、計分歸屬模組</td><td>避免重複計分</td></tr>
+<tr><td>valuation_scenarios</td><td>方法、EPS 口徑、倍數、情境、估值日、目標日、敏感度</td><td></td></tr>
+<tr><td>theses</td><td>使用者、標的、版本、原因、預期、區間、失效條件、報告快照 ID</td><td>只新增版本</td></tr>
+<tr><td>holdings／trades</td><td>交易時間、價格、股數、費用、稅、匯率</td><td>持股由交易紀錄推算</td></tr>
+<tr><td>report_snapshots</td><td>報告 ID、快照 ID、模板版本、內容、發布時間</td><td></td></tr>
+<tr><td>notifications</td><td>去重鍵、管道、狀態、重試次數、送出時間</td><td></td></tr>
+<tr><td>audit_log</td><td>操作者、角色、動作、目標、結果、時間</td><td></td></tr>
+</table></div>
+
+<h3>5.3 資料來源矩陣</h3>
+<p>「待確認」表示條款、存取方式或 Render IP 可用性未經實測。付費價格隨時變動，實作前再查。</p>
+<div class="tbl"><table>
+<tr><th>代號</th><th>來源</th><th>用途</th><th>費用</th><th>現況／風險</th></tr>
+<tr><td>TWSE</td><td>證交所 OpenAPI／opendata／MIS</td><td>台股報價、法人、除權息預告</td><td>免費</td><td>exchangeReport 路徑擋 Render IP，opendata 可用（依過去紀錄）</td></tr>
+<tr><td>TPEx</td><td>櫃買中心 OpenAPI</td><td>上櫃報價、除權息</td><td>免費</td><td>部分欄位名稱待確認</td></tr>
+<tr><td>MOPS</td><td>公開資訊觀測站</td><td>財報、重大訊息、法說資料、股利公告</td><td>免費</td><td>無正式 API，需解析頁面；Render IP 存取待確認</td></tr>
+<tr><td>FinMind</td><td>FinMind API</td><td>還原股價、財報、月營收、新聞</td><td>免費額度＋付費方案</td><td>全市場查詢可能需付費等級；欄位名稱待實測</td></tr>
+<tr><td>SEC</td><td>EDGAR XBRL companyfacts／submissions</td><td>美股財報、8-K、股數</td><td>免費</td><td>需在 User-Agent 帶聯絡資訊，並遵守速率限制</td></tr>
+<tr><td>FRED</td><td>St. Louis Fed</td><td>2Y／10Y／30Y 殖利率、CPI、失業率等歷史序列</td><td>免費（API key）</td><td>日資料有延遲，非即時</td></tr>
+<tr><td>BLS／Fed</td><td>官方發布</td><td>CPI、PPI、非農原始值、FOMC 聲明、點陣圖</td><td>免費</td><td></td></tr>
+<tr><td>利率期貨隱含</td><td>CME FedWatch 等</td><td>降息升息機率</td><td>待確認</td><td>授權條款待查，可能需付費</td></tr>
+<tr><td>Yahoo</td><td>Yahoo Finance 非官方端點</td><td>美股、指數、匯率、期貨報價</td><td>免費但非正式</td><td>無服務保證，端點會變；只能當備援</td></tr>
+<tr><td>共識</td><td>FactSet、LSEG、S&amp;P、Visible Alpha；較平價的 FMP、Finnhub 等</td><td>EPS 共識、修正歷程</td><td>付費</td><td>台股共識覆蓋度待確認；歷史快照需自行保存</td></tr>
+<tr><td>金價</td><td>台銀牌價、銀樓報價</td><td>台灣黃金</td><td>免費</td><td>網頁解析，改版即失效</td></tr>
+<tr><td>Dubai 原油</td><td>Platts 等</td><td>Dubai 基準價</td><td>付費</td><td>無免費可靠來源時顯示「不提供」</td></tr>
+<tr><td>新聞</td><td>Google News RSS、鉅亨 RSS、媒體 RSS</td><td>新聞事件</td><td>免費 RSS</td><td>Reuters、Bloomberg 全文需授權；只存標題與連結</td></tr>
+<tr><td>產業數據</td><td>研究機構報告、公司法說、公會統計</td><td>TAM、市占、ASP</td><td>多為付費</td><td>第一版以公司揭露與公會資料為主，手動輸入並記錄來源</td></tr>
+<tr><td>LLM</td><td>Groq</td><td>解釋、分類、翻譯</td><td>免費額度＋付費</td><td>速率限制；必須非同步呼叫（v10.9.35 教訓）</td></tr>
+<tr><td>Gmail</td><td>Gmail API 或 SMTP 應用程式密碼</td><td>郵件推播</td><td>免費</td><td>需要帳號設定</td></tr>
+</table></div>
+
+<h3>5.4 環境變數</h3>
+<pre># 現有
+LINE_CHANNEL_SECRET  LINE_CHANNEL_ACCESS_TOKEN  GOOGLE_SHEETS_ID
+GOOGLE_SHEETS_CREDENTIALS  GROQ_API_KEY  FINMIND_TOKEN  PORT
+# 建議新增
+OWNER_USER_ID          # 目前寫死在 app.py 第 864 行，建議移到環境變數
+DATABASE_URL           # 若採方案 A
+FRED_API_KEY           # 殖利率與總經
+SEC_USER_AGENT         # 例如 "Lumistock contact@example.com"
+GMAIL_SENDER  GMAIL_APP_PASSWORD   # 或改用 Gmail API OAuth
+CONSENSUS_API_KEY      # 決定供應商後才需要
+TZ_DISPLAY=Asia/Taipei</pre>
+</section>
+
+<section id="s6">
+<h2>6 報告與 LINE 模板</h2>
+<p>以下是結構範本。方括號是欄位，<b>不是實際資料</b>。每段內容標記四種類型：<span class="pill s-ok">事實</span> <span class="pill s-done">計算</span> <span class="pill s-fix">AI 推論</span> <span class="pill s-unk">情境／待驗證</span></p>
+
+<h3>6.1 個股完整研究報告</h3>
+<pre>━━ [代號] [中文名] / [英文名] ━━
+市場 [TWSE/TPEx/NASDAQ/NYSE] · 種類 [普通股/ETF/ADR] · 幣別 [TWD/USD]
+價格 [x] （[即時/延遲 N 分/收盤]，交易所時間 [yyyy-mm-dd HH:MM TZ]）
+資料快照 [snapshot_id] · 報告產生 [時間] · 模板 v[版本]
+
+1 研究結論
+  一句話：[結論]　適用期間：[長期研究 / 3–6 個月波段]
+  品質 [A/B/C/資料不足]　價格 [A/B/C/資料不足]　時機 [A/B/C/資料不足]
+  風險 [高/中/低]　證據完整度 [xx%]　狀態：[值得研究/品質佳但估值偏高/...]
+
+2 業務與收入           [事實] 分部占比、地區占比、收入類型、成長率
+3 產業位置             [事實][計算] 市場規模、CAGR、供需狀態、週期、CR、價值鏈位置
+4 成長、優勢、護城河    [計算][AI 推論] 每項附數字證據與失效條件；管理層指引命中率
+5 財報趨勢與品質        [事實][計算] 8 季/5 年、FCF、CCR、CCC、ROE 杜邦、股數變化、償債
+6 預期差與 EPS 修正     [計算] 實際 vs 公布前共識（無快照則寫「無法計算」）、指引、修正方向
+7 估值                 [計算][情境] 方法與選用理由、歷史帶、三情境（EPS × 倍數）、敏感度表
+8 趨勢、籌碼、技術       [事實][計算] 市場趨勢 / 個股趨勢兩層、法人、量價、指標參數
+9 催化劑與風險          [事實][AI 推論] 事件日曆、主要風險、反方論點（至少 2 條）
+10 條件式行動           [情境] 若 [事件/價格] 則 [重新評估/分批研究]；論點失效條件
+11 來源與限制           原始連結清單、缺漏欄位、來源衝突、陳舊資料、信心依據
+                       「本報告為研究輔助，不構成投資建議」</pre>
+
+<h3>6.2 LINE 摘要卡</h3>
+<pre>[代號] [名稱]　[價格] [漲跌%]
+[資料時間] · [即時/延遲/收盤]
+──────────
+📌 [一句結論]
+品質 [B] ｜ 價格 [C] ｜ 時機 [資料不足]
+狀態：[品質佳但估值偏高]
+⚠ 主要風險：[一句]
+🔎 論點失效條件：[一句]
+資料完整度 [72%]　缺：[共識快照]
+[看完整報告]  [加入觀察]  [記錄論點]</pre>
+<p>卡片沿用粉嫩色系（Flex 卡片使用薰衣草粉 <code>#C9B0DB</code>、奶油杏粉 <code>#E8B8A8</code>），漲 <code>#D97A5C</code>、跌 <code>#7AABBE</code>；不使用深紫、深色、花草裝飾。</p>
+
+<h3>6.3 原 79 項對照（追蹤中）</h3>
+<div class="tbl"><table>
+<tr><th>原面向</th><th>原項數</th><th>已知舉例</th><th>對應本模板</th></tr>
+<tr><td>基本面</td><td class="nw">13</td><td>營收、EPS、毛利率、ROE、P/E</td><td>§2、§4、§5；P/E 移到 §7</td></tr>
+<tr><td>技術面</td><td class="nw">12</td><td>MA、KD、MACD、RSI、支撐壓力</td><td>§8</td></tr>
+<tr><td>籌碼</td><td class="nw">9</td><td>三大法人、融資、借券</td><td>§8</td></tr>
+<tr><td>新聞</td><td class="nw">8</td><td>個股、產業、財報、法說、政策</td><td>§9，並接 M10 事件</td></tr>
+<tr><td>產業</td><td class="nw">6</td><td>趨勢、週期、題材、供應鏈</td><td>§3</td></tr>
+<tr><td>總經</td><td class="nw">12</td><td>美股、SOX、VIX、Fed、CPI</td><td>§1 脈絡、§9；接 M2</td></tr>
+<tr><td>風險</td><td class="nw">11</td><td>追高、匯率、政策、除權息</td><td>§9、§10</td></tr>
+<tr><td>操作</td><td class="nw">8</td><td>短中長期、停損</td><td>§10（改為條件式，不直接給買賣點）</td></tr>
+</table></div>
+<p class="meta">8 個面向合計 79 項，但只知道部分舉例。<b>不能宣稱本模板已涵蓋原 79 項</b>，需要妳補完整清單後逐項對照。</p>
+</section>
+
+<section id="s7">
+<h2>7 P0–P3 工作清單</h2>
+<p>每一版都依鐵則附上版本交付紀錄，並跑固定測試案例。標「需先問」的項目會改變評分、資料源或 UI，動手前要先取得妳同意。</p>
+
+<h3>P0 現況盤點與資料正確性</h3>
+<div class="tbl"><table>
+<tr><th>ID</th><th>工作</th><th>相依</th><th>完成標準</th><th>狀態</th></tr>
+<tr><td>P0-1</td><td>10 個確認 bug 修正（見第 8 節）</td><td>—</td><td>離線測試全過＋Render 固定案例實測</td><td><span class="pill s-done">離線完成，待部署實測</span></td></tr>
+<tr><td>P0-2</td><td>Render 實測清單：2330、3533、00878、00904、AAPL、NVDA、TSLA，盤中與盤後各一次</td><td>P0-1 部署</td><td>截圖或 log 記錄名稱、量、漲跌、時間正確</td><td><span class="pill s-unk">需妳部署</span></td></tr>
+<tr><td>P0-3</td><td>報價時間改顯示交易所時間戳，另列查詢時間</td><td>—</td><td>卡片同時顯示兩個時間</td><td><span class="pill s-fix">需先問（UI）</span></td></tr>
+<tr><td>P0-4</td><td>MIS 收盤後不標「盤中」</td><td>—</td><td>13:30 後狀態為收盤</td><td><span class="pill s-fix">待做</span></td></tr>
+<tr><td>P0-5</td><td>除權息日參考價不重複扣減：優先採交易所參考價</td><td>—</td><td>除息日漲跌幅與交易所一致</td><td><span class="pill s-fix">待做，需實測資料</span></td></tr>
+<tr><td>P0-6</td><td>O/H/L/C 同一根 K 棒；新增紅黑 K 判斷（收盤 vs 開盤）</td><td>—</td><td>開高收低案例測試</td><td><span class="pill s-fix">需先問（UI）</span></td></tr>
+<tr><td>P0-7</td><td>2Y 殖利率改用正確來源（FRED DGS2 或其他），並修正標籤</td><td>FRED key</td><td>2Y 與官方數值一致</td><td><span class="pill s-fix">需先問（資料源）</span></td></tr>
+<tr><td>P0-8</td><td>FinMind 月營收欄位實測；若無年增率欄位，改由 13 個月資料自行計算</td><td>FINMIND_TOKEN 實測</td><td>2330 年增率與公開資訊觀測站一致</td><td><span class="pill s-fix">需先問（影響評分）</span></td></tr>
+<tr><td>P0-9</td><td>新聞：解析 Google 轉址後才判斷白名單；中性新聞不給滿分</td><td>—</td><td>台股個股新聞與該股相關；評分測試</td><td><span class="pill s-fix">需先問（影響評分）</span></td></tr>
+<tr><td>P0-10</td><td>補齊 EX_DIVIDEND_FALLBACK（6 月–11 月）</td><td>—</td><td>表格涵蓋未來 60 天</td><td><span class="pill s-fix">待做</span></td></tr>
+<tr><td>P0-11</td><td>自訂停損、推播設定寫入 Sheets（重啟不遺失）</td><td>—</td><td>重啟後設定仍在</td><td><span class="pill s-fix">待做</span></td></tr>
+<tr><td>P0-12</td><td>持股 JSON 加鎖與原子寫入</td><td>—</td><td>併發測試不遺失</td><td><span class="pill s-fix">待做</span></td></tr>
+<tr><td>P0-13</td><td>債券 ETF（代號含 B）不再被 <code>isdigit()</code> 當成美股</td><td>—</td><td>00679B 查價、持股、費用正確</td><td><span class="pill s-fix">待做</span></td></tr>
+<tr><td>P0-14</td><td>RSI 等指標資料不足時回傳「資料不足」而非預設值</td><td>—</td><td>短序列測試</td><td><span class="pill s-fix">需先問（影響評分）</span></td></tr>
+<tr><td>P0-15</td><td>全部管理 postback 權限測試矩陣</td><td>—</td><td>每個 action × 三種角色</td><td><span class="pill s-fix">待做</span></td></tr>
+</table></div>
+
+<h3>P1 單一標的研究閉環</h3>
+<div class="tbl"><table>
+<tr><th>ID</th><th>工作</th><th>相依</th><th>完成標準</th></tr>
+<tr><td>P1-1</td><td>儲存方案落地（第 5.1 節）＋觀測值信封＋快照 ID</td><td>妳決定方案</td><td>可寫入與查詢，重啟不遺失</td></tr>
+<tr><td>P1-2</td><td>證券主檔 securities（含種類、財年、ADR 比率）</td><td>P1-1</td><td>固定案例與 TSM 正確</td></tr>
+<tr><td>P1-3</td><td>財報擷取：台股（MOPS／FinMind）、美股（SEC XBRL），累計轉單季、TTM</td><td>P1-1</td><td>2330、AAPL 8 季與官方一致</td></tr>
+<tr><td>P1-4</td><td>M5 財務健檢計算庫＋單元測試（全部公式與例外）</td><td>P1-3</td><td>第 9 節財報相關情境全過</td></tr>
+<tr><td>P1-5</td><td>共識快照開始每日保存（即使還沒有付費來源，也先保存公司指引）</td><td>P1-1</td><td>快照只增不改</td></tr>
+<tr><td>P1-6</td><td>M6 估值：P/E、P/B、EV/Sales、歷史帶、三情境、敏感度</td><td>P1-4</td><td>虧損、ADR 案例全過</td></tr>
+<tr><td>P1-7</td><td>M4 公司與 M3 產業：手動輸入介面（Sheets 範本）＋來源欄位</td><td>P1-1</td><td>2330、NVDA 各完成一份</td></tr>
+<tr><td>P1-8</td><td>M7 技術指標重構為參數化純函式，並使用還原價</td><td>—</td><td>與舊結果差異可解釋</td></tr>
+<tr><td>P1-9</td><td>M8 三軸評等與論點卡</td><td>P1-4、P1-6、P1-8</td><td>「品質佳但估值偏高」情境正確</td></tr>
+<tr><td>P1-10</td><td>M9 報告組裝＋LINE 摘要＋網頁報告</td><td>P1-9</td><td>2330、NVDA 完整報告，每個數字可回溯</td></tr>
+<tr><td>P1-11</td><td>加入例外產業：一家金融股、一家虧損成長股、一檔 ETF</td><td>P1-10</td><td>不套錯模板</td></tr>
+<tr><td>P1-12</td><td>79 項對照表完成</td><td>妳提供清單</td><td>逐項標出涵蓋、移除或新增</td></tr>
+</table></div>
+
+<h3>P2 持股與事件追蹤</h3>
+<div class="tbl"><table>
+<tr><th>ID</th><th>工作</th><th>相依</th><th>完成標準</th></tr>
+<tr><td>P2-1</td><td>M12 公司行動五層＋還原係數＋持股冪等調整</td><td>P1-1</td><td>同日除息＋拆股情境通過</td></tr>
+<tr><td>P2-2</td><td>M10 事件化新聞（合併、狀態、單一計分歸屬）</td><td>P1-1</td><td>轉載情境通過</td></tr>
+<tr><td>P2-3</td><td>財報、法說、EPS 修正事件偵測，並觸發論點重評</td><td>P1-5、P1-9</td><td>論點卡顯示變更</td></tr>
+<tr><td>P2-4</td><td>M11 持股健檢（集中度、共同曝險）與條件提醒</td><td>P1-9</td><td>單次跌幅不判定失效</td></tr>
+<tr><td>P2-5</td><td>M13 排程：交易日曆、美東時區、去重、重試、單一排程器</td><td>P1-1</td><td>假日與夏令時間測試通過</td></tr>
+<tr><td>P2-6</td><td>Gmail 推播</td><td>P2-5、Gmail 設定</td><td>重試不重寄</td></tr>
+<tr><td>P2-7</td><td>覆盤：報酬分解、錯誤歸因</td><td>P2-4</td><td>EPS×P/E 分解正確</td></tr>
+</table></div>
+
+<h3>P3 擴大覆蓋</h3>
+<ul>
+  <li>P3-1 多產業專屬指標模型（半導體、金融、軟體、航運、生技、零售）</li>
+  <li>P3-2 可解釋篩選十大分類（新增價值類），四道檢查</li>
+  <li>P3-3 台美傳導證據庫與供應鏈圖</li>
+  <li>P3-4 管理後台網頁版與稽核查詢</li>
+  <li>P3-5 VIP（方案確定後才做）</li>
+  <li>P3-6 成本優化：快取、LLM 用量、資料供應商</li>
+  <li>P3-7 回測（只用當時已公布資料，計入交易成本）；沒有回測前不宣稱勝率</li>
+</ul>
+<p class="meta">原則：資料品質沒有達標前，不擴充股票數量。</p>
+</section>
+
+<section id="s8">
+<h2>8 v10.9.187 交付紀錄</h2>
+<div class="tbl"><table>
+<tr><th>項目</th><th>內容</th></tr>
+<tr><td>版本號</td><td>10.9.187（基於 GitHub main 的 v10.9.186，commit <code>a9298af</code>）</td></tr>
+<tr><td>部署狀態</td><td><b>未部署、未推送</b>。檔案交給妳下載後自行推送</td></tr>
+<tr><td>修改內容</td><td><ol>
+<li>MIS 成交量改用累積量 <code>v</code>，不再用當盤量 <code>tv</code></li>
+<li>RSI 近 14 日無下跌時回傳 100（原 50），<code>get_kline_analysis</code> 與 <code>score_technical</code> 兩處</li>
+<li><code>user_detail</code> postback 加上管理者權限檢查</li>
+<li>禁止封鎖 Owner 與管理者</li>
+<li>Sheets 還原：股數 0 的列視為清倉，移除較早紀錄</li>
+<li>即使全部清倉也寫回 /tmp，避免殘留舊資料</li>
+<li>刪除持股時刪除 Sheets 中所有符合列，不再只刪第一列</li>
+<li>證交稅依代號區分：一般股 0.3%、ETF 0.1%、債券 ETF 在 2026-12-31 前 0</li>
+<li>賣出訊息與預覽的稅率文字改為實際稅率</li>
+<li><code>/callback</code> 缺簽章標頭時回 400（原本 500）</li>
+</ol></td></tr>
+<tr><td>修改函式</td><td><code>_fetch_tw_mis</code>、<code>get_kline_analysis</code>、<code>score_technical</code>、<code>handle_postback</code>、<code>block_user_by_name</code>、<code>restore_portfolio_from_sheets</code>、<code>delete_portfolio_from_sheets</code>、<code>calc_sell_fee_tax</code>（新增選填參數，舊呼叫方式不變）、新增 <code>tw_sell_tax_rate</code>、<code>fmt_tax_rate</code>、<code>process_sell</code>、<code>make_sell_preview_flex</code>、<code>format_sell_import_preview</code>、<code>make_portfolio_flex_carousel</code>、<code>get_portfolio_summary</code>、<code>callback</code></td></tr>
+<tr><td>可能影響的舊功能</td><td><ul>
+<li>成交量數字在盤中會明顯變大（這是修正後的正確值）</li>
+<li>持續上漲股票的 RSI 變成 100：卡片顯示「短線過熱」；<code>score_technical</code> 不再給「RSI 健康 +10」，<b>會影響趨勢類推薦排序</b></li>
+<li>ETF 賣出的淨收入與未實現損益變多（稅較低）</li>
+<li>重啟後，先前「賣光但復活」的持股會消失（這是修正後的正確行為）</li>
+</ul></td></tr>
+<tr><td>測試項目</td><td><code>tests/test_p0.py</code> 17 項：MIS 成交量、RSI 全漲／持平／全跌／一般、清倉不復活、清倉後再買、刪除所有列、一般用戶查詳情被拒、管理者可查、不可封鎖 Owner、缺簽章 400、一般股稅、ETF 稅、債券 ETF 稅與到期、舊呼叫相容、名稱內建表回歸</td></tr>
+<tr><td>測試結果</td><td>v10.9.186：10 項失敗（即 bug 重現）、7 項通過。v10.9.187：17 項全部通過。<code>py_compile</code> 通過</td></tr>
+<tr><td>測試限制</td><td>line-bot-sdk、gspread 無法在沙盒安裝，改用 stub；所有外部 API 都用 mock。<b>這些測試只證明邏輯正確，不代表 Render 上的資料正確</b></td></tr>
+<tr><td>回歸風險</td><td>低到中。RSI 修正會改變推薦排序（中）；其餘為局部邏輯（低）。未改動 webhook 同步流程、快取、名稱快取初始化</td></tr>
+<tr><td>剩餘風險</td><td>MIS 欄位 <code>v</code> 的意義以公開文件為依據，需要盤中實測確認；債券 ETF 停徵是否延長需在年底前確認；P0-3～P0-15 未處理</td></tr>
+<tr><td>下一步</td><td>妳推送並部署 → 跑 P0-2 固定案例 → 回報結果 → 我接著做 P0-4、P0-10、P0-11、P0-12、P0-13（不需先問的項目）</td></tr>
+</table></div>
+<h4>建議 commit message</h4>
+<pre>v10.9.187 P0 修正：MIS 成交量、RSI 全漲、權限、持股復活、ETF 證交稅
+
+- MIS 改用累積成交量 v（原誤用當盤量 tv）
+- RSI 近 14 日無下跌回傳 100（原誤回 50），含 score_technical
+- user_detail postback 後端檢查管理者權限
+- 禁止封鎖 Owner / 管理者
+- 自選股 Sheets：清倉列移除舊紀錄；刪除時刪所有同檔列
+- 證交稅依代號：股 0.3% / ETF 0.1% / 債券 ETF 停徵期 0
+- /callback 缺簽章回 400
+- 新增 tests/（離線 mock 測試 17 項）</pre>
+</section>
+
+<section id="s9">
+<h2>9 驗收情境對照</h2>
+<div class="tbl"><table>
+<tr><th>情境</th><th>模組</th><th>階段</th><th>目前</th></tr>
+<tr><td>台美代碼與相似名稱</td><td>M1</td><td>P0-2、P1-2</td><td><span class="pill s-unk">待實測</span></td></tr>
+<tr><td>FY 不等於日曆年、累計現金流</td><td>M5</td><td>P1-3、P1-4</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>GAAP 與調整後 EPS 並存</td><td>M5、M6</td><td>P1-4、P1-6</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>市占 10%→20%、市場 +20% 得 140%</td><td>M3</td><td>P1-7</td><td><span class="pill s-done">公式已驗算</span></td></tr>
+<tr><td>EPS 虧損、接近零、權益為負</td><td>M5、M6</td><td>P1-4、P1-6</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>沒有歷史共識</td><td>M6</td><td>P1-5、P1-6</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>同日除息或拆股</td><td>M12</td><td>P2-1</td><td><span class="pill s-fix">現有程式不處理配股與拆股</span></td></tr>
+<tr><td>同一新聞多家轉載</td><td>M10</td><td>P0-9、P2-2</td><td><span class="pill s-fix">台股丟棄不合併；美股已合併</span></td></tr>
+<tr><td>財報與新聞資料衝突</td><td>M9、M10</td><td>P1-10</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>來源失效、延遲、欄位缺漏</td><td>全部</td><td>P0、P1-1</td><td><span class="pill s-fix">部分有備援，缺值常以 0 代替</span></td></tr>
+<tr><td>ADR 與普通股、不同幣別</td><td>M1、M6</td><td>P1-2、P1-6</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>品質佳但價格昂貴</td><td>M8</td><td>P1-9</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>高營收成長但現金惡化或稀釋</td><td>M5</td><td>P1-4</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>相同時間點重跑研究</td><td>M9</td><td>P1-1、P1-10</td><td><span class="pill s-no">未實作</span></td></tr>
+<tr><td>推播重試、假日、夏令時間</td><td>M13</td><td>P2-5</td><td><span class="pill s-fix">不判斷交易日、無重試</span></td></tr>
+<tr><td>一般用戶嘗試管理動作</td><td>M14</td><td>P0-15</td><td><span class="pill s-done">user_detail 已修並測試</span>，其餘待建矩陣</td></tr>
+</table></div>
+</section>
+
+<section id="s10">
+<h2>10 待決定與待補</h2>
+<h3>10.1 需要妳決定</h3>
+<ol>
+  <li><b>儲存方案</b>：建議方案 A（Sheets＋託管 Postgres），牽涉是否接受新服務與可能費用。</li>
+  <li><b>五大貨幣</b>：程式設定了 11 種，請指定哪五種（候選：USD、JPY、EUR、CNY、HKD 等）。</li>
+  <li><b>推播排程</b>：每日兩次，還是台股與美股各兩次？是否兩者都寄 Gmail？</li>
+  <li><b>P0「需先問」項目</b>：P0-3、P0-6、P0-7、P0-8、P0-9、P0-14 是否可以動手。</li>
+  <li><b>共識資料</b>：是否考慮付費來源；若不付費，估值只用公司指引與自建估計，並從現在開始保存快照。</li>
+  <li><b>程式結構</b>：新模組是否同意放在獨立檔案（<code>research/</code>），<code>app.py</code> 只加呼叫點。</li>
+</ol>
+<h3>10.2 接續實作所缺的檔案與設定</h3>
+<div class="tbl"><table>
+<tr><th>項目</th><th>用途</th><th>必要性</th></tr>
+<tr><td>六章講義 PDF</td><td>核對第 3 節校正與頁碼</td><td>P1 前</td></tr>
+<tr><td>原研究報告 79 項完整清單</td><td>6.3 節逐項對照</td><td>P1-12</td></tr>
+<tr><td>Render 部署後 P0-2 測試結果（截圖或 log）</td><td>把「待確認」改為「已驗證」</td><td>立即</td></tr>
+<tr><td>Google Sheets 各分頁欄位標題（可去識別化）</td><td>確認還原與權限邏輯的欄位名稱</td><td>P0</td></tr>
+<tr><td>FinMind 方案等級</td><td>判斷全市場查詢與還原價是否可用</td><td>P0-8</td></tr>
+<tr><td>Render 方案、worker 數、gunicorn 設定</td><td>排程、併發與重複推播</td><td>P0-12、P2-5</td></tr>
+<tr><td>FRED API key</td><td>2Y 殖利率與總經</td><td>P0-7</td></tr>
+<tr><td>Gmail 寄件帳號設定方式</td><td>郵件推播</td><td>P2-6</td></tr>
+<tr><td>新版 Rich Menu 圖檔是否已更新</td><td>色系規格</td><td>P3</td></tr>
+<tr><td>台股新聞來源既有設定是否有不在程式中的名單</td><td>M10 白名單</td><td>P2-2</td></tr>
+</table></div>
+</section>
+</main>
+</div>
