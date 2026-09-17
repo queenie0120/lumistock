@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.187"
+VERSION              = "10.9.188"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -1226,6 +1226,14 @@ def _bg_init():
         if n: dlog("SETTINGS", f"還原使用者設定：{n} 位")
     except Exception as e:
         dlog("SETTINGS", f"開機還原設定失敗：{e}")
+    # v10.9.188：還原自訂停損／目標與推播設定（原本只存 /tmp，重啟遺失）
+    try:
+        SETTINGS_STORE.restore("user_alerts", target=USER_ALERTS, merge=merge_two_level)
+        SETTINGS_STORE.restore("push_settings", target=PUSH_SETTINGS, merge=merge_shallow)
+        for k, v in DEFAULT_PUSH_SETTINGS.items():
+            PUSH_SETTINGS.setdefault(k, v)
+    except Exception as e:
+        dlog("SETTINGS_STORE", f"開機還原設定失敗：{type(e).__name__}: {e}")
     # v10.9.109：還原警報 dedup 歷史（避免 Render 重啟後重發警報）
     try:
         restore_alert_history_from_sheets()
@@ -1404,19 +1412,38 @@ EX_DIVIDEND_TTL = 12 * 3600  # 12 小時更新一次
 #
 # 維護紀錄：
 #   2026/05/19 - Queenie 初始建立（v10.9.45）
-#   下次更新建議：2026/06/01（補 6 月除權息）
+#   2026/09/17 - 移除過期項目，補 9/17–10/05 已公告項目（v10.9.188）
 EX_DIVIDEND_FALLBACK = {
-    # ─────── 2026/05 ───────
-    "00878": {"date": "20260519", "cash": 0.66, "stock": 0.0,
-              "adjusted_reference_price": None, "source": "fallback",
-              "note": "ETF 季配息"},
-    "00904": {"date": "20260519", "cash": 0.20, "stock": 0.0,
-              "adjusted_reference_price": None, "source": "fallback",
-              "note": "ETF 季配息"},
-    # TODO: 未來 30 天其他除權息（每月初手動更新）
+    # v10.9.188 更新（2026/09/17 查詢）
+    # 來源：TWSE 除權除息預告表 TWT48U（https://www.twse.com.tw/rwd/zh/exRight/TWT48U）
+    # 只收錄「已公告」且除息日 >= 2026/09/17 的項目；不用往年日期推估。
+    # 已公告除息日但「金額待公告」者不放入表格：cash=0 的項目沒有提醒效果，
+    #   且會擋住 _lazy_load_exdiv_for_stock 向 FinMind 補抓實際金額。
+    #   待公告：00918（9/18）、00713（9/21）、00930（9/23）、00406A（10/05）
+    # 已移除過期項目：00878 / 00904（2026/05/19）
+    # 未收錄：2890 永豐金 10/07 為現金增資除權，非配息，參考價算法不同
+    # 期間內查無公告：0050、006208、0056、00878、00904、00692、00850、00679B、2317、2454、2412、2881、2882、2886
 
-    # ─────── 2026/06 ───────（預留位置）
-    # 待 2026/06/01 從 TWSE 公開資料補入
+    # ─────── 2026/09 ───────
+    "00929": {"date": "20260917", "cash": 0.38, "stock": 0.0,
+              "adjusted_reference_price": None, "source": "fallback:TWT48U",
+              "note": "ETF 月配息，發放日 2026/10/16"},
+    "00710B": {"date": "20260917", "cash": 0.39, "stock": 0.0,
+               "adjusted_reference_price": None, "source": "fallback:TWT48U",
+               "note": "債券 ETF 配息"},
+    "00711B": {"date": "20260917", "cash": 0.20, "stock": 0.0,
+               "adjusted_reference_price": None, "source": "fallback:TWT48U",
+               "note": "債券 ETF 配息"},
+    "00712": {"date": "20260917", "cash": 0.20, "stock": 0.0,
+              "adjusted_reference_price": None, "source": "fallback:TWT48U",
+              "note": "ETF 配息"},
+    "00728": {"date": "20260918", "cash": 0.77, "stock": 0.0,
+              "adjusted_reference_price": None, "source": "fallback:TWT48U",
+              "note": "ETF 配息"},
+    "2542": {"date": "20260923", "cash": 4.00, "stock": 0.0,
+             "adjusted_reference_price": None, "source": "fallback:TWT48U",
+             "note": "現金股利"},
+    # 下次更新建議：2026/10 上旬（0056）、2026/11 上旬（00878、00679B、00850、00692）
 }
 
 
@@ -2113,6 +2140,17 @@ def _should_alert(uid: str, sid: str, alert_type: str) -> bool:
 # 結構：{user_id: {sid: {"stop_loss": float, "target": float, "updated": ts}}}
 # ──────────────────────────────────────────
 USER_ALERTS_FILE = "/tmp/lumistock_user_alerts.json"
+PUSH_SETTINGS_FILE = "/tmp/lumistock_push_settings.json"
+
+# v10.9.188：設定持久化介面（P1 換資料庫時只替換 mirror）
+from lumistock.db.settings_store import (JsonFileStore, SheetsKVStore, MirroredStore,
+                                         merge_shallow, merge_two_level)
+SETTINGS_STORE = MirroredStore(
+    primary=JsonFileStore({"user_alerts": USER_ALERTS_FILE,
+                           "push_settings": PUSH_SETTINGS_FILE}),
+    # get_or_create_sheet 定義在後面，用 lambda 延遲取用
+    mirror=SheetsKVStore(lambda *a, **k: get_or_create_sheet(*a, **k), log=dlog),
+    async_mirror=True, log=dlog)
 
 def _load_user_alerts() -> dict:
     try:
@@ -2124,9 +2162,10 @@ def _load_user_alerts() -> dict:
     return {}
 
 def _save_user_alerts(data: dict) -> None:
+    # v10.9.188：改走 SETTINGS_STORE（/tmp 原子寫入＋背景鏡像到 Sheets「系統設定KV」）
     try:
-        with open(USER_ALERTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        if not SETTINGS_STORE.save("user_alerts", data):
+            dlog("USER_ALERT", "寫入 /tmp 失敗")
     except Exception as e:
         dlog("USER_ALERT", f"寫入失敗：{e}")
 
@@ -2159,7 +2198,6 @@ def list_user_alerts(uid: str) -> dict:
 # ──────────────────────────────────────────
 # v10.9.142：推播管理設定（owner 控制）
 # ──────────────────────────────────────────
-PUSH_SETTINGS_FILE = "/tmp/lumistock_push_settings.json"
 DEFAULT_PUSH_SETTINGS = {
     "morning_report_time": "06:30",       # 每日健檢 + 持股警報時間
     "portfolio_alerts_enabled": True,     # 持股警報總開關
@@ -2181,9 +2219,10 @@ def _load_push_settings() -> dict:
     return dict(DEFAULT_PUSH_SETTINGS)
 
 def _save_push_settings(d: dict) -> None:
+    # v10.9.188：改走 SETTINGS_STORE（/tmp＋背景鏡像到 Sheets）
     try:
-        with open(PUSH_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
+        if not SETTINGS_STORE.save("push_settings", d):
+            dlog("PUSH_SETTING", "寫入 /tmp 失敗")
     except Exception as e:
         dlog("PUSH_SETTING", f"寫入失敗：{e}")
 
@@ -4297,7 +4336,7 @@ MARKET_SYMBOLS = {
     "查天然氣":  ("NG=F",   "⚡ 天然氣期貨"),
     # 📉 債券
     "查美債":    ("^TNX",   "美國10年期公債殖利率"),
-    "查美債2Y":  ("^IRX",   "美國2年期公債殖利率"),
+    "查美債2Y":  ("2YY=F",  "美國2年期殖利率（CBOT 期貨）"),  # v10.9.188：原 ^IRX 為 13 週國庫券
     "查美債30Y": ("^TYX",   "美國30年期公債殖利率"),
 }
 
@@ -4542,16 +4581,20 @@ def get_yield_analysis() -> dict:
             dlog("YIELD", f"{sym} 失敗：{e}")
             return None
 
-    y2 = get_yld("^IRX")   # 2Y (用短期國庫券近似)
+    # v10.9.188：2Y 不再用 ^IRX（13 週國庫券）。來源：2YY=F 期貨 → FRED DGS2；都失敗則顯示 --
+    from lumistock.services.market.yields import get_us_2y_yield
+    y2 = get_us_2y_yield(requests.get)
     y10 = get_yld("^TNX")  # 10Y
     y30 = get_yld("^TYX")  # 30Y
 
-    if not (y2 and y10):
+    if not y10:
         return {}
+    if not y2:
+        dlog("YIELD", "2Y 殖利率全部來源失敗，不計算 10Y-2Y 利差")
 
-    # 判斷殖利率倒掛
-    spread_2_10 = y10["yield"] - y2["yield"]
-    inverted = spread_2_10 < 0
+    # 判斷殖利率倒掛（沒有 2Y 就不判斷，避免假訊號）
+    spread_2_10 = (y10["yield"] - y2["yield"]) if y2 else None
+    inverted = spread_2_10 is not None and spread_2_10 < 0
 
     # AI 解讀邏輯
     interpretations = []
@@ -4563,7 +4606,9 @@ def get_yield_analysis() -> dict:
         interpretations.append("📈 10年期殖利率下降 → 成長股、AI 類股可能受惠")
 
     # 倒掛警告
-    if inverted:
+    if spread_2_10 is None:
+        interpretations.append("⚪ 2年期殖利率暫時取不到，本次不判斷曲線倒掛")
+    elif inverted:
         interpretations.append(f"⚠️ 殖利率倒掛 2Y > 10Y（差距 {abs(spread_2_10):.2f}％）→ 經濟衰退預警訊號")
     elif spread_2_10 < 0.5:
         interpretations.append(f"🟡 殖利率曲線平坦（差距僅 {spread_2_10:.2f}％）→ 市場對長期經濟保守")
@@ -4571,9 +4616,9 @@ def get_yield_analysis() -> dict:
         interpretations.append(f"🟢 殖利率曲線正常（10Y-2Y = {spread_2_10:.2f}％）→ 經濟結構健康")
 
     # 2 年期解讀（Fed 政策）
-    if y2["pct"] > 2:
+    if y2 and y2["pct"] > 2:
         interpretations.append("🔴 2年期急升 → 市場預期 Fed 升息壓力增加")
-    elif y2["pct"] < -2:
+    elif y2 and y2["pct"] < -2:
         interpretations.append("🟢 2年期急跌 → 市場預期 Fed 可能降息")
 
     # 30 年期解讀（通膨）
@@ -4599,7 +4644,7 @@ def make_yield_analysis_flex(data: dict) -> dict:
     y10 = data.get("y10", {})
     y30 = data.get("y30", {})
     inverted = data.get("inverted", False)
-    spread = data.get("spread", 0)
+    spread = data.get("spread")
     interpretations = data.get("interpretations", [])
 
     # 倒掛時用淺紅警示色
@@ -4643,7 +4688,8 @@ def make_yield_analysis_flex(data: dict) -> dict:
             "type":"box","layout":"vertical","spacing":"md","paddingAll":"14px",
             "contents":[
                 # 殖利率數值
-                yield_row("📊 2 年期", y2, "→ 短期利率/Fed 政策預期"),
+                yield_row("📊 2 年期", y2,
+                          "→ 短期利率/Fed 政策預期" + (f"（{y2['source_label']}）" if y2 and y2.get("source_label") else "")),
                 {"type":"separator","color":"#F0D5C0"},
                 yield_row("📉 10 年期", y10, "→ 長期經濟/全球資金成本"),
                 {"type":"separator","color":"#F0D5C0"},
@@ -4652,7 +4698,7 @@ def make_yield_analysis_flex(data: dict) -> dict:
                 # 曲線狀態
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":"曲線狀態","size":"xs","color":"#A07560","flex":1},
-                    {"type":"text","text":f"{'⚠️ 倒掛' if inverted else '✅ 正常'} ({spread:+.2f}％)",
+                    {"type":"text","text":(f"{'⚠️ 倒掛' if inverted else '✅ 正常'} ({spread:+.2f}％)" if spread is not None else "— 缺 2Y 資料"),
                      "size":"xs","color":("#D97A5C" if inverted else "#5D8B6B"),"weight":"bold","flex":2,"align":"end"}
                 ]},
                 {"type":"separator","color":"#F0D5C0"},
@@ -8163,7 +8209,8 @@ def _load_finmind_monthly_revenue(sid: str) -> list:
     回傳 [{date, revenue_million, yoy_pct}, ...]（最新在前）。"""
     if not FINMIND_TOKEN: return []
     end_date = now_taipei().strftime("%Y-%m-%d")
-    start_date = (now_taipei() - timedelta(days=180)).strftime("%Y-%m-%d")
+    # v10.9.188：抓 16 個月，才有「去年同月」可算年增率
+    start_date = (now_taipei() - timedelta(days=490)).strftime("%Y-%m-%d")
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": "TaiwanStockMonthRevenue",
@@ -8179,21 +8226,13 @@ def _load_finmind_monthly_revenue(sid: str) -> list:
         if payload.get("status") != 200: return []
         rows = payload.get("data") or []
         if not rows: return []
-        rows.sort(key=lambda x: x.get("date", ""), reverse=True)
-        out = []
-        for row in rows[:4]:
-            try:
-                rev = int(row.get("revenue", 0)) // 1_000_000   # 換算成「百萬」
-                # FinMind 欄位：revenue_year, revenue_month, revenue, revenue_growth_rate, ...
-                yoy = row.get("revenue_year_growth")
-                if yoy is None:
-                    yoy = row.get("revenue_growth_rate", 0)
-                out.append({
-                    "date": (row.get("date") or "")[:7],   # YYYY-MM
-                    "revenue_million": rev,
-                    "yoy_pct": float(yoy) if yoy is not None else 0.0,
-                })
-            except: continue
+        # v10.9.188：FinMind 此資料集沒有年增率欄位（舊版讀不到 → 全部當 0）。
+        # 改用去年同月營收自行計算；算不出來的期數不回傳（缺值不當 0）。
+        # date 改為「營收所屬月份」（原為公布月份）。
+        from lumistock.calc.revenue import compute_monthly_yoy
+        out = compute_monthly_yoy(rows, limit=4)
+        if not out:
+            dlog("AI_QA", f"revenue {sid}：{len(rows)} 筆資料不足以計算年增率")
         return out
     except Exception as e:
         dlog("AI_QA", f"revenue {sid} fail: {type(e).__name__}: {e}")
@@ -15064,6 +15103,15 @@ def reply_flex_safe(reply_token, user_id, flex_content, alt_text, fallback_text,
         try: push_message(user_id, fallback_text)
         except Exception as e2: dlog("FLEX", f"push 也失敗：{e2}")
         return False
+
+
+# v10.9.188：Lumistock 2.0 Web API（/api/v1）。掛載失敗不影響 LINE webhook。
+try:
+    from lumistock.api import create_api_blueprint
+    app.register_blueprint(create_api_blueprint(VERSION))
+    dlog("STARTUP", "已掛載 /api/v1")
+except Exception as _e:
+    dlog("STARTUP", f"/api/v1 掛載失敗（不影響 LINE 功能）：{type(_e).__name__}: {_e}")
 
 
 @app.route("/",methods=["GET"])
