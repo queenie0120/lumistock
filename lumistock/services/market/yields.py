@@ -46,13 +46,25 @@ def _valid(v) -> bool:
     return v is not None and YIELD_MIN < v < YIELD_MAX
 
 
+def _as_date(value):
+    """只接受 YYYY-MM-DD 形式的觀測日。
+
+    v10.9.191：Yahoo 回的是 Unix epoch（regularMarketTime），舊版直接當成
+    觀測日塞進卡片 → 標題列出現「資料日 1790102734」。Yahoo 是盤中報價，
+    本來就沒有「觀測日」的概念，一律回 None，卡片只顯示查詢時間。
+    """
+    if isinstance(value, str) and len(value) >= 8 and value[:4].isdigit() and "-" in value:
+        return value
+    return None
+
+
 def _mk(value, prev, source, label, note, as_of=None) -> dict:
     """統一的單一期別回傳格式（yield/chg/pct 與舊版相容，呼叫端與 Flex 卡不用改）。"""
     chg = value - prev
     return {
         "yield": value, "chg": chg, "pct": (chg / prev * 100) if prev else 0.0,
         "source": source, "source_label": label, "source_note": note,
-        "as_of": as_of,
+        "as_of": _as_date(as_of),
     }
 
 
@@ -132,8 +144,9 @@ def _yahoo_curve(http_get):
     for tenor in TENORS:
         r = raw.get(tenor)
         if r and _valid(r.get("value")):
+            # Yahoo 是盤中報價，沒有觀測日概念 → as_of 留空（epoch 不可當日期）
             curve[tenor] = _mk(r["value"], r["prev"], f"yahoo_{YAHOO_SYMBOLS[tenor]}",
-                               YAHOO_LABEL, YAHOO_NOTE, r.get("time"))
+                               YAHOO_LABEL, YAHOO_NOTE, None)
         else:
             missing.append(tenor)
     return curve, missing
