@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.188"
+VERSION              = "10.9.189"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -4336,7 +4336,10 @@ MARKET_SYMBOLS = {
     "查天然氣":  ("NG=F",   "⚡ 天然氣期貨"),
     # 📉 債券
     "查美債":    ("^TNX",   "美國10年期公債殖利率"),
-    "查美債2Y":  ("2YY=F",  "美國2年期殖利率（CBOT 期貨）"),  # v10.9.188：原 ^IRX 為 13 週國庫券
+    # v10.9.188：原 ^IRX 為 13 週國庫券
+    # v10.9.189：改走 __US2Y__ 特殊分支，與殖利率曲線卡同一個來源（FRED CMT 優先），
+    #            避免兩張卡顯示不同數字。來源標籤由卡片的 meta 行顯示。
+    "查美債2Y":  ("__US2Y__", "🇺🇸 美國2年期公債殖利率"),
     "查美債30Y": ("^TYX",   "美國30年期公債殖利率"),
 }
 
@@ -4561,39 +4564,27 @@ def get_market_strength_label(pct: float) -> tuple:
 
 def get_yield_analysis() -> dict:
     """殖利率 AI 解讀（v10.9.32 新增，規則式判讀）"""
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    # 抓 2Y、10Y、30Y
-    def get_yld(sym):
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
-            r = requests.get(url, headers=headers, timeout=8)
-            result = r.json()["chart"]["result"][0]
-            meta = result["meta"]
-            quotes = result.get("indicators",{}).get("quote",[{}])[0]
-            closes = [c for c in quotes.get("close",[]) if c is not None]
-            price = meta.get("regularMarketPrice") or (closes[-1] if closes else 0)
-            prev = closes[-2] if len(closes)>=2 else price
-            chg = price - prev
-            pct = chg / prev * 100 if prev else 0
-            return {"yield": price, "chg": chg, "pct": pct}
-        except Exception as e:
-            dlog("YIELD", f"{sym} 失敗：{e}")
-            return None
-
-    # v10.9.188：2Y 不再用 ^IRX（13 週國庫券）。來源：2YY=F 期貨 → FRED DGS2；都失敗則顯示 --
-    from lumistock.services.market.yields import get_us_2y_yield
-    y2 = get_us_2y_yield(requests.get)
-    y10 = get_yld("^TNX")  # 10Y
-    y30 = get_yld("^TYX")  # 30Y
+    # v10.9.188：2Y 不再用 ^IRX（13 週國庫券）。
+    # v10.9.189：整條曲線改走 get_us_yield_curve —— 主來源 FRED CMT（官方口徑，
+    #            與外部網站對得起來），備援才是 Yahoo 期貨／指數。
+    #            利差只在 2Y 與 10Y「同源同日」時計算，避免拿不同日的兩腳相減。
+    from lumistock.services.market.yields import get_us_yield_curve
+    curve = get_us_yield_curve(requests.get)
+    y2, y10, y30 = curve.get("y2"), curve.get("y10"), curve.get("y30")
+    aligned = curve.get("aligned", False)
+    as_of = curve.get("as_of")
 
     if not y10:
         return {}
     if not y2:
         dlog("YIELD", "2Y 殖利率全部來源失敗，不計算 10Y-2Y 利差")
+    elif not aligned:
+        dlog("YIELD", "2Y/10Y 來源或觀測日不一致，不計算 10Y-2Y 利差")
+    else:
+        dlog("YIELD", f"曲線來源 {curve.get('source_label')}，觀測日 {as_of}")
 
-    # 判斷殖利率倒掛（沒有 2Y 就不判斷，避免假訊號）
-    spread_2_10 = (y10["yield"] - y2["yield"]) if y2 else None
+    # 判斷殖利率倒掛（沒有 2Y、或兩腳不同源不同日就不判斷，避免假訊號）
+    spread_2_10 = (y10["yield"] - y2["yield"]) if (y2 and aligned) else None
     inverted = spread_2_10 is not None and spread_2_10 < 0
 
     # AI 解讀邏輯
@@ -4606,8 +4597,11 @@ def get_yield_analysis() -> dict:
         interpretations.append("📈 10年期殖利率下降 → 成長股、AI 類股可能受惠")
 
     # 倒掛警告
-    if spread_2_10 is None:
+    if spread_2_10 is None and not y2:
         interpretations.append("⚪ 2年期殖利率暫時取不到，本次不判斷曲線倒掛")
+    elif spread_2_10 is None:
+        # v10.9.189：兩腳不同源或不同觀測日，相減出來的利差沒有意義
+        interpretations.append("⚪ 2年期與10年期來源／觀測日不一致，本次不判斷曲線倒掛")
     elif inverted:
         interpretations.append(f"⚠️ 殖利率倒掛 2Y > 10Y（差距 {abs(spread_2_10):.2f}％）→ 經濟衰退預警訊號")
     elif spread_2_10 < 0.5:
@@ -4634,6 +4628,35 @@ def get_yield_analysis() -> dict:
         "spread": spread_2_10,
         "inverted": inverted,
         "interpretations": interpretations,
+        # v10.9.189：資料出處與觀測日，供卡片標示（不改版面，只填既有欄位）
+        "aligned": aligned,
+        "as_of": as_of,
+        "source_label": curve.get("source_label", ""),
+    }
+
+
+def get_us_2y_quote() -> dict:
+    """v10.9.189：「查美債2Y」用。與殖利率曲線卡同一個來源（FRED CMT 優先、
+    Yahoo 2YY=F 備援），回傳 make_quote_flex 可用的格式。失敗回 {}。
+    不另外設計卡片，沿用既有 make_quote_flex 與 meta 行。"""
+    from lumistock.services.market.yields import get_us_2y_yield
+    y = get_us_2y_yield(requests.get)
+    if not y:
+        record_health("US 2Y Yield", False, "FRED 與 Yahoo 皆失敗")
+        return {}
+    record_health("US 2Y Yield", True)
+    is_official = str(y.get("source", "")).startswith("fred")
+    label = y.get("source_label") or y.get("source", "")
+    as_of = y.get("as_of")
+    if is_official and as_of:
+        label = f"{label}（資料日 {as_of}）"
+    return {
+        "price": y["yield"], "chg": y["chg"], "pct": y["pct"],
+        "source": label,
+        "meta": build_data_meta(label,
+                                is_realtime=False,
+                                is_fallback=not is_official,
+                                delay_min=0 if is_official else 15),
     }
 
 
@@ -4646,6 +4669,13 @@ def make_yield_analysis_flex(data: dict) -> dict:
     inverted = data.get("inverted", False)
     spread = data.get("spread")
     interpretations = data.get("interpretations", [])
+    # v10.9.189：資料出處／觀測日（只填進既有文字欄位，版面不變）
+    as_of = data.get("as_of")
+
+    def src_hint(base, yld_data):
+        """在既有提示行後面附上來源標籤，沒有就維持原樣。"""
+        label = (yld_data or {}).get("source_label") if isinstance(yld_data, dict) else None
+        return f"{base}（{label}）" if label else base
 
     # 倒掛時用淺紅警示色
     header_color = "#D49B9B" if inverted else "#C9B0DB"
@@ -4681,24 +4711,27 @@ def make_yield_analysis_flex(data: dict) -> dict:
             "type":"box","layout":"vertical","backgroundColor":header_color,"paddingAll":"14px",
             "contents":[
                 {"type":"text","text":title,"size":"lg","color":"#FFFFFF","weight":"bold"},
-                {"type":"text","text":now_taipei().strftime("%m/%d %H:%M"),"size":"xxs","color":"#FFFFFF"}
+                {"type":"text",
+                 "text":(f"{now_taipei().strftime('%m/%d %H:%M')} ‧ 資料日 {as_of}" if as_of
+                         else now_taipei().strftime("%m/%d %H:%M")),
+                 "size":"xxs","color":"#FFFFFF"}
             ]
         },
         "body":{
             "type":"box","layout":"vertical","spacing":"md","paddingAll":"14px",
             "contents":[
                 # 殖利率數值
-                yield_row("📊 2 年期", y2,
-                          "→ 短期利率/Fed 政策預期" + (f"（{y2['source_label']}）" if y2 and y2.get("source_label") else "")),
+                yield_row("📊 2 年期", y2, src_hint("→ 短期利率/Fed 政策預期", y2)),
                 {"type":"separator","color":"#F0D5C0"},
-                yield_row("📉 10 年期", y10, "→ 長期經濟/全球資金成本"),
+                yield_row("📉 10 年期", y10, src_hint("→ 長期經濟/全球資金成本", y10)),
                 {"type":"separator","color":"#F0D5C0"},
-                yield_row("📈 30 年期", y30, "→ 長期通膨/財政風險"),
+                yield_row("📈 30 年期", y30, src_hint("→ 長期通膨/財政風險", y30)),
                 {"type":"separator","color":"#F0D5C0"},
                 # 曲線狀態
                 {"type":"box","layout":"horizontal","contents":[
                     {"type":"text","text":"曲線狀態","size":"xs","color":"#A07560","flex":1},
-                    {"type":"text","text":(f"{'⚠️ 倒掛' if inverted else '✅ 正常'} ({spread:+.2f}％)" if spread is not None else "— 缺 2Y 資料"),
+                    {"type":"text","text":(f"{'⚠️ 倒掛' if inverted else '✅ 正常'} ({spread:+.2f}％)" if spread is not None
+                                           else ("— 缺 2Y 資料" if not y2 else "— 來源不一致，不判讀")),
                      "size":"xs","color":("#D97A5C" if inverted else "#5D8B6B"),"weight":"bold","flex":2,"align":"end"}
                 ]},
                 {"type":"separator","color":"#F0D5C0"},
@@ -15823,6 +15856,17 @@ def handle_message(event):
                     reply_flex(event.reply_token, flex, name)
                     return
             reply_text(event.reply_token, "⚠️ 台灣金價取得失敗\n請稍後再試")
+            return
+        # v10.9.189：美債 2Y 走殖利率服務（FRED CMT 優先），與殖利率曲線卡同源
+        if sym == "__US2Y__":
+            dlog("HANDLER", "→ 查美債2Y")
+            data = get_us_2y_quote()
+            if data:
+                flex = make_quote_flex(name, data, "#5B8DB8")
+                if flex:
+                    reply_flex(event.reply_token, flex, name)
+                    return
+            reply_text(event.reply_token, "⚠️ 2 年期殖利率暫時無法取得\n請稍後再試")
             return
         # v10.9.51：櫃買指數改用 TPEx 官方（Yahoo ^TWOII 資料偏移 1 天且 rmp 卡舊值）
         if sym == "__TPEXIDX__":

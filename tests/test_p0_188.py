@@ -34,6 +34,12 @@ FRED_OLD = "DATE,DGS2\n2026-09-14,3.52\n2026-09-15,.\n2026-09-15,3.55\n2026-09-1
 FRED_NEW = "observation_date,DGS2\n2026-09-15,3.55\n2026-09-16,\n2026-09-16,3.61\n"
 
 
+def fred_series(name, prev, last):
+    """v10.9.189：產生與 FRED_OLD 同日期軸的序列（09-15 prev、09-16 last）。"""
+    return (f"DATE,{name}\n2026-09-14,{prev - 0.03:.2f}\n"
+            f"2026-09-15,{prev:.2f}\n2026-09-16,{last:.2f}\n")
+
+
 class T1_Fred(unittest.TestCase):
     def test_parse_both_headers_and_missing(self):
         self.assertEqual(parse_fred_csv(FRED_OLD)[-1], ("2026-09-16", 3.58))
@@ -60,7 +66,10 @@ class T2_Yield2Y(unittest.TestCase):
                 return Resp(js=yahoo_js(3.60, 3.55))
             if "fred" in url:
                 if not fred_ok: raise OSError("x")
-                return Resp(FRED_OLD)
+                # v10.9.189：曲線三期別都走 FRED，router 需能分辨序列並給不同值
+                if "DGS10" in url: return Resp(fred_series("DGS10", 4.05, 4.08))
+                if "DGS30" in url: return Resp(fred_series("DGS30", 4.62, 4.60))
+                return Resp(FRED_OLD)   # DGS2：prev 3.55 → 3.58
             if "%5ETNX" in url or "^TNX" in url: return Resp(js=yahoo_js(4.10, 4.05))
             if "%5ETYX" in url or "^TYX" in url: return Resp(js=yahoo_js(4.60, 4.62))
             raise AssertionError("unexpected url " + url)
@@ -73,17 +82,20 @@ class T2_Yield2Y(unittest.TestCase):
         self.assertFalse(any("IRX" in u for u in calls))
         self.assertNotIn("^IRX", json.dumps(app.MARKET_SYMBOLS["查美債2Y"]))
 
-    def test_primary_futures(self):
+    # v10.9.189：主來源由 2YY=F 期貨改為 FRED CMT（官方口徑），期貨降為備援。
+    # 原 test_primary_futures / test_fallback_fred 的預期行為刻意對調。
+    def test_primary_is_official_cmt(self):
         get, _ = self.router()
+        y = get_us_2y_yield(get)
+        self.assertEqual(y["source"], "fred_dgs2")
+        self.assertAlmostEqual(y["yield"], 3.58)
+        self.assertAlmostEqual(y["chg"], 0.03)
+
+    def test_fallback_futures_when_fred_down(self):
+        get, _ = self.router(fred_ok=False)
         y = get_us_2y_yield(get)
         self.assertEqual(y["source"], "yahoo_2yy_f")
         self.assertAlmostEqual(y["yield"], 3.60)
-
-    def test_fallback_fred(self):
-        get, _ = self.router(yahoo_ok=False)
-        y = get_us_2y_yield(get)
-        self.assertEqual(y["source"], "fred_dgs2")
-        self.assertAlmostEqual(y["chg"], 0.03)
 
     def test_analysis_spread(self):
         get, _ = self.router()
