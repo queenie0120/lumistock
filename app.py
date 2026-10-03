@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.190"
+VERSION              = "10.9.191"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -2276,8 +2276,8 @@ def run_portfolio_alerts(force: bool = False) -> dict:
     for uid, holdings in by_user.items():
         user_alerts = []
         for symbol, data in holdings:
-            sid = symbol.replace(".TW", "")
-            if not sid.isdigit():
+            sid = norm_sym(symbol)
+            if not is_tw_symbol(sid):
                 continue  # 暫不處理美股（之後再加）
             try:
                 tw = get_tw_stock(sid)
@@ -3188,9 +3188,9 @@ def make_portfolio_action_carousel(user_id: str) -> dict:
         bubbles = []
         for key, data in list(up.items())[:10]:
             symbol = _pf_symbol(key)
-            sid = symbol.replace(".TW","")
+            sid = norm_sym(symbol)
             try:
-                if sid.isdigit():
+                if is_tw_symbol(sid):
                     tw = get_tw_stock(sid)
                     price = tw["price"] if tw else 0
                     name = tw["name"] if tw else sid
@@ -3906,7 +3906,7 @@ def restore_portfolio_from_sheets() -> int:
             except:
                 continue
             # 正規化：台股代號統一去掉 .TW，避免「2330」與「2330.TW」重複
-            norm_symbol = symbol.replace(".TW", "") if symbol.replace(".TW","").isdigit() else symbol
+            norm_symbol = norm_sym(symbol) if is_tw_symbol(symbol) else symbol
             # v10.9.187：股數 <= 0 的列是「清倉紀錄」→ 移除較早的同檔紀錄
             # （舊版直接 continue，導致賣光後重啟持股復活）
             if shares <= 0:
@@ -5695,6 +5695,21 @@ def get_tw_stock_name_fallback(stock_id: str) -> str:
 # ══════════════════════════════════════════
 #  台股資料
 # ══════════════════════════════════════════
+# v10.9.191：台股代號判斷。舊版一律用 isdigit()，債券 ETF（00679B）、
+# 反向 ETF（00632R）、特別股（2881A）都會被當成美股 → 報價走錯路徑、
+# 市場欄寫錯、手續費與證交稅完全不算。改用格式判斷（4~6 位數字 + 0~2 字母）。
+# 與 /api/v1 掛載同樣的保護：套件載入失敗也不能讓 LINE 功能掛掉，退回舊行為。
+try:
+    from lumistock.calc.symbols import (is_tw_symbol, is_us_symbol,   # noqa: E402
+                                        market_of, normalize_symbol as norm_sym)
+except Exception as _e:   # pragma: no cover - 僅在套件缺失時觸發
+    dlog("STARTUP", f"⚠️ symbols 模組載入失敗，代號判斷退回舊行為：{_e}")
+    def norm_sym(s): return (s or "").strip().replace(".TW", "").replace(".TWO", "")
+    def is_tw_symbol(s): return norm_sym(s).isdigit()
+    def is_us_symbol(s): return bool(norm_sym(s)) and not norm_sym(s).isdigit()
+    def market_of(s): return "台股" if is_tw_symbol(s) else "美股"
+
+
 # v10.9.170：判斷台股是否在盤中（給 MIS / cache 邏輯用，避免重複實作）
 def _tw_in_trading_hours() -> bool:
     """週一~五 09:00-13:30（含集合競價）= True"""
@@ -5940,7 +5955,12 @@ def get_tw_stock(stock_id: str) -> dict:
         vol_lots = picked.get("vol_lots")
         vol_str = f"{vol_lots:,} 張" if isinstance(vol_lots, int) and vol_lots > 0 else "N/A"
 
-        is_rt = picked.get("is_realtime", False)
+        # v10.9.191：is_realtime 只代表「來源是即時來源」，不代表「現在是盤中」。
+        # 舊版收盤後照樣標「盤中」。要同時在交易時段內才算盤中；
+        # 收盤後是「收盤資料」，不是「延遲 15 分」。
+        is_rt_source = picked.get("is_realtime", False)
+        in_hours = _tw_in_trading_hours()
+        is_rt = is_rt_source and in_hours
         result = {
             "name": name, "price": price, "chg": chg, "pct": pct,
             "open": _fmt(picked.get("open")),
@@ -5953,7 +5973,7 @@ def get_tw_stock(stock_id: str) -> dict:
             "validation": label,  # v10.9.107：UI 可顯示
             "meta": build_data_meta(picked["source"],
                                     is_realtime=is_rt, is_fallback=False,
-                                    delay_min=0 if is_rt else 15),
+                                    delay_min=0 if (is_rt or not in_hours) else 15),
         }
         if ex_div:
             result["ex_dividend"] = ex_div["cash"]
@@ -6956,7 +6976,7 @@ def restore_sell_to_portfolio(user_id: str, symbol: str, restored_shares: int,
     save_portfolio(portfolio)
     try:
         name = NAME_CACHE.get(norm, norm)
-        market = "台股" if norm.isdigit() else "美股"
+        market = market_of(norm)
         save_portfolio_to_sheets(user_id, norm, name, market, new_total, final_avg)
     except Exception as e:
         dlog("PORTFOLIO", f"restore 後同步 Sheets 失敗：{type(e).__name__}: {e}")
@@ -7183,7 +7203,7 @@ def process_sell(user_id: str, stock_id: str, sell_shares: int, sell_price: floa
     # 否則 Render 重啟 → restore 從 Sheets 讀回舊的股數 → 賣出像沒發生
     # （append 新一筆，restore 取每個 key 的最後一筆，所以新狀態會勝出）
     try:
-        market = "台股" if norm.isdigit() else "美股"
+        market = market_of(norm)
         save_portfolio_to_sheets(user_id, norm, name, market, remaining, cost_avg)
     except Exception as e:
         dlog("PORTFOLIO", f"賣出後同步「自選股」失敗：{type(e).__name__}: {e}")
@@ -7336,7 +7356,7 @@ def process_buy(user_id: str, stock_id: str, buy_shares: int, buy_price: float) 
             break
 
     # 計算這次買入的手續費 + 真實成本
-    is_tw = norm.isdigit()
+    is_tw = is_tw_symbol(norm)
     buy_fee = calc_buy_fee(buy_price, buy_shares, user_id) if is_tw else 0
     new_cost_total = buy_price * buy_shares + buy_fee  # 含費總成本
 
@@ -7520,7 +7540,7 @@ def make_buy_preview_flex(items: list, user_id: str) -> dict:
         sid = h["stock_id"]; shares = h["shares"]; price = h["buy_price"]
         norm = sid.replace(".TW", "")
         name = NAME_CACHE.get(norm, "")
-        is_tw = norm.isdigit()
+        is_tw = is_tw_symbol(norm)
         fee = calc_buy_fee(price, shares, user_id) if is_tw else 0
         held = None
         for k in (_pf_key(user_id, norm), _pf_key(user_id, sid), norm, sid, sid + ".TW"):
@@ -7665,7 +7685,7 @@ def format_buy_import_preview(items: list, user_id: str) -> str:
         sid = h["stock_id"]; shares = h["shares"]; price = h["buy_price"]
         norm = sid.replace(".TW", "")
         name = NAME_CACHE.get(norm, "")
-        is_tw = norm.isdigit()
+        is_tw = is_tw_symbol(norm)
         fee = calc_buy_fee(price, shares, user_id) if is_tw else 0
         # 找既有部位
         held = None
@@ -11491,7 +11511,7 @@ def get_dynamic_watchlist()->list:
             for row in data.get("data",[])[:15]:
                 sid=row[1].strip() if len(row)>1 else ""
                 nm=row[2].strip() if len(row)>2 else ""
-                if sid and sid.isdigit(): wl.append((sid,nm,0,0,0))
+                if sid and is_tw_symbol(sid): wl.append((sid,nm,0,0,0))
     except: pass
     for sid,nm in [("0050","元大台灣50"),("00878","國泰永續高股息"),
                    ("006208","富邦台50"),("0056","元大高股息"),
@@ -14061,7 +14081,7 @@ def build_and_push_holdings_analysis(user_id: str):
             if data.get("user_id") != user_id: continue
             symbol = _pf_symbol(key)
             sid = symbol.replace(".TW", "")
-            if not sid.isdigit() and not (len(sid) >= 4 and sid[:4].isdigit()):
+            if not is_tw_symbol(sid):
                 continue  # 暫不支援美股
             shares = int(data.get("shares", 0) or 0)
             if shares <= 0: continue
@@ -14672,9 +14692,9 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
     total_fee_tax = 0
     for key, data in up.items():
         symbol = _pf_symbol(key)  # v10.9.73：從複合 key 取 symbol
-        sid = symbol.replace(".TW", "")
+        sid = norm_sym(symbol)
         try:
-            if sid.isdigit():
+            if is_tw_symbol(sid):
                 tw = get_tw_stock(sid)
                 price = tw["price"] if tw else 0
                 name  = tw["name"] if tw else sid
@@ -14690,7 +14710,7 @@ def make_portfolio_flex_carousel(user_id: str) -> dict:
         cost = bp * shares
         gross_pct = (price - bp) / bp * 100 if price and bp else 0
         # v10.9.92：賣出費稅（台股有，美股無）
-        if sid.isdigit() and price:
+        if is_tw_symbol(sid) and price:
             fee, tax = calc_sell_fee_tax(price, shares, user_id, sid)
         else:
             fee, tax = 0, 0
@@ -15065,7 +15085,7 @@ def make_stock_flex(symbol,name,market_type,status,source,
     }
 
 def get_stock_flex(symbol:str, user_id:str="")->tuple:
-    symbol=symbol.strip().upper(); is_tw=symbol.isdigit()
+    symbol=symbol.strip().upper(); is_tw=is_tw_symbol(symbol)
     query_time=now_taipei().strftime("%m/%d %H:%M")
     if is_tw:
         tw=get_tw_stock(symbol)
@@ -17314,7 +17334,7 @@ def handle_message(event):
                 # 同步 Sheets
                 try:
                     name = NAME_CACHE.get(norm, norm)
-                    market = "台股" if norm.isdigit() else "美股"
+                    market = market_of(norm)
                     save_portfolio_to_sheets(user_id, norm, name, market, shares, cost_avg)
                 except Exception as e:
                     dlog("PORTFOLIO", f"重設股數同步 Sheets 失敗：{e}")
@@ -17346,8 +17366,8 @@ def handle_message(event):
                 raw_price = float(parts[3])
                 if shares <= 0 or raw_price <= 0:
                     raise ValueError("invalid")
-                norm = stock_id.replace(".TW", "")
-                is_tw = norm.isdigit()
+                norm = norm_sym(stock_id)
+                is_tw = is_tw_symbol(norm)
                 buy_fee = calc_buy_fee(raw_price, shares, user_id) if is_tw else 0
                 cost_avg = (raw_price * shares + buy_fee) / shares if shares else raw_price
                 # 移除所有既有 key
