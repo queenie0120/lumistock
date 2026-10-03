@@ -858,7 +858,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-VERSION              = "10.9.189"
+VERSION              = "10.9.190"
 CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 OWNER_USER_ID        = "U972c7aec7b6628d70f52bc0bcbb4bf4a"
@@ -9053,11 +9053,60 @@ def title_similarity(a: str, b: str) -> float:
     return max(bigram_sim, trigram_sim * 0.85)
 
 
-def deduplicate_news(nl: list, similarity_threshold: float = 0.5, max_per_source: int = 2) -> list:
+# v10.9.190：議題分群用的公司名集合（辨識標題裡的實體）。
+# NAME_CACHE 會隨開機補齊，所以帶版本號快取，不是算一次就固定。
+_NEWS_NAME_SET = {"names": frozenset(), "size": -1}
+
+
+def get_news_entity_names() -> frozenset:
+    """回傳公司名集合，供新聞議題分群辨識實體用。NAME_CACHE 變動時自動重算。"""
+    try:
+        if len(NAME_CACHE) != _NEWS_NAME_SET["size"]:
+            _NEWS_NAME_SET["names"] = frozenset(
+                n for n in NAME_CACHE.values() if n and len(n) >= 2)
+            _NEWS_NAME_SET["size"] = len(NAME_CACHE)
+    except Exception:
+        pass
+    return _NEWS_NAME_SET["names"]
+
+
+def diversify_news_topics(items: list, title_of, max_per_topic: int = 1) -> list:
+    """v10.9.190：依議題重新排序，讓前面的名額涵蓋最多不同議題。
+    只重排不丟棄；失敗時原樣回傳，絕不讓新聞消失。"""
+    if not items:
+        return []
+    try:
+        from lumistock.calc.news_topics import diversify_titles
+        out = diversify_titles(items, title_of, names=get_news_entity_names(),
+                               sim_fn=title_similarity, max_per_topic=max_per_topic)
+        if len(out) != len(items):
+            dlog("NEWS", f"議題分群數量異常 {len(items)}→{len(out)}，改用原順序")
+            return items
+        return out
+    except Exception as e:
+        dlog("NEWS", f"議題分群失敗（用原順序）：{type(e).__name__}: {e}")
+        return items
+
+
+def same_news_topic(title_a: str, title_b: str) -> bool:
+    """v10.9.190：兩則是否在講同一件事（實體 + 事件類別），不是比字面。
+    判斷不出來時回傳 False，交給呼叫端既有的字面門檻決定。"""
+    try:
+        from lumistock.calc.news_topics import topic_signature, same_topic
+        names = get_news_entity_names()
+        return same_topic(topic_signature(title_a or "", names),
+                          topic_signature(title_b or "", names))
+    except Exception:
+        return False
+
+
+def deduplicate_news(nl: list, similarity_threshold: float = 0.5, max_per_source: int = 2,
+                     max_per_topic: int = 1) -> list:
     """新聞去重 + 同媒體限制（v10.9.34 完全升級）
     nl: [(title, url), ...]
     similarity_threshold: 標題相似度閾值（>= 此值視為重複）
     max_per_source: 同一媒體最多顯示幾則
+    max_per_topic:  v10.9.190 每個議題在前段最多幾則（超過的往後排，不丟棄）
     """
     if not nl: return []
     original_count = len(nl)
@@ -9093,7 +9142,9 @@ def deduplicate_news(nl: list, similarity_threshold: float = 0.5, max_per_source
 
     if original_count > len(result):
         dlog("NEWS", f"去重 {original_count}→{len(result)}（過濾相似{skipped_similar} 同媒體{skipped_max_source}）")
-    return result
+    # v10.9.190：字面去重擋不住「同一議題、不同寫法」。再依議題輪流排序，
+    # 讓呼叫端取前 N 則時涵蓋最多不同議題（只重排，不減少則數）。
+    return diversify_news_topics(result, lambda x: x[0], max_per_topic)
 
 
 def clean_title(t:str)->str:
@@ -10248,9 +10299,13 @@ def get_google_news_multi(query: str, count: int = 10) -> list:
         return []
 
 
-def _merge_dedup_news(*lists, count: int = 12) -> list:
-    """合併多個新聞 dict 清單，依 normalize_title 去重，保留先到的。"""
-    out, seen = [], set()
+def _merge_dedup_news(*lists, count: int = 12, max_per_topic: int = 1) -> list:
+    """合併多個新聞 dict 清單，依 normalize_title 去重，保留先到的。
+
+    v10.9.190：normalize_title 只擋得掉「標題一模一樣」，同一議題換個寫法會全部
+    留下，12 格輪播常被單一議題吃光。改為先收完再依議題輪流排序，最後才截斷。
+    """
+    merged, seen = [], set()
     for lst in lists:
         for n in lst:
             t = n.get("title", "")
@@ -10258,10 +10313,9 @@ def _merge_dedup_news(*lists, count: int = 12) -> list:
             if not t or norm in seen:
                 continue
             seen.add(norm)
-            out.append(n)
-            if len(out) >= count:
-                return out
-    return out
+            merged.append(n)
+    out = diversify_news_topics(merged, lambda n: n.get("title", ""), max_per_topic)
+    return out[:count]
 
 
 # v10.9.165：分類新聞的「真實」過篩管道（之前封面寫了但沒做的）
@@ -10315,7 +10369,8 @@ def _filter_and_dedup_category_news(items: list, count: int = 10,
                 sim = _us_news_title_similar(it["title"], kept["title"])
             except Exception:
                 sim = 0.0
-            if sim >= similarity_threshold:
+            # v10.9.190：字面門檻擋不住「同一事件、不同寫法」，加議題判斷
+            if sim >= similarity_threshold or same_news_topic(it["title"], kept["title"]):
                 merged_into = kept
                 break
         if merged_into is None:
