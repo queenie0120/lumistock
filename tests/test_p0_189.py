@@ -306,3 +306,40 @@ class T5_Query2Y(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class T6_AsOfFormat(unittest.TestCase):
+    """v10.9.192：Yahoo 回的是 Unix epoch，不可當成觀測日顯示。
+
+    症狀（實機抓到）：FRED 不可用時退到 Yahoo，卡片標題列出現
+    「資料日 1790102734」。Yahoo 是盤中報價，沒有觀測日概念。
+    """
+
+    def test_yahoo_curve_has_no_as_of(self):
+        get, _ = full_router(fred_ok=False)
+        c = get_us_yield_curve(get)
+        self.assertTrue(c["aligned"])
+        self.assertIsNone(c["as_of"])
+        for t in ("y2", "y10", "y30"):
+            if c.get(t):
+                self.assertIsNone(c[t]["as_of"], t)
+
+    def test_fred_curve_keeps_real_date(self):
+        get, _ = fred_router()
+        c = get_us_yield_curve(get)
+        self.assertEqual(c["as_of"], "2026-09-16")
+
+    def test_epoch_never_reaches_flex(self):
+        get, _ = full_router(fred_ok=False)
+        with mock.patch.object(app.requests, "get", side_effect=get):
+            d = app.get_yield_analysis()
+        s = json.dumps(app.make_yield_analysis_flex(d), ensure_ascii=False)
+        self.assertNotIn("資料日", s)
+        self.assertNotIn("1789000000", s)
+
+    def test_2y_quote_has_no_epoch(self):
+        get, _ = full_router(fred_ok=False)
+        with mock.patch.object(app.requests, "get", side_effect=get):
+            q = app.get_us_2y_quote()
+        self.assertNotIn("資料日", q["source"])
+        self.assertTrue(q["meta"]["is_fallback"])
